@@ -1186,3 +1186,224 @@ def test_search_songs_returns_tracks_for_real_payload(monkeypatch):
     assert out[0]["artist"] == "孙这"
     assert out[0]["mp3_url"].startswith("http")
     assert out[0]["quality"], "音质必须判定出来（br=320000 -> HD 320k）"
+
+
+# ===========================================================================
+# 播放热路径改进程内取数 —— 「搜到了却一直缓冲、无法播放」的根因
+#
+# /api/v1/song/{id}/url 与 /api/v1/song/{id}/info 原先 exec CLI，而它们位于播放热
+# 路径：飞牛每首歌各调一次，一次搜索 50 首就是上百次调用。
+# 实测（真实 NetEase-MusicBox 0.5.3）：CLI 子进程冷启动 47.37s、稳态 1.4s；
+# 代理侧对这两个请求的 httpx 超时只有 10s ⇒ 冷启动必然超时。
+# 而 httpx.ReadTimeout('') 的 str() 是【空串】，日志只剩
+#   resolve_netease_url error for 94344 (quality=exhigh):
+# 连异常类型都看不见。改进程内后实测取链 0.05s、详情 0.07s、歌词 0.13s。
+# ===========================================================================
+
+
+def test_urls_for_level_matches_upstream_songs_url(monkeypatch):
+    """核心等价性：_urls_for_level 必须和上游 api.songs_url 给出一致结果。
+
+    上游 songs_url(ids) 的 level 取自全局 Config().get("music_quality")，不接受参数；
+    本服务需要按请求音质取链，又不能去改用户的全局配置文件。真机上实测校验过：
+    用 Config 当前值走 _urls_for_level，返回与 api.songs_url() 逐字节一致。
+    这条用例把该等价关系的参数构造钉住，防止上游变动后我们悄悄漂移。
+    """
+    captured = {}
+
+    class _Api:
+        def eapi_request(self, path, params):
+            captured["path"] = path
+            captured["params"] = params
+            return {"data": [{"id": 7, "code": 200, "url": "http://cdn/7.mp3"}]}
+
+        def request(self, method, path, params=None, **kw):
+            captured["weapi"] = (method, path, params)
+            return {"data": []}
+
+    monkeypatch.setattr(ne2, "_level_to_encode_type", lambda level: "mp3")
+    out = ne2._urls_for_level(_Api(), [7], "exhigh")
+    assert out == [{"id": 7, "code": 200, "url": "http://cdn/7.mp3"}]
+    assert captured["path"] == "/api/song/enhance/player/url/v1"
+    assert captured["params"]["level"] == "exhigh"
+    assert captured["params"]["encodeType"] == "mp3"
+    assert captured["params"]["ids"] == "[7]", "ids 必须是紧凑 JSON（与上游分隔符一致）"
+    assert "weapi" not in captured, "eapi 有结果就不该再走 weapi 降级"
+
+
+def test_urls_for_level_falls_back_to_weapi_with_rate_map(monkeypatch):
+    """eapi 无结果时按上游同款 rate_map 降级到 weapi。"""
+    seen = {}
+
+    class _Api:
+        def eapi_request(self, path, params):
+            return {"data": []}
+
+        def request(self, method, path, params=None, **kw):
+            seen["call"] = (method, path, params)
+            return {"data": [{"id": 9, "code": 200, "url": "http://cdn/9.mp3"}]}
+
+    monkeypatch.setattr(ne2, "_level_to_encode_type", lambda level: "flac")
+    out = ne2._urls_for_level(_Api(), [9], "lossless")
+    assert out and out[0]["id"] == 9
+    assert seen["call"][1] == "/weapi/song/enhance/player/url"
+    assert seen["call"][2]["br"] == 999000, "lossless 必须映射到 999000（上游 rate_map）"
+    assert seen["call"][2]["ids"] == [9]
+
+
+def test_urls_for_level_survives_eapi_exception(monkeypatch):
+    """eapi 抛异常不能炸，必须继续走 weapi 降级。"""
+    class _Api:
+        def eapi_request(self, path, params):
+            raise RuntimeError("eapi boom")
+
+        def request(self, method, path, params=None, **kw):
+            return {"data": [{"id": 3, "code": 404, "url": None}]}
+
+    monkeypatch.setattr(ne2, "_level_to_encode_type", lambda level: "mp3")
+    out = ne2._urls_for_level(_Api(), [3], "exhigh")
+    assert out == [{"id": 3, "code": 404, "url": None}]
+
+
+def test_pick_by_id_prefers_matching_id():
+    items = [{"id": 1, "url": "a"}, {"id": 2, "url": "b"}]
+    assert ne2._pick_by_id(items, 2)["url"] == "b"
+    assert ne2._pick_by_id([{"id": 5, "url": "x"}], 999)["url"] == "x", "单条时退化为返回它"
+    assert ne2._pick_by_id([{"id": 5}, {"id": 6}], 999) is None, "多条且对不上不能瞎猜"
+    assert ne2._pick_by_id([], 1) is None
+    assert ne2._pick_by_id(None, 1) is None
+    assert ne2._pick_by_id([None, {"id": 4}], 4)["id"] == 4
+    assert ne2._pick_by_id({"id": 8}, 8)["id"] == 8
+
+
+def test_song_url_info_returns_cli_compatible_shape(monkeypatch):
+    """返回结构必须与 CLI `musicbox song url --json` 的 data 字段一致。
+
+    代理 resolve_netease_url 只认 code == 200 and url，因此不能改形状。
+    """
+    class _Api:
+        def eapi_request(self, path, params):
+            return {"data": [{"id": 410710837, "code": 200,
+                              "url": "http://cdn/a.mp3", "br": 320000, "level": "exhigh"}]}
+
+        def request(self, *a, **kw):
+            return {"data": []}
+
+    monkeypatch.setattr(ne2, "_get_api", lambda: _Api())
+    monkeypatch.setattr(ne2, "_quality_to_level", lambda q: str(q).lower())
+    monkeypatch.setattr(ne2, "_level_to_encode_type", lambda level: "mp3")
+    info = ne2.song_url_info(410710837, "exhigh")
+    assert info["code"] == 200 and info["url"]
+    assert info["id"] == 410710837
+    assert ne2.quality_of(info) == "HD 320k"
+
+
+def test_song_raw_detail_keeps_upstream_shape(monkeypatch):
+    """_online_info 期望的是【上游原始】形状（自己解析 ar/al/dt/sq/hr/h），
+    不是 _map_song_detail 映射后的 song_name/album_pic_url 那套。"""
+    raw = {"id": 7, "name": "屋顶", "ar": [{"name": "周杰伦"}],
+           "al": {"name": "范特西", "picUrl": "http://p/1.jpg"},
+           "dt": 267232, "sq": None, "hr": None, "h": {"size": 10691439, "br": 320000}}
+
+    class _Api:
+        def songs_detail(self, ids):
+            assert ids == [7]
+            return [raw]
+
+    monkeypatch.setattr(ne2, "_get_api", lambda: _Api())
+    got = ne2.song_raw_detail(7)
+    assert got == raw
+    assert got["ar"][0]["name"] == "周杰伦"
+    assert got["h"]["br"] == 320000
+
+
+# --------- 端点层：进程内优先，CLI 只在问不到上游时兜底 ---------
+
+def test_song_url_endpoint_uses_in_process_and_skips_cli(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mb_app, "song_url_info",
+                        lambda sid, q: {"id": sid, "code": 200, "url": "http://cdn/1.mp3"})
+    monkeypatch.setattr(mb_app, "exec_musicbox",
+                        lambda args, **kw: calls.append(args) or {"ok": False})
+    with TestClient(app) as client:
+        body = client.get("/api/v1/song/1/url", params={"quality": "exhigh"}).json()
+    assert body["engine"] == "in-process"
+    assert body["data"]["url"] == "http://cdn/1.mp3"
+    assert calls == [], "进程内已成功就绝不能再 spawn CLI（冷启动实测 47s）"
+
+
+def test_song_url_structured_404_does_not_fall_back_to_cli(monkeypatch):
+    """上游明确说取不到链（code=404）是权威答案：跑慢 CLI 不会有不同结果。
+
+    否则 proxy 依次试 lossless→exhigh 时，每首不可播曲目都会触发两次子进程调用，
+    等于把这次修复又抵消掉。
+    """
+    calls = []
+    monkeypatch.setattr(mb_app, "song_url_info",
+                        lambda sid, q: {"id": sid, "code": 404, "url": None})
+    monkeypatch.setattr(mb_app, "exec_musicbox",
+                        lambda args, **kw: calls.append(args) or {"ok": True})
+    with TestClient(app) as client:
+        body = client.get("/api/v1/song/2/url", params={"quality": "lossless"}).json()
+    assert body["engine"] == "in-process"
+    assert body["data"]["code"] == 404
+    assert calls == [], "结构化 404 不得兜底跑 CLI"
+
+
+def test_song_url_falls_back_to_cli_only_when_upstream_unreachable(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mb_app, "song_url_info",
+                        lambda sid, q: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(mb_app, "exec_musicbox",
+                        lambda args, **kw: calls.append(args) or {
+                            "ok": True, "data": {"code": 200, "url": "http://cli/1.mp3"}})
+    with TestClient(app) as client:
+        body = client.get("/api/v1/song/1/url", params={"quality": "exhigh"}).json()
+    assert calls == [["song", "url", "1", "--quality", "exhigh", "--json"]]
+    assert body["data"]["url"] == "http://cli/1.mp3"
+    assert "engine" not in body, "走 CLI 兜底时不要谎报 in-process"
+
+
+def test_song_url_empty_response_falls_back_to_cli(monkeypatch):
+    """问到了但是空响应（既无 code 也无 id）→ 视为没问到上游，允许兜底。"""
+    calls = []
+    monkeypatch.setattr(mb_app, "song_url_info", lambda sid, q: {})
+    monkeypatch.setattr(mb_app, "exec_musicbox",
+                        lambda args, **kw: calls.append(args) or {"ok": True, "data": {}})
+    with TestClient(app) as client:
+        client.get("/api/v1/song/5/url", params={"quality": "exhigh"})
+    assert len(calls) == 1
+
+
+def test_song_info_endpoint_returns_raw_shape(monkeypatch):
+    raw = {"id": 7, "name": "屋顶", "ar": [{"name": "周杰伦"}],
+           "al": {"picUrl": "http://p/1.jpg"}, "dt": 267232, "h": {"br": 320000}}
+    calls = []
+    monkeypatch.setattr(mb_app, "song_raw_detail", lambda sid: dict(raw))
+    monkeypatch.setattr(mb_app, "exec_musicbox",
+                        lambda args, **kw: calls.append(args) or {"ok": False})
+    with TestClient(app) as client:
+        body = client.get("/api/v1/song/7/info").json()
+    assert body["engine"] == "in-process"
+    assert body["data"]["ar"][0]["name"] == "周杰伦"
+    assert body["data"]["dt"] == 267232
+    assert calls == []
+
+
+def test_song_info_falls_back_to_cli_on_error(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mb_app, "song_raw_detail",
+                        lambda sid: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(mb_app, "exec_musicbox",
+                        lambda args, **kw: calls.append(args) or {"ok": True, "data": {"name": "x"}})
+    with TestClient(app) as client:
+        client.get("/api/v1/song/7/info")
+    assert calls == [["song", "info", "7", "--json"]]
+
+
+def test_song_url_rejects_bad_quality(monkeypatch):
+    """音质白名单照旧生效，别让这次改动放宽校验。"""
+    with TestClient(app) as client:
+        r = client.get("/api/v1/song/1/url", params={"quality": "bogus"})
+    assert r.status_code == 400
+    assert "bogus" in r.text

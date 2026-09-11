@@ -1084,7 +1084,7 @@ async def _enrich_netease_items(client: httpx.AsyncClient, items: list[dict]) ->
             return
         payload = r.json()
     except Exception as e:
-        logger.warning("Failed to fetch songs detail: %s", e)
+        logger.warning("Failed to fetch songs detail: %s: %s", type(e).__name__, e)
         return
 
     if not isinstance(payload, dict) or payload.get("ok") is False:
@@ -1129,7 +1129,8 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str) -> str | 
                         if code == 200 and url:
                             return str(url)
         except Exception as e:
-            logger.warning("resolve_netease_url error for %s (quality=%s): %s", song_id, q, e)
+            logger.warning("resolve_netease_url error for %s (quality=%s): %s: %s",
+                          song_id, q, type(e).__name__, e)
     return None
 
 
@@ -2057,7 +2058,8 @@ async def _online_info(request: Request, guid: str) -> dict | None:
                     if isinstance(l_data, dict):
                         lyric_text = str(l_data.get("lyric") or "").strip()
         except Exception as l_err:
-            logger.warning("musicbox lyric fetch in _online_info failed for %s: %s", guid, l_err)
+            logger.warning("musicbox lyric fetch in _online_info failed for %s: %s: %s",
+                         guid, type(l_err).__name__, l_err)
 
         return {
             "id": f"{NETEASE_SOURCE}:{song_id}",
@@ -2072,7 +2074,7 @@ async def _online_info(request: Request, guid: str) -> dict | None:
             "lyric": lyric_text,
         }
     except Exception as e:
-        logger.warning("musicbox /info failed for %s: %s", guid, e)
+        logger.warning("musicbox /info failed for %s: %s: %s", guid, type(e).__name__, e)
         return None
 
 

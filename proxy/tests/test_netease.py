@@ -1,5 +1,6 @@
 """Tests for fnmusic-ext netease (musicbox) integration, fast search, and pagination."""
 import asyncio
+import logging
 import os
 import time
 import httpx
@@ -326,6 +327,38 @@ async def test_resolve_netease_url_all_fail():
     )
     url = await resolve_netease_url(client, "186016")
     assert url is None
+
+
+@pytest.mark.anyio
+async def test_resolve_netease_url_logs_exception_type(caplog):
+    """回归真机上的诊断盲区：日志必须带异常类型。
+
+    真机日志只有孤零零一行、冒号后面是空的：
+        resolve_netease_url error for 94344 (quality=exhigh):
+    原因是 httpx 的超时异常 ``ReadTimeout('')`` 的 ``str()`` 是【空字符串】
+    （ConnectTimeout / ReadError / TimeoutException 同样如此），
+    于是日志里既看不出是超时、连接失败还是解析错误，排查只能靠猜。
+    而这里超时的成因是 /song/{id}/url 原先 exec CLI，冷启动实测 47s、
+    稳态 1.4s，远超代理侧 10s 的 httpx 超时。
+    """
+    def timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("")
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(timeout_handler), base_url="http://127.0.0.1:8770"
+    )
+    with caplog.at_level(logging.WARNING, logger="fnmusic_proxy"):
+        url = await resolve_netease_url(client, "186016")
+
+    assert url is None
+    msg = "\n".join(r.getMessage() for r in caplog.records)
+    assert "resolve_netease_url error" in msg
+    assert "ReadTimeout" in msg, (
+        "httpx 超时异常的 str() 为空，必须把 type(e).__name__ 打出来，"
+        "否则日志里冒号后面什么都没有，无法判断故障类型"
+    )
+    # 代理会依次试 primary(lossless) 与 exhigh，两级都超时都应留痕
+    assert msg.count("ReadTimeout") == 2
 
 
 # =========================================================================

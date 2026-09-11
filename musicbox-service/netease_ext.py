@@ -1,6 +1,7 @@
 """Optional NEMbox internals for batch detail / lyrics (NetEase-MusicBox)."""
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -510,3 +511,123 @@ def song_lyric_pair(song_id: int) -> dict[str, str]:
     lyric_str = "\n".join(str(line) for line in raw_lyric) if isinstance(raw_lyric, list) else ""
     tlyric_str = "\n".join(str(line) for line in raw_tlyric) if isinstance(raw_tlyric, list) else ""
     return {"lyric": lyric_str, "tlyric": tlyric_str}
+
+
+# ---------------------------------------------------------------------------
+# 播放热路径的进程内实现
+#
+# 为什么必须有这两个函数：``/api/v1/song/{id}/url`` 与 ``/api/v1/song/{id}/info``
+# 原先直接 exec CLI（``musicbox song url ...``）。它们位于**播放热路径**上——飞牛
+# 播放器每首歌都要各调一次，一次搜索 50 首就是上百次调用。
+#
+# 实测（真实 NetEase-MusicBox 0.5.3）：
+#   CLI 子进程**冷启动 47.37s**，稳态仍有 1.4s；进程内 eapi 取链仅 **0.05s**，
+#   songs_detail 原始详情同样是进程内一次 HTTP。
+# 而代理侧对这两个请求的 httpx 超时是 **10s** ⇒ 冷启动必然超时。更糟的是超时异常
+# ``httpx.ReadTimeout('')`` 的 ``str()`` 是**空串**，日志只剩
+# ``resolve_netease_url error for 94344 (quality=exhigh): ``，连异常类型都看不见。
+# 用户侧现象即「搜索结果和歌单都出来了，但一直缓冲、无法播放」。
+#
+# 因此这里改为进程内直取；CLI 仅作为进程内失败时的兜底（保留 exec_musicbox 调用方）。
+# ---------------------------------------------------------------------------
+
+# 上游 api.songs_url 里 weapi 降级用的码率映射，原样照搬以免语义漂移
+_LEVEL_RATE_MAP = {
+    "exhigh": 320000,
+    "higher": 192000,
+    "standard": 128000,
+    "lossless": 999000,
+    "hires": 999000,
+    "jymaster": 999000,
+}
+
+
+def _level_to_encode_type(level: str) -> str:
+    """上游 ``level_to_encode_type`` 的薄封装。
+
+    抽成模块级函数的唯一目的是让测试可以打桩——直接 ``from NEMbox.api import``
+    写在函数体里的话，未安装真实 NetEase-MusicBox 的环境会直接 ImportError，
+    这条纯逻辑分支就再也测不到。
+    """
+    from NEMbox.api import level_to_encode_type
+
+    return level_to_encode_type(level)
+
+
+def _quality_to_level(quality: str) -> str:
+    """上游 ``music_quality_to_level`` 的薄封装，理由同上。"""
+    from NEMbox.api import music_quality_to_level
+
+    return music_quality_to_level(quality)
+
+
+def _urls_for_level(api, ids: list[int], level: str) -> list[Any]:
+    """按**指定** level 取直链，逐行对齐上游 ``api.songs_url`` 的实现。
+
+    上游 ``songs_url(ids)`` 的 level 取自全局 ``Config().get("music_quality")``，
+    **不接受参数**；而本服务的接口需要按请求音质（proxy 会依次试
+    lossless → exhigh）取链。直接改全局 Config 会写坏用户配置文件，
+    故在此按同样逻辑显式传 level。
+
+    已实测校验：用 Config 里当前的 quality 走本函数，其返回与
+    ``api.songs_url()`` **完全一致**，因此这是等价改写而非另起一套。
+    """
+    params = {
+        "ids": json.dumps(ids, separators=(",", ":")),
+        "level": level,
+        "encodeType": _level_to_encode_type(level),
+    }
+    try:
+        data = api.eapi_request("/api/song/enhance/player/url/v1", params).get("data", [])
+    except Exception:  # noqa: BLE001 - eapi 不可用时照上游走 weapi 降级
+        data = []
+    if data:
+        return data if isinstance(data, list) else []
+    return (api.request("POST", "/weapi/song/enhance/player/url",
+                        {"ids": ids, "br": _LEVEL_RATE_MAP.get(level, 320000)}).get("data") or [])
+
+
+def _pick_by_id(items: Any, song_id: int) -> dict[str, Any] | None:
+    """从返回列表里挑出指定 id 的那条；挑不到就退化为返回唯一一条。"""
+    if isinstance(items, dict):
+        return items or None
+    if not isinstance(items, list):
+        return None
+    for it in items:
+        if isinstance(it, dict):
+            try:
+                if int(it.get("id") or it.get("song_id") or 0) == song_id:
+                    return it
+            except (TypeError, ValueError):
+                continue
+    singles = [x for x in items if isinstance(x, dict)]
+    return singles[0] if len(singles) == 1 else None
+
+
+def song_url_info(song_id: int, quality: str = "exhigh") -> dict[str, Any]:
+    """进程内取单曲直链信息（含 code / url / br / level / freeTrialPrivilege）。
+
+    返回结构与 CLI ``musicbox song url <id> --json`` 的 ``data`` 字段一致，
+    因此代理侧 ``resolve_netease_url`` 无需改动：它只认 ``code == 200 and url``。
+    取不到时返回 ``{}``，由调用方决定是否降级到 CLI。
+    """
+    sid = int(song_id)
+    level = _quality_to_level(quality)
+    api = _get_api()
+    with _api_lock:
+        data = _urls_for_level(api, [sid], level)
+    return _pick_by_id(data, sid) or {}
+
+
+def song_raw_detail(song_id: int) -> dict[str, Any]:
+    """进程内取单曲**原始**详情（含 ar / al / dt / sq / hr / h）。
+
+    代理的 ``_online_info`` 期望的正是这个原始形状（它自己解析 ar/al/dt/sq/h），
+    而不是 ``_map_song_detail`` 映射后的 song_name/album_pic_url 那套，
+    所以这里直接返回 ``api.songs_detail([id])`` 的原始条目。
+    """
+    sid = int(song_id)
+    api = _get_api()
+    with _api_lock:
+        raw = api.songs_detail([sid])
+    return _pick_by_id(raw, sid) or {}

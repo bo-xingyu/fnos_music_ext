@@ -23,6 +23,8 @@ from netease_ext import (
     reset_api_instance,
     search_songs as ne_search_songs,
     song_lyric_pair,
+    song_raw_detail,
+    song_url_info,
 )
 import runner
 from runner import MusicboxTimeoutError, ensure_xdg_dirs
@@ -197,13 +199,45 @@ def search(
 
 @app.get("/api/v1/song/{song_id}/url")
 def song_url(song_id: int = Path(..., ge=1), quality: str = Query("exhigh")):
+    """取播放直链。**播放热路径**：飞牛每首歌各调一次。
+
+    优先走进程内 NEMbox（实测 0.05s）。原先这里 exec CLI，冷启动实测 **47s**、
+    稳态 1.4s，而代理侧超时只有 10s ⇒ 必然超时，且 ``httpx.ReadTimeout('')`` 的
+    ``str()`` 是空串，日志里只剩一行看不出原因的 warning，用户侧表现为
+    「搜索结果出来了但一直缓冲」。CLI 现仅作进程内失败时的兜底。
+    """
     if quality not in QUALITY_WHITELIST:
         raise HTTPException(status_code=400, detail=f"Invalid quality {quality!r}")
+    info = {}
+    reached_upstream = False
+    try:
+        info = song_url_info(song_id, quality)
+        # 只要拿到结构化的上游应答（哪怕 code=404 / url 为空）就视为可信权威结果：
+        # 那表示「这首歌确实取不到直链」，再跑一次慢 CLI 不会有不同答案，反而在
+        # proxy 依次试 lossless→exhigh 时把每首不可播的曲目变成两次子进程调用。
+        reached_upstream = isinstance(info, dict) and ("code" in info or "id" in info)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("in-process song_url_info failed for %s(q=%s): %s: %s",
+                       song_id, quality, type(exc).__name__, exc)
+    if reached_upstream:
+        return {"ok": True, "data": info, "engine": "in-process"}
+    # 进程内连上游都没问到（异常/空响应）才兜底走 CLI，两者共享同一份 cookie 文件
     return exec_musicbox(["song", "url", str(song_id), "--quality", quality, "--json"])
 
 
 @app.get("/api/v1/song/{song_id}/info")
 def song_info(song_id: int = Path(..., ge=1)):
+    """取单曲原始详情（ar/al/dt/sq/hr/h）。同样是播放热路径，逻辑同上。"""
+    raw = {}
+    reached_upstream = False
+    try:
+        raw = song_raw_detail(song_id)
+        reached_upstream = isinstance(raw, dict) and bool(raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("in-process song_raw_detail failed for %s: %s: %s",
+                       song_id, type(exc).__name__, exc)
+    if reached_upstream:
+        return {"ok": True, "data": raw, "engine": "in-process"}
     return exec_musicbox(["song", "info", str(song_id), "--json"])
 
 

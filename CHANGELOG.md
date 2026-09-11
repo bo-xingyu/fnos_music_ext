@@ -3,6 +3,101 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.1.6] - 2026-09-11
+
+修复 2.1.5 之后暴露的下一个症状：**「搜索结果和歌单都出来了，但一直缓冲、无法播放」**。
+
+2.1.5 修好了列表层（试听判定误杀），于是曲目能正常出现在搜索结果与每日推荐里。但列表层
+走的是**进程内** NEMbox，播放层走的却是**另一条路**——这条路的性能问题此前被列表层的
+空结果掩盖着，列表一空就根本走不到播放。
+
+### 根因：播放热路径每首歌 spawn 一个 CLI 子进程，且慢到必然超时
+
+`/api/v1/song/{id}/url`（取播放直链）与 `/api/v1/song/{id}/info`（取曲目详情）原先都是：
+
+```python
+return exec_musicbox(["song", "url", str(song_id), "--quality", quality, "--json"])
+```
+
+这两个端点位于**播放热路径**：飞牛播放器每首歌各调一次，一次搜索 50 首就是上百次调用。
+用真实 `NetEase-MusicBox 0.5.3` 实测：
+
+| 调用方式 | 耗时 |
+| --- | --- |
+| CLI 子进程**冷启动** | **47.37s** |
+| CLI 子进程稳态 | 1.40s |
+| 进程内 eapi 取链 | **0.05s** |
+| 进程内 `songs_detail` 原始详情 | **0.07s** |
+
+而代理侧对这两个请求的 httpx 超时只有 **10s** ⇒ 冷启动**必然超时**，
+稳态 1.4s × 上百次调用也让播放器一直等不到直链。真机装完 2.1.5 后的实测（同一进程内
+服务，真实上游）：`search` 0.58s、取链 0.05s、详情 0.07s、歌词 0.13s——全部远离 10s 红线。
+
+真机日志里那几十条 `musicbox /info failed for online:netease:<id>` 正是同一件事。
+
+### 诊断盲区：超时的异常日志冒号后面是空的
+
+真机日志只有一行、看不出任何原因：
+
+```
+resolve_netease_url error for 94344 (quality=exhigh):
+```
+
+原因是 **httpx 的超时异常 `str()` 恒为空字符串**（实测 `ReadTimeout`、`ConnectTimeout`、
+`ReadError`、`TimeoutException` 全部如此），而日志写的是 `"...: %s", e`。
+于是「超时 / 连接失败 / 解析错误」在日志里长得一模一样（都是空）。
+
+### 修复
+
+1. **播放热路径改进程内取数**：新增 `netease_ext.song_url_info()` 与
+   `song_raw_detail()`，`/song/{id}/url`、`/song/{id}/info` 改为进程内优先，
+   CLI 仅在「连上游都没问到」（抛异常或空响应）时兜底。
+2. **结构化 404 不再兜底跑 CLI**：上游明确回答「取不到直链」（`code=404` / `url=null`）
+   是权威结果，再 spawn 一次慢 CLI 不会有不同答案。若照旧兜底，代理依次试
+   `lossless → exhigh` 会让**每首不可播曲目触发两次子进程调用**，把这次修复又抵消掉。
+3. **异常日志补上类型**：`resolve_netease_url`、`_online_info`、歌词抓取、批量详情
+   共 4 处从 `"%s", e` 改为 `"%s: %s", type(e).__name__, e`，日志不再出现空冒号。
+
+### 关于音质参数的实现说明
+
+上游 `api.songs_url(ids)` 的 `level` 取自**全局** `Config().get("music_quality")`，
+**不接受参数**；而本服务需要按请求音质取链（代理会依次试 `lossless → exhigh`）。
+直接改全局 Config 会写坏用户的配置文件，因此新增 `_urls_for_level()` 按上游同样的
+逻辑显式传 level（含 eapi 主路径与 weapi `rate_map` 降级）。
+
+已实测校验：用 Config 当前值走 `_urls_for_level()`，其返回与 `api.songs_url()`
+**完全一致**，故这是等价改写而非另起一套；并有测试把该等价关系与 `rate_map`
+（`lossless → 999000` 等）钉住。
+
+顺带一处发现：CLI `musicbox song url <id> --quality exhigh` 会返回 `code=404 / url=null`
+（带 `cannotListenReason:1`），而 `--quality lossless` 能拿到真实直链（`level` 回落到
+`exhigh`）；进程内参数化取链则两种音质都返回 `code=200` 且带真实直链。因此改用进程内后，
+代理原本「lossless 失败再试 exhigh」的降级链两级通常都能直接命中。
+
+### 测试
+
+新增 14 个用例（**509 passed / 1 skipped**，真实 NEMbox 环境；
+**505 passed / 5 skipped**，系统 python）：
+
+- `_urls_for_level` 与上游参数构造的等价性（紧凑 JSON `ids`、`level`、`encodeType`），
+  eapi 有结果时**不得**再走 weapi 降级
+- weapi 降级使用上游同款 `rate_map`（`lossless → br=999000`）；eapi 抛异常时仍降级
+- `_pick_by_id`：优先匹配 id；多条且对不上时返回 `None` 而不是瞎猜；脏数据不炸
+- `song_url_info` 返回结构与 CLI `song url --json` 的 `data` 字段兼容，
+  且能被 `quality_of()` 正确判为 `HD 320k`
+- `song_raw_detail` 必须保持**上游原始形状**（`ar`/`al`/`dt`/`sq`/`hr`/`h`）——
+  代理 `_online_info` 自己解析这些字段，若给映射后的 `song_name`/`album_pic_url` 会失效
+- 端点层：进程内成功**绝不再** spawn CLI；结构化 404 **不得**兜底；
+  抛异常/空响应才兜底且 CLI 参数正确；走兜底时不谎报 `engine=in-process`
+- 音质白名单照旧生效（非法音质 400），未被本次改动放宽
+- 代理日志盲区回归：用真实 `httpx.ReadTimeout('')` 复现，断言日志含 `ReadTimeout`
+  且两级降级（lossless/exhigh）各留一条痕迹
+
+> 为便于测试打桩，把 `_level_to_encode_type` / `_quality_to_level` 抽成模块级薄封装
+> ——否则 `from NEMbox.api import ...` 写在函数体里，未安装真实 NetEase-MusicBox
+> 的环境会直接 ImportError，这些纯逻辑分支就再也测不到。运行期行为不变。
+
+
 ## [2.1.5] - 2026-09-11
 
 **这一版才是「搜不到任何在线歌曲 / 每日推荐永远为空」的真正根因。**
