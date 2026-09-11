@@ -631,3 +631,291 @@ def song_raw_detail(song_id: int) -> dict[str, Any]:
     with _api_lock:
         raw = api.songs_detail([sid])
     return _pick_by_id(raw, sid) or {}
+
+
+# ---------------------------------------------------------------------------
+# 歌单 / 推荐口径 / 红心 / 最高品质下载
+#
+# 一律走进程内 NEMbox，不走 CLI：
+#  - CLI 的 playlist show / album / download 都经 dig_info，任一首取不到直链就把
+#    整个结果集清空（HTTP 仍 200），这是 2.1.3 之前的老毛病；
+#  - CLI 每次 spawn 子进程，冷启动实测 47s，放在浏览/播放热路径上必然超时（2.1.6）。
+# ---------------------------------------------------------------------------
+
+# 逐档降级取"该账号能拿到的最高品质"。顺序即优先级：
+# jymaster(臻品母带) > hires(高清无损) > lossless(无损) > exhigh(极高320k)
+BEST_QUALITY_CHAIN = ("jymaster", "hires", "lossless", "exhigh")
+
+# 上游返回的歌单封面是 http://（歌曲封面才是 https），必须升级协议：
+# 飞牛 UI 跑在 https 下，http 图片会被浏览器按混合内容直接拦掉。
+def _https_cover(url: Any) -> str:
+    s = str(url or "").strip()
+    if s.startswith("http://"):
+        return "https://" + s[len("http://"):]
+    return s
+
+
+def _norm_playlist(raw: Any) -> dict[str, Any] | None:
+    """把上游原始歌单 dict 归一化成本服务统一形状（容错缺字段）。
+
+    上游 user_playlist / recommend_resource / top_playlists 都是原样透传网易云响应，
+    NEMbox 源码只引用过 id/name/creator.nickname，因此 coverImgUrl、trackCount、
+    subscribed 这些字段**源码层面无法证明一定存在**，全部按可选处理。
+    """
+    if not isinstance(raw, dict):
+        return None
+    pid = raw.get("id") or raw.get("playlistId")
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    creator = raw.get("creator") if isinstance(raw.get("creator"), dict) else {}
+    name = str(raw.get("name") or raw.get("title") or "").strip()
+    if not name:
+        name = f"歌单 {pid}"
+    return {
+        "playlist_id": pid,
+        "name": name,
+        "cover_url": _https_cover(raw.get("coverImgUrl") or raw.get("picUrl")
+                                  or creator.get("backgroundUrl") or ""),
+        "track_count": _to_int(raw.get("trackCount") or raw.get("track_count") or 0),
+        "description": str(raw.get("description") or "")[:300],
+        # 自建 vs 收藏：subscribed 为 True 表示是收藏的别人的歌单
+        "subscribed": bool(raw.get("subscribed")),
+        "creator": str(creator.get("nickname") or ""),
+        "creator_id": _to_int(creator.get("userId") or raw.get("userId") or 0),
+    }
+
+
+def _to_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _playlist_list(raw: Any) -> list[dict[str, Any]]:
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for it in raw:
+        n = _norm_playlist(it)
+        if n:
+            out.append(n)
+    return out
+
+
+def user_playlists(uid: int, offset: int = 0, limit: int = 50) -> list[dict[str, Any]]:
+    """账户歌单（自建 + 收藏），需登录。"""
+    api = _get_api()
+    with _api_lock:
+        raw = api.user_playlist(int(uid), offset=offset, limit=limit)
+    return _playlist_list(raw)
+
+
+def recommend_playlists() -> list[dict[str, Any]]:
+    """网易云按账号口味的推荐歌单列表（recommend_resource），需登录。"""
+    api = _get_api()
+    with _api_lock:
+        raw = api.recommend_resource()
+    return _playlist_list(raw)
+
+
+def toplists() -> list[dict[str, Any]]:
+    """排行榜清单：上游返回 [(榜单名, 榜单歌单id)]，无需登录。"""
+    api = _get_api()
+    with _api_lock:
+        raw = api.fetch_toplists()
+    out = []
+    if isinstance(raw, (list, tuple)):
+        for pair in raw:
+            try:
+                name, pid = pair[0], int(pair[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            out.append({"playlist_id": pid, "name": str(name), "cover_url": "",
+                        "track_count": 0, "description": "", "subscribed": False,
+                        "creator": "", "creator_id": 0})
+    return out
+
+
+def category_playlists(category: str = "华语", order: str = "hot",
+                       limit: int = 20) -> list[dict[str, Any]]:
+    """分类歌单（华语/欧美/场景/情感…），无需登录。"""
+    api = _get_api()
+    cat = str(category or "华语").strip()
+    order_ = "new" if str(order or "hot").strip().lower() == "new" else "hot"
+    with _api_lock:
+        raw = api.top_playlists(cat, order_, 0, max(1, min(int(limit or 20), 50)))
+    return _playlist_list(raw)
+
+
+def playlist_categories() -> dict[str, list[str]]:
+    """歌单分类目录 {大类名: [子类名]}；上游失败时用 NEMbox 内置常量兜底。"""
+    api = _get_api()
+    with _api_lock:
+        raw = api.playlist_catelogs()
+    parsed = api._parse_playlist_classes(raw) if isinstance(raw, dict) else {}
+    if not parsed:
+        try:
+            parsed = dict(api._get_playlist_classes() or {})
+        except Exception:  # noqa: BLE001
+            parsed = {}
+    return {str(k): [str(x) for x in v] for k, v in parsed.items() if v}
+
+
+def new_albums(limit: int = 20) -> list[dict[str, Any]]:
+    """新碟上架（专辑维度），无需登录。"""
+    api = _get_api()
+    with _api_lock:
+        raw = api.new_albums(offset=0, limit=max(1, min(int(limit or 20), 50)))
+    out = []
+    if isinstance(raw, list):
+        for a in raw:
+            if not isinstance(a, dict):
+                continue
+            aid = _to_int(a.get("id"))
+            if not aid:
+                continue
+            artist = a.get("artist") if isinstance(a.get("artist"), dict) else {}
+            out.append({
+                "album_id": aid,
+                "name": str(a.get("name") or f"专辑 {aid}"),
+                "cover_url": _https_cover(a.get("picUrl") or a.get("blurPicUrl") or ""),
+                "artist": str(artist.get("name") or ""),
+                "publish_time": _to_int(a.get("publishTime") or 0),
+            })
+    return out
+
+
+def personal_fm() -> list[dict[str, Any]]:
+    """私人FM / 漫游曲目，需登录。返回已按可播性过滤的 song_info 列表。"""
+    api = _get_api()
+    with _api_lock:
+        raw = api.personal_fm()
+    return _songs_from_raw_list(raw)
+
+
+def playlist_track_ids(playlist_id: int, limit: int = 300) -> list[int]:
+    """取歌单内曲目 id。
+
+    ⚠️ 上游 ``playlist_songlist`` 返回的 ``trackIds`` **不是纯 id 列表**，而是
+    ``[{"id": …, "v": …, "at": …}, …]`` 这种 dict 列表（实测确认），
+    直接当 int 用会全线炸掉。同时兼容两种形态。
+    """
+    api = _get_api()
+    with _api_lock:
+        raw = api.playlist_songlist(int(playlist_id))
+    ids: list[int] = []
+    if isinstance(raw, list):
+        for it in raw:
+            if isinstance(it, dict):
+                sid = _to_int(it.get("id"))
+            else:
+                sid = _to_int(it)
+            if sid:
+                ids.append(sid)
+            if len(ids) >= max(1, min(int(limit or 300), 1000)):
+                break
+    return ids
+
+
+def album_songs(album_id: int, limit: int = 200) -> list[dict[str, Any]]:
+    """专辑内曲目。上游 ``album()`` 直接返回歌曲 dict 列表。"""
+    api = _get_api()
+    with _api_lock:
+        raw = api.album(int(album_id))
+    return _songs_from_raw_list(raw, limit=limit)
+
+
+def _songs_from_raw_list(raw: Any, limit: int = 300) -> list[dict[str, Any]]:
+    """把一批上游原始 song dict 逐首过滤后映射成 song_info。
+
+    与 search_songs / daily_songs 同一套规则：坏数据只影响它自己那一首，
+    绝不整表清空。
+    """
+    if not isinstance(raw, list) or not raw:
+        return []
+    ids = [_safe_sid(s) for s in raw]
+    ids = [i for i in ids if i]
+    if not ids:
+        return []
+    playable = playable_url_map(ids)
+    out: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    cap = max(1, int(limit or 300))
+    for song in raw:
+        if not isinstance(song, dict):
+            continue
+        sid = _safe_sid(song)
+        if not sid or sid in seen or sid not in playable:
+            continue
+        seen.add(sid)
+        out.append(_song_info_from_raw(song, playable[sid]))
+        if len(out) >= cap:
+            break
+    return out
+
+
+def songs_by_ids(ids: list[int], limit: int = 300) -> list[dict[str, Any]]:
+    """按 id 批量取可播曲目（歌单/排行榜内容都走这里）。"""
+    clean = [int(i) for i in ids if _to_int(i)]
+    if not clean:
+        return []
+    api = _get_api()
+    with _api_lock:
+        raw = api.songs_detail(clean[:1000])
+    return _songs_from_raw_list(raw, limit=limit)
+
+
+def best_url_info(song_id: int) -> dict[str, Any]:
+    """按 jymaster → hires → lossless → exhigh 逐档试，取该账号能拿到的直链。
+
+    ⚠️ 上游会按账号权益**自动降级**并以 ``code=200`` 返回：请求 jymaster 时，
+    非臻品权益的账号拿回来的可能是 ``level=exhigh``（实测匿名账号对免费曲即如此）。
+    所以 ``best_quality`` **必须取响应里的实际 ``level``**，而不是我们请求的档位，
+    否则日志与归档 sidecar 都会谎称存了臻品母带，实际只有 320k mp3。
+    ``requested_level`` 保留请求档位，便于对照"想要什么 vs 拿到什么"。
+
+    一档都取不到返回 ``{}``。
+    """
+    sid = int(song_id)
+    api = _get_api()
+    for level in BEST_QUALITY_CHAIN:
+        with _api_lock:
+            try:
+                data = _urls_for_level(api, [sid], level)
+            except Exception:  # noqa: BLE001
+                data = []
+        item = _pick_by_id(data, sid)
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if url and item.get("code") == 200 and not is_trial_snippet(item):
+            item = dict(item)
+            actual = str(item.get("level") or "").strip().lower()
+            item["best_quality"] = actual or level
+            item["requested_level"] = level
+            # 上游降级了要留痕：这是"账号权益不够"而非"我们没试更高档"
+            item["downgraded"] = bool(actual) and actual != level
+            return item
+    return {}
+
+
+def song_like(song_id: int, like: bool = True) -> dict[str, Any]:
+    """红心/取消红心（收藏同步回网易云），需登录。
+
+    上游是 ``song_like(songid, like=True)`` → eapi ``/api/song/like``
+    参数 ``{trackId, userid, like}``，返回 bool。
+    注意：``like=False`` 这条分支在 NEMbox 源码里从未被调用过（CLI 只有加红心入口），
+    属于未经验证路径，因此这里把上游返回值与异常都如实回传给调用方，不静默吞掉。
+    """
+    api = _get_api()
+    try:
+        with _api_lock:
+            ok = api.song_like(int(song_id), like=bool(like))
+        return {"ok": bool(ok), "song_id": int(song_id), "like": bool(like),
+                "requires_login": bool(not ok)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "song_id": int(song_id), "like": bool(like),
+                "error": f"{type(exc).__name__}: {exc}"[:200]}

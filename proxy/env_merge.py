@@ -33,6 +33,18 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_FREE_ONLY_ON_LOGOUT", "true"),
     ("FNMUSIC_DAILY_ENABLED", "true"),
     ("FNMUSIC_DAILY_LIMIT", "20"),
+    # --- 更多口径歌单 / 账户歌单（v2.2 新增）---
+    ("FNMUSIC_NETEASE_CHANNELS", "mine,toplist,category"),
+    ("FNMUSIC_NETEASE_CHANNEL_LIMIT", "8"),
+    ("FNMUSIC_NETEASE_CATEGORY", "华语"),
+    ("FNMUSIC_PLAYLIST_TRACK_LIMIT", "300"),
+    ("FNMUSIC_PLAYLIST_CACHE_DIR", ""),
+    # --- 收藏归档与红心同步（v2.2 新增）---
+    # 归档目录默认留空 = 关闭自动下载：这是往用户自己的磁盘写文件，
+    # 绝不能替他决定写到哪儿，必须他在管理页里显式填。
+    ("FNMUSIC_DOWNLOAD_DIR", ""),
+    ("FNMUSIC_DOWNLOAD_ON_FAVORITE", "true"),
+    ("FNMUSIC_FAV_SYNC_LIKE", "true"),
     ("FNMUSIC_LOGIN_STATE_TTL", "300"),
     ("FNMUSIC_LOGIN_CHECK_INTERVAL", "3600"),
     ("FNMUSIC_VIP_WARN_DAYS", "7"),
@@ -54,7 +66,12 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
 ]
 NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOGIN_",
                 "FNMUSIC_VIP_", "FNMUSIC_PUSHPLUS_", "FNMUSIC_LOG_",
-                "FNMUSIC_SEARCH_")
+                "FNMUSIC_SEARCH_",
+                # v2.2 新增：更多口径歌单、账户歌单、收藏归档与红心同步。
+                # 加前缀只是允许这些键被自动补齐，键本身仍必须在 NEW_DEFAULTS 里列出，
+                # 因此不会凭空给老用户的 .env 塞进没定义的项。
+                "FNMUSIC_NETEASE_CHANNEL", "FNMUSIC_NETEASE_CATEGOR",
+                "FNMUSIC_PLAYLIST_", "FNMUSIC_DOWNLOAD_", "FNMUSIC_FAV_")
 
 # v2.0 已废弃的配置项：升级合并时从 .env 中清理，避免残留误导。
 # 只删「确定已无代码读取」的键；FNMUSIC_MODE / BASE_IMAGE / PIP_INDEX 等 docker 相关项保留。

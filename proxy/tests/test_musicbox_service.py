@@ -907,6 +907,27 @@ import netease_ext as ne2
 
 
 @pytest.fixture(autouse=True)
+def _stub_level_encoder_when_nembox_missing():
+    """未安装真实 NEMbox 时，给 level→encodeType 的薄封装打桩。
+
+    ``_urls_for_level`` 会调它，而它内部 ``from NEMbox.api import ...``；系统 python
+    没有该包时会 ImportError，被 best_url_info 的 except 吞掉后返回 {}，
+    于是"报告实际档位"这类纯逻辑用例全部测不到。装了真实包时不打桩，保留原行为。
+    """
+    if importlib.util.find_spec("NEMbox") is not None:
+        yield
+        return
+    saved = ne2._level_to_encode_type
+    ne2._level_to_encode_type = lambda level: (
+        "flac" if str(level) in ("lossless", "hires", "jymaster") else "mp3"
+    )
+    try:
+        yield
+    finally:
+        ne2._level_to_encode_type = saved
+
+
+@pytest.fixture(autouse=True)
 def _reset_cli_probe_cache():
     """_CLI_PROBE 是进程级缓存，用例之间必须清空，否则串味且结果不确定。"""
     mb_app.reset_cli_probe_for_test()
@@ -914,6 +935,7 @@ def _reset_cli_probe_cache():
         yield
     finally:
         mb_app.reset_cli_probe_for_test()
+
 
 # 下面这些用例要跑真实的 NEMbox 构造流程（cookie_jar.load / Storage / deviceId），
 # 因此需要环境里真的装了 NetEase-MusicBox。CI/沙箱没装时自动跳过；
@@ -1614,3 +1636,112 @@ def test_importing_app_module_does_not_spawn_cli(tmp_path):
     out = json.loads(proc.stdout.decode("utf-8", "replace").strip().splitlines()[-1])
     assert out["started"] is False, "导入即预热会让测试 spawn 真实 CLI 子进程"
     assert out["probe"] is None
+
+
+# ===========================================================================
+# 最高品质取链（收藏归档用）
+#
+# 实测发现的坑：上游会按账号权益**自动降级**并以 code=200 返回。请求 jymaster 时，
+# 非臻品权益的账号拿回来的是 level=exhigh（匿名账号对免费曲实测如此，br=320000、
+# type=mp3）。因此 best_quality **必须取响应里的实际 level**，否则日志与归档
+# sidecar 都会谎称"存了臻品母带"，实际只有 320k mp3 —— 这种错不会报错，
+# 只会让用户发现自己硬盘上全是 mp3。
+# ===========================================================================
+
+
+class _DowngradeApi:
+    """复刻上游行为：无论请求什么 level，都按"账号权益上限"返回。"""
+
+    def __init__(self, granted_level="exhigh", br=320000, typ="mp3", codes=None):
+        self.requests = []
+        self.granted = granted_level
+        self.br = br
+        self.typ = typ
+        self.codes = codes or {}
+
+    def eapi_request(self, path, params):
+        level = params.get("level")
+        self.requests.append(level)
+        code = self.codes.get(level, 200)
+        if code == 404:
+            return {"data": [{"id": 555, "code": 404, "url": None}]}
+        return {"data": [{"id": 555, "code": code, "url": f"http://cdn/{level}.{self.typ}",
+                          "br": self.br, "level": self.granted, "type": self.typ}]}
+
+    def request(self, method, path, params=None, **kw):
+        return {"data": []}
+
+
+def test_best_quality_reports_actual_level_not_requested(monkeypatch):
+    api = _DowngradeApi(granted_level="exhigh")
+    monkeypatch.setattr(ne2, "_get_api", lambda: api)
+    info = ne2.best_url_info(555)
+    assert info["best_quality"] == "exhigh", "必须报告实际拿到的档位，不能报请求的档位"
+    assert info["requested_level"] == "jymaster"
+    assert info["downgraded"] is True, "上游降级了要留痕"
+    assert api.requests == ["jymaster"], (
+        "既然第一档就拿到了直链，就不该再继续往下试（每档一次上游往返）"
+    )
+
+
+def test_best_quality_when_entitlement_is_lossless(monkeypatch):
+    """权益是无损：请求臻品母带被自动降到 lossless，必须如实报告降级。"""
+    api = _DowngradeApi(granted_level="lossless", br=999000, typ="flac")
+    monkeypatch.setattr(ne2, "_get_api", lambda: api)
+    info = ne2.best_url_info(555)
+    assert info["best_quality"] == "lossless"
+    assert info["requested_level"] == "jymaster"
+    assert info["downgraded"] is True
+    assert info["url"].endswith(".flac")
+    assert api.requests == ["jymaster"], "第一档就拿到直链，不该再继续试"
+
+
+def test_best_quality_descends_until_a_url_appears(monkeypatch):
+    """高档位不给直链（code=404）时必须继续往下试，不能第一档失败就放弃。"""
+    api = _DowngradeApi(granted_level="exhigh",
+                        codes={"jymaster": 404, "hires": 404, "lossless": 404})
+    monkeypatch.setattr(ne2, "_get_api", lambda: api)
+    info = ne2.best_url_info(555)
+    assert api.requests == list(ne2.BEST_QUALITY_CHAIN), "四档都该试到"
+    assert info["best_quality"] == "exhigh" and info["requested_level"] == "exhigh"
+    assert info["downgraded"] is False, "请求档位与实际档位一致时不算降级"
+
+
+def test_best_quality_all_denied_returns_empty(monkeypatch):
+    api = _DowngradeApi(codes={lv: 404 for lv in ne2.BEST_QUALITY_CHAIN})
+    monkeypatch.setattr(ne2, "_get_api", lambda: api)
+    assert ne2.best_url_info(555) == {}, "一档都拿不到就该返回空，由端点如实报错"
+
+
+def test_best_quality_rejects_trial_snippet(monkeypatch):
+    """只给试听片段不算能归档。"""
+    class _Trial(_DowngradeApi):
+        def eapi_request(self, path, params):
+            data = super().eapi_request(path, params)
+            data["data"][0]["freeTrialInfo"] = {"st": 0, "et": 60}
+            return data
+
+    monkeypatch.setattr(ne2, "_get_api", lambda: _Trial(granted_level="exhigh"))
+    assert ne2.best_url_info(555) == {}
+
+
+def test_best_quality_survives_eapi_explosion(monkeypatch):
+    class _Boom(_DowngradeApi):
+        def eapi_request(self, path, params):
+            raise RuntimeError("boom")
+
+    api = _Boom()
+    calls = {"weapi": 0}
+
+    def fake_request(method, path, params=None, **kw):
+        calls["weapi"] += 1
+        return {"data": [{"id": 555, "code": 200, "url": "http://cdn/w.mp3",
+                          "level": "", "type": "mp3"}]}
+
+    api.request = fake_request
+    monkeypatch.setattr(ne2, "_get_api", lambda: api)
+    info = ne2.best_url_info(555)
+    assert info["best_quality"] == "jymaster", (
+        "上游没回 level 时回落到请求档位，不能因为字段缺失就丢掉这条直链"
+    )
+    assert calls["weapi"] == 1, "eapi 炸了应走 weapi 降级"

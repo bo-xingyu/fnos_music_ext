@@ -125,6 +125,18 @@ write_env_file() {
         echo "# --- 网易云官方每日推荐（需登录） ---"
         echo "FNMUSIC_DAILY_ENABLED=$(dq "$(norm_bool "${WIZ_DAILY}")")"
         echo "FNMUSIC_DAILY_LIMIT=$(dq "${WIZ_DAILY_LIMIT}")"
+        echo "# --- 更多口径歌单 / 账户歌单 ---"
+        echo "FNMUSIC_NETEASE_CHANNELS=$(dq "mine,toplist,category")"
+        echo "FNMUSIC_NETEASE_CHANNEL_LIMIT=$(dq "8")"
+        echo "FNMUSIC_NETEASE_CATEGORY=$(dq "华语")"
+        echo "FNMUSIC_PLAYLIST_TRACK_LIMIT=$(dq "300")"
+        # 放 PKGVAR 而不是 RUN_DIR：RUN_DIR 在「卸载+重装」时整个被删，
+        # 注册表存着歌单名字与封面，丢了就会退化成"网易云歌单 12345"+无封面。
+        echo "FNMUSIC_PLAYLIST_CACHE_DIR=$(dq "${PKGVAR}/playlist_cache")"
+        echo "# --- 收藏归档与红心同步 ---"
+        echo "FNMUSIC_DOWNLOAD_DIR=$(dq "")"
+        echo "FNMUSIC_DOWNLOAD_ON_FAVORITE=$(dq "true")"
+        echo "FNMUSIC_FAV_SYNC_LIKE=$(dq "true")"
         echo "# --- PushPlus 推送提醒 ---"
         echo "FNMUSIC_PUSHPLUS_ENABLED=$(dq "$(norm_bool "${WIZ_PUSH_ENABLED}")")"
         echo "FNMUSIC_PUSHPLUS_TOKEN=${token_line}"

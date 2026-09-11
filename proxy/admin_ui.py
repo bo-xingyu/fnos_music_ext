@@ -137,6 +137,40 @@ def _free_text(maxlen: int = 200):
     return check
 
 
+# 可在网页上勾选的歌单口径。「每日推荐」不在此列——它有独立开关 daily_enabled，
+# 重复放一个勾只会让人以为两个开关各管一半。
+CHANNEL_KEYS = ("mine", "nrec", "toplist", "category", "newalbum", "fm")
+
+
+def _as_channels(v: Any) -> str:
+    """口径勾选列表：逗号分隔，只接受已知 key，按固定顺序输出。"""
+    picked: list[str] = []
+    for part in str(v or "").replace(";", ",").split(","):
+        key = part.strip().lower()
+        if key and key in CHANNEL_KEYS and key not in picked:
+            picked.append(key)
+    if not picked:
+        raise ValueError("至少勾选一个歌单口径（全不勾等于关掉这个功能）")
+    return ",".join(sorted(picked, key=CHANNEL_KEYS.index))
+
+
+def _as_path(v: Any) -> str:
+    """归档目录：必须是已存在的可写绝对路径，且不能是系统目录。
+
+    这里就地把关，而不是等到用户点收藏时才发现路径不对——那时文件可能已经
+    写进错误位置。校验规则与 proxy/download.validate_dir 同源，只此一份。
+    """
+    path = str(v or "").strip()
+    if not path:
+        return ""          # 空 = 关闭自动归档
+    from . import download as _dl
+
+    ok, why = _dl.validate_dir(path)
+    if not ok:
+        raise ValueError(why)
+    return path
+
+
 def _token(v: Any) -> str:
     s = str(v).strip()
     if not s:
@@ -167,6 +201,15 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     "login_check_interval_h": ("FNMUSIC_LOGIN_CHECK_INTERVAL", _int_range(0, 168), False),
     "log_max_mb": ("FNMUSIC_LOG_MAX_MB", _int_range(0, 1024), False),
     "log_max_days": ("FNMUSIC_LOG_MAX_DAYS", _int_range(0, 3650), False),
+    # --- 更多口径歌单 / 账户歌单 ---
+    "netease_channels": ("FNMUSIC_NETEASE_CHANNELS", _as_channels, False),
+    "netease_channel_limit": ("FNMUSIC_NETEASE_CHANNEL_LIMIT", _int_range(1, 50), False),
+    "netease_category": ("FNMUSIC_NETEASE_CATEGORY", _free_text(32), False),
+    "playlist_track_limit": ("FNMUSIC_PLAYLIST_TRACK_LIMIT", _int_range(1, 1000), False),
+    # --- 收藏归档与红心同步 ---
+    "download_dir": ("FNMUSIC_DOWNLOAD_DIR", _as_path, True),
+    "download_on_favorite": ("FNMUSIC_DOWNLOAD_ON_FAVORITE", _as_bool, False),
+    "fav_sync_like": ("FNMUSIC_FAV_SYNC_LIKE", _as_bool, False),
 }
 
 # 页面上以「天/小时」为单位展示，落盘时换算成秒
@@ -192,6 +235,13 @@ DEFAULTS = {
     "login_check_interval_h": "1",
     "log_max_mb": "10",
     "log_max_days": "30",
+    "netease_channels": "mine,toplist,category",
+    "netease_channel_limit": "8",
+    "netease_category": "华语",
+    "playlist_track_limit": "300",
+    "download_dir": "",
+    "download_on_favorite": "true",
+    "fav_sync_like": "true",
 }
 
 MASK = "••••••••"
@@ -1220,7 +1270,7 @@ h1{font-size:18px;margin:0 0 2px}
 .pill.warn{background:var(--warnbg);color:var(--warn)}
 .pill.err{background:var(--errbg);color:var(--err)}
 label{display:block;margin-bottom:12px}
-label .lb{font-size:13px;font-weight:600;margin-bottom:4px}
+label .chbox{display:flex;flex-wrap:wrap;gap:6px 14px;margin:4px 0}.ck{display:inline-flex;align-items:center;gap:5px;font-weight:400;font-size:13px}.ck input{width:auto;margin:0}.lb{font-size:13px;font-weight:600;margin-bottom:4px}
 label .ht{color:var(--mut);font-size:12px;margin-top:3px}
 input,select{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;
   background:var(--bg);color:var(--fg);font:inherit;font-size:13px}
@@ -1321,6 +1371,49 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
         <label><span class="lb">每日推荐曲目数</span>
           <input name="daily_limit" inputmode="numeric" placeholder="20">
           <span class="ht">1–100，抓取网易云官方每日推荐</span>
+        </label>
+
+        <label><span class="lb">歌单口径</span>
+          <span class="chbox" id="chGroup">
+            <label class="ck"><input type="checkbox" data-ch="mine">我的歌单（自建+收藏）</label>
+            <label class="ck"><input type="checkbox" data-ch="nrec">推荐歌单</label>
+            <label class="ck"><input type="checkbox" data-ch="toplist">排行榜</label>
+            <label class="ck"><input type="checkbox" data-ch="category">分类歌单</label>
+            <label class="ck"><input type="checkbox" data-ch="newalbum">新碟上架</label>
+            <label class="ck"><input type="checkbox" data-ch="fm">私人FM</label>
+          </span>
+          <input type="hidden" name="netease_channels" value="">
+          <span class="ht">勾哪些就往飞牛歌单列表注入哪些；需登录的口径未登录时自动不显示。每日推荐由上面的开关单独控制</span>
+        </label>
+
+        <label><span class="lb">每口径注入上限</span>
+          <input name="netease_channel_limit" inputmode="numeric" placeholder="8">
+          <span class="ht">1–50。排行榜上游有 63 个，不限就会把你自己的本地歌单淹掉</span>
+        </label>
+
+        <label><span class="lb">分类歌单的分类</span>
+          <input name="netease_category" placeholder="华语">
+          <span class="ht">华语 / 欧美 / 日语 / 韩语 / 粤语 / 流行 / 摇滚 / 民谣 / 电子 ……</span>
+        </label>
+
+        <label><span class="lb">歌单曲目上限</span>
+          <input name="playlist_track_limit" inputmode="numeric" placeholder="300">
+          <span class="ht">1–1000，点开歌单时最多解析多少首（越多越慢）</span>
+        </label>
+
+        <label><span class="lb">收藏归档目录</span>
+          <input name="download_dir" placeholder="/vol1/1000-xxx/music/网易云收藏（留空=不下载）">
+          <span class="ht">必须是已存在的可写<b>绝对路径</b>；系统目录会被拒绝。按 <code>歌手/歌手 - 歌名.flac</code> 落盘并配同名 .lrc</span>
+        </label>
+
+        <label><span class="lb">点收藏时自动下载</span>
+          <input type="checkbox" name="download_on_favorite">
+          <span class="ht">取账号能拿到的最高品质（jymaster→hires→lossless→exhigh 逐档降级），配歌词</span>
+        </label>
+
+        <label><span class="lb">收藏同步回网易云</span>
+          <input type="checkbox" name="fav_sync_like">
+          <span class="ht">收藏=加红心，取消收藏=撤销红心。这是对你网易云账号的写操作</span>
         </label>
 
         <label><span class="lb">单次搜索请求条数</span>
@@ -1438,7 +1531,7 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
 (function(){
 "use strict";
 var $=function(s){return document.querySelector(s)};
-var BOOLS=["free_only_on_logout","daily_enabled","pushplus_enabled"];
+var BOOLS=["free_only_on_logout","daily_enabled","pushplus_enabled","download_on_favorite","fav_sync_like"];
 var pollTimer=null, qrUnikey="", expireTimer=null;
 
 // 服务端注入的绝对前缀（形如 /app/fnmusicext/）。
@@ -1589,10 +1682,35 @@ function loadCfg(){
       if(BOOLS.indexOf(k)>=0) el.checked=(v[k]==="true");
       else el.value=v[k]==null?"":v[k];
       if(k==="pushplus_token") el.placeholder = j.has_token ? "已保存（留空则不修改）" : "留空表示不启用推送";
+      if(k==="netease_channels") hiddenToChannels();
     });
     return j;
   });
 }
+
+// 歌单口径：多个勾选框 <-> 单个隐藏域 netease_channels
+function channelsToHidden(){
+  var picked=[];
+  Array.prototype.forEach.call(document.querySelectorAll("#chGroup input[data-ch]"),function(el){
+    if(el.checked) picked.push(el.getAttribute("data-ch"));
+  });
+  var order=["mine","nrec","toplist","category","newalbum","fm"];
+  picked.sort(function(a,b){ return order.indexOf(a)-order.indexOf(b) });
+  var h=document.getElementsByName("netease_channels")[0];
+  if(h) h.value=picked.join(",");
+}
+function hiddenToChannels(){
+  var h=document.getElementsByName("netease_channels")[0];
+  if(!h) return;
+  var on=(h.value||"").split(",");
+  Array.prototype.forEach.call(document.querySelectorAll("#chGroup input[data-ch]"),function(el){
+    el.checked = on.indexOf(el.getAttribute("data-ch"))>=0;
+  });
+}
+Array.prototype.forEach.call(document.querySelectorAll("#chGroup input[data-ch]"),function(el){
+  el.onchange=channelsToHidden;
+});
+hiddenToChannels();
 
 $("#qrBtn").onclick=function(){ newQr() };
 $("#qrRefresh").onclick=function(){ newQr() };

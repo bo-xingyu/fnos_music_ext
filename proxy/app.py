@@ -38,12 +38,16 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 try:
     from . import netease_auth
     from . import netease_items
+    from . import playlists
+    from . import download as downloader
     from . import pushplus
     from . import recommend as dailyrec
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import netease_auth  # type: ignore
     import netease_items  # type: ignore
+    import playlists  # type: ignore
+    import download as downloader  # type: ignore
     import pushplus  # type: ignore
     import recommend as dailyrec  # type: ignore
     from version import get_version  # type: ignore
@@ -529,6 +533,24 @@ def remember_media_path(guid: str, media_path: str) -> None:
             f.write(_path_stem(media_path))
     except Exception as e:
         logger.warning("Failed to remember media path for %s: %s", guid, e)
+
+
+def remember_archive_path(guid: str, media_path: str) -> None:
+    """登记**归档**文件（收藏下载），与边播边存的 tee 缓存分用两个 ref 命名空间。
+
+    必须分开：``remember_media_path`` 每个 guid 只有一个 ``.ref``，归档目录与曲库缓存
+    目录是两个不同位置，复用同一个 ref 会互相覆盖，卸载时就漏删其中一边。
+    存的是**词干**（不含扩展名），这样卸载脚本按 ``${stem}.{ext}`` 逐个精确删除的老
+    逻辑对归档同样适用（含 ``.lrc``）。
+    """
+    try:
+        os.makedirs(CONF["cache_dir"], exist_ok=True)
+        ref = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.archive.ref")
+        with open(ref, "w", encoding="utf-8") as f:
+            f.write(_path_stem(media_path))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to remember archive path for %s: %s: %s",
+                       guid, type(exc).__name__, exc)
 
 
 def recalled_media_stem(guid: str) -> str | None:
@@ -2257,13 +2279,23 @@ async def static_cover(request: Request, subpath: str = ""):
             first_guid = str(tracks[0].get("guid") or "")
             if is_online_guid(first_guid):
                 guid = first_guid
-    if not is_online_guid(guid):
-        return await forward_to_upstream(request, get_upstream_client(request.app))
 
-    cover = await _online_cover_url(request, guid)
+    if playlists.is_channel_guid(guid):
+        # ⚠️ 必须在下面的通用分支之前处理：像 online:playlist:ne:123 这种 guid 同样满足
+        # is_online_guid()，而通用逻辑是 split(":")[-1] 取"歌曲 id"，会把 123 当成
+        # song_id 去查 —— 结果是给歌单配上一首完全无关歌曲的封面。
+        cover = await _channel_playlist_cover(request, guid)
+    else:
+        cover = ""
+    if not cover and not playlists.is_channel_guid(guid):
+        if not is_online_guid(guid):
+            return await forward_to_upstream(request, get_upstream_client(request.app))
+        cover = await _online_cover_url(request, guid)
     if not cover:
         # 退回元数据（可能是缓存里已有的整条记录），再取不到才 404
-        data = await _online_info(request, guid)
+        data = None
+        if is_online_guid(guid) and not playlists.is_channel_guid(guid):
+            data = await _online_info(request, guid)
         cover = (data or {}).get("cover_url") or ""
     if not cover:
         # 无封面时返回 404，避免把 JSON 当成图片导致客户端裂图
@@ -2500,7 +2532,74 @@ async def favorite_track_create(request: Request):
         except Exception as e:
             logger.warning("Error updating online favorites for user %s: %s", user_guid, e)
 
+    # 2) 收藏同步回网易云（加红心）+ 3) 归档下载。两者都只能尽力而为：
+    #    本地收藏已经写成功了，任何一步失败都不该让这个接口报错——
+    #    否则用户点一下收藏就看到红叉，反而把本来能用的功能弄坏。
+    mb_client = get_musicbox_client(request.app)
+    sid = _netease_song_id(guid)
+    if sid:
+        like_res = await _sync_netease_like(mb_client, sid, like=True)
+        if not like_res.get("ok"):
+            # 不静默：红心没加上必须留痕，否则用户以为同步了其实没有
+            logger.warning("netease like not applied for song %s: %s", sid, like_res)
+        if downloader.download_enabled():
+            state = downloader.enqueue(
+                mb_client, sid,
+                {"title": (info or {}).get("title") or "",
+                 "artist": (info or {}).get("artist") or "",
+                 "album": (info or {}).get("album") or ""},
+                ref_writer=lambda path: remember_archive_path(guid, path),
+            )
+            logger.info("archive enqueued for song %s (%s)", sid, state)
+    # ⚠️ data 必须保持 None：这是飞牛官方接口的响应形状，既有客户端按它解析。
+    #    归档/红心的执行结果走日志，不要为了"回传细节"去改线上协议。
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
+
+
+def _netease_song_id(guid: str) -> str:
+    """从在线 guid 里取出**纯数字**的网易云歌曲 id；不是网易云来源则返回空。
+
+    两个必须挡住的坑（都是既有测试当场抓到的）：
+    1. ``song_id_from_online_guid`` 返回的是 ``netease:228908`` 这种带来源的串，
+       直接 ``int()`` 会 ValueError —— 项目里其它地方一律再 ``.split(":")[-1]``。
+    2. guid 也可能是 ``online:kuwo:123`` 这类**非网易云**来源，绝不能拿去加红心，
+       那是往用户网易云账号里写一条不相干的歌。
+    """
+    g = str(guid or "")
+    if not is_online_guid(g):
+        return ""
+    src = source_from_online_guid(g)
+    if src and src != NETEASE_SOURCE:
+        return ""
+    sid = song_id_from_online_guid(g).split(":")[-1].strip()
+    return sid if sid.isdigit() else ""
+
+
+async def _sync_netease_like(client, song_id: str, like: bool) -> dict[str, Any]:
+    """收藏 <-> 网易云红心。
+
+    这是**对用户账号的写操作**，因此不静默失败：结果如实回传给接口与日志，
+    管理页能据此看出到底是没登录、上游拒绝、还是取消红心那条未验证分支不通。
+    """
+    if not downloader.like_sync_enabled():
+        return {"ok": False, "skipped": "disabled"}
+    if not str(song_id).isdigit():
+        return {"ok": False, "error": "invalid_song_id"}
+    try:
+        r = await client.post(f"/api/v1/song/{int(song_id)}/like",
+                              params={"like": "true" if like else "false"}, timeout=15.0)
+        if r.status_code != 200:
+            return {"ok": False, "error": f"http_{r.status_code}"}
+        body = r.json()
+        if not isinstance(body, dict):
+            return {"ok": False, "error": "bad_payload"}
+        if body.get("ok") is not True:
+            return {"ok": False, "error": str(body.get("error") or "upstream_rejected")}
+        return {"ok": True, "like": like}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("netease like sync failed song=%s like=%s: %s: %s",
+                       song_id, like, type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:160]}
 
 
 @app.post("/music/api/v1/favorite-track/delete")
@@ -2530,6 +2629,13 @@ async def favorite_track_delete(request: Request):
         except Exception as e:
             logger.warning("Error deleting from online favorites for user %s: %s", user_guid, e)
 
+    # 取消收藏同步撤销网易云红心（用户选的口径是双向同步）。
+    # 归档文件不删：那是用户主动要求下载到自定义目录的资产，取消收藏不等于要删文件。
+    sid = _netease_song_id(guid)
+    if sid:
+        res = await _sync_netease_like(get_musicbox_client(request.app), sid, like=False)
+        if not res.get("ok"):
+            logger.warning("netease unlike not applied for song %s: %s", sid, res)
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
 
@@ -2703,6 +2809,79 @@ async def _load_daily_bundle(request: Request, user_guid: str) -> dict:
         return dailyrec.empty_daily_bundle(user_guid)
 
 
+async def _netease_logged_in() -> bool:
+    """当前网易云账号是否已登录（走带 TTL 的登录态缓存，不额外打上游）。"""
+    try:
+        return bool((await netease_auth.fetch_state(musicbox_client())).logged_in)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("login state probe failed: %s: %s", type(exc).__name__, exc)
+        return False
+
+
+async def _channel_playlist_records(client) -> tuple[list[dict], set[str], bool]:
+    """按管理页勾选的口径拉取要注入的伪歌单清单。"""
+    logged_in = await _netease_logged_in()
+    return await playlists.collect_records(client, logged_in)
+
+
+def _channel_public_fields(rec: dict) -> dict:
+    """伪歌单 -> 飞牛歌单列表条目形状。
+
+    与每日推荐的区别：``isDaily`` 必须为 False（飞牛会对 isDaily 的条目做特殊
+    的"今日推荐"渲染），且封面走 coverId=guid 由 /static/cover 拦截。
+    """
+    now = int(time.time())
+    return {
+        "guid": rec.get("guid"),
+        "name": rec.get("name") or "网易云歌单",
+        "coverId": rec.get("guid"),
+        "cover_url": rec.get("cover_url") or "",
+        "coverUrl": rec.get("cover_url") or "",
+        "createdAt": int(rec.get("createdAt") or now),
+        "updatedAt": int(rec.get("updatedAt") or now),
+        "trackCount": int(rec.get("track_count") or 0),
+        "isDaily": False,
+        "source": "netease",
+        "channel": rec.get("channel") or "",
+    }
+
+
+async def _channel_tracks(request: Request, guid: str, limit: int = 0) -> list[dict]:
+    """伪歌单 -> 飞牛 track 对象列表（已补封面、已按可播性过滤）。"""
+    client = get_musicbox_client(request.app)
+    items = await playlists.resolve_track_items(
+        client, guid, netease_items.map_netease_song, _enrich_netease_items
+    )
+    if limit and limit > 0:
+        items = items[:limit]
+    return [build_online_track(it) for it in items]
+
+
+async def _channel_playlist_cover(request: Request, guid: str) -> str:
+    """伪歌单封面：注册表优先，缺失时回落到第一首歌的封面（并回填注册表）。
+
+    排行榜口径上游**不给** coverImgUrl，只能借用榜单第一首歌的专辑封面。这一步
+    要拉取曲目列表、代价不小，因此拿到后必须写回注册表，让它整个进程只发生一次。
+    """
+    reg = playlists.lookup(guid)
+    cover = str(reg.get("cover_url") or "")
+    if cover:
+        return cover
+    try:
+        tracks = await _channel_tracks(request, guid, limit=1)
+        first = str((tracks[0] or {}).get("coverUrl") or "") if tracks else ""
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("channel cover fallback failed for %s: %s: %s",
+                       guid, type(exc).__name__, exc)
+        return ""
+    if first:
+        playlists.remember({"guid": guid, "name": reg.get("name", ""), "cover_url": first,
+                            "track_count": reg.get("track_count", 0),
+                            "channel": reg.get("channel", "")})
+        playlists.save_registry()
+    return first
+
+
 def _playlist_public_fields(record: dict) -> dict:
     return {
         "guid": record.get("guid"),
@@ -2746,31 +2925,55 @@ async def playlist_list(request: Request):
         official = []
         data["list"] = official
 
-    # 先剔掉可能残留的旧日推条目（例如昨天登录、今天掉线留下的记录）
+    # 先剔掉可能残留的旧伪歌单条目（例如取消了某个口径、昨天登录今天掉线）
     official = [
         it for it in official
-        if not (isinstance(it, dict) and dailyrec.is_daily_playlist_guid(str(it.get("guid") or "")))
+        if not (isinstance(it, dict) and (
+            dailyrec.is_daily_playlist_guid(str(it.get("guid") or ""))
+            or playlists.is_channel_guid(str(it.get("guid") or ""))))
     ]
 
-    if not tracks:
-        # 未登录 / 抓取失败：不注入空的「每日推荐」歌单，保持官方列表原样
-        reason = str(bundle.get("reason") or "")
-        if reason:
-            logger.info("daily playlist not injected for %s: %s", user_guid[:8], reason)
-        data["list"] = official
-        data["total"] = len(official)
-        return JSONResponse(content=envelope, headers=headers)
+    # 更多口径的歌单（我的歌单/推荐歌单/排行榜/分类歌单/新碟/私人FM）
+    try:
+        channel_recs, keep, complete = await _channel_playlist_records(
+            get_musicbox_client(request.app))
+        # 清单不完整时（未登录 / 某口径抛异常）绝不能清注册表：否则用户只是掉线一次，
+        # 所有歌单的名字与封面缓存就被抹掉了，恢复登录后全都要重新拉一遍。
+        if complete:
+            playlists.forget_stale(keep)
+    except Exception as e:
+        logger.warning("channel playlist inject failed: %s: %s", type(e).__name__, e)
+        channel_recs = []
 
-    rec = _playlist_public_fields(bundle.get("playlist") or {})
-    rec["trackCount"] = len(tracks)
-    data["list"] = [rec] + official
-    data["total"] = len(official) + 1
+    head: list[dict] = []
+    if tracks:
+        rec = _playlist_public_fields(bundle.get("playlist") or {})
+        rec["trackCount"] = len(tracks)
+        head.append(rec)
+    elif str(bundle.get("reason") or ""):
+        logger.info("daily playlist not injected for %s: %s", user_guid[:8], bundle.get("reason"))
+    head.extend(_channel_public_fields(r) for r in channel_recs)
+
+    data["list"] = head + official
+    data["total"] = len(head) + len(official)
     return JSONResponse(content=envelope, headers=headers)
 
 
 @app.get("/music/api/v1/playlist/detail")
 async def playlist_detail(request: Request):
     guid = str(request.query_params.get("guid") or "").strip()
+    if playlists.is_channel_guid(guid):
+        reg = playlists.lookup(guid)
+        rec = {
+            "guid": guid,
+            "name": reg.get("name") or f"网易云歌单 {playlists._target_id(guid) or ''}".strip(),
+            "cover_url": reg.get("cover_url") or "",
+            "track_count": reg.get("track_count") or 0,
+            "channel": reg.get("channel") or playlists.channel_of(guid),
+            "createdAt": reg.get("ts") or int(time.time()),
+            "updatedAt": reg.get("ts") or int(time.time()),
+        }
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": _channel_public_fields(rec)})
     if not dailyrec.is_daily_playlist_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
@@ -2788,12 +2991,16 @@ async def playlist_detail(request: Request):
 async def playlist_batch_detail(request: Request):
     raw = request.query_params.get("guids") or request.query_params.get("guid") or ""
     guids = [g.strip() for g in raw.split(",") if g.strip()]
-    daily_ids = [g for g in guids if dailyrec.is_daily_playlist_guid(g)]
-    if not daily_ids:
+
+    def _is_mine(g: str) -> bool:
+        return dailyrec.is_daily_playlist_guid(g) or playlists.is_channel_guid(g)
+
+    mine_ids = [g for g in guids if _is_mine(g)]
+    if not mine_ids:
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     upstream_client = get_upstream_client(request.app)
-    rest = [g for g in guids if not dailyrec.is_daily_playlist_guid(g)]
+    rest = [g for g in guids if not _is_mine(g)]
     official_list: list = []
     if rest:
         headers = copy_incoming_headers(request)
@@ -2818,10 +3025,29 @@ async def playlist_batch_detail(request: Request):
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed and auth_resp is not None:
         return auth_resp
-    bundle = await _load_daily_bundle(request, user_guid)
-    rec = _playlist_public_fields(bundle.get("playlist") or {})
-    rec["trackCount"] = len(bundle.get("tracks") or [])
-    return JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": [rec] + official_list}})
+
+    out: list[dict] = []
+    daily_rec: dict | None = None
+    for g in mine_ids:
+        if playlists.is_channel_guid(g):
+            reg = playlists.lookup(g)
+            out.append(_channel_public_fields({
+                "guid": g,
+                "name": reg.get("name") or f"网易云歌单 {playlists._target_id(g)}".strip(),
+                "cover_url": reg.get("cover_url") or "",
+                "track_count": reg.get("track_count") or 0,
+                "channel": reg.get("channel") or playlists.channel_of(g),
+                "createdAt": reg.get("ts"), "updatedAt": reg.get("ts"),
+            }))
+        elif daily_rec is None:
+            # 每日推荐只解析一次；同一次批量请求里重复的日推 guid 复用结果
+            bundle = await _load_daily_bundle(request, user_guid)
+            daily_rec = _playlist_public_fields(bundle.get("playlist") or {})
+            daily_rec["trackCount"] = len(bundle.get("tracks") or [])
+            out.append(daily_rec)
+        else:
+            out.append(daily_rec)
+    return JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": out + official_list}})
 
 
 @app.get("/music/api/v1/track/playlist-detail/list")
@@ -2832,15 +3058,25 @@ async def playlist_track_list(request: Request):
         or request.query_params.get("guid")
         or ""
     ).strip()
-    if not dailyrec.is_daily_playlist_guid(guid):
+    is_channel = playlists.is_channel_guid(guid)
+    if not is_channel and not dailyrec.is_daily_playlist_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     upstream_client = get_upstream_client(request.app)
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed and auth_resp is not None:
         return auth_resp
-    bundle = await _load_daily_bundle(request, user_guid)
-    tracks = dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
+
+    if is_channel:
+        try:
+            tracks = dailyrec.stamp_playlist_tracks(await _channel_tracks(request, guid))
+        except Exception as e:
+            logger.warning("channel playlist tracks failed for %s: %s: %s",
+                           guid, type(e).__name__, e)
+            return _online_unavailable("netease playlist unavailable", code=502)
+    else:
+        bundle = await _load_daily_bundle(request, user_guid)
+        tracks = dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
     try:
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):

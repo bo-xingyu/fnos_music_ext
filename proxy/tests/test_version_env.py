@@ -398,3 +398,45 @@ def test_cli_summary_does_not_report_removed_keys_as_custom_kept(tmp_path, capsy
     if custom_line:
         assert "FNMUSIC_MUSICDL_ENABLED" not in custom_line[0]
         assert "FNMUSIC_MY_EXTRA" in custom_line[0]
+
+
+# ---------------------------------------------------------------------------
+# 打包清单完整性（真实事故防护）
+#
+# build_fpk.sh 用的是**显式文件清单**（sync_into_app 逐个列出 + 自检再列一遍）来
+# 决定哪些文件进 payload。2.2.0 新增 proxy/playlists.py 与 proxy/download.py 时忘了
+# 登记，包能构建成功、自检也"全部通过"，但 payload 里没有这两个模块 —— 装上去
+# import 就直接 ImportError。校验 payload 时才发现。
+# 这类"新文件忘了登记"的错不会有任何提示，只能用测试钉住。
+# ---------------------------------------------------------------------------
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def test_every_proxy_module_is_in_fpk_manifest():
+    """proxy/ 下每个运行期 .py 都必须被 sync_into_app 登记，否则不会被打包。"""
+    root = _repo_root()
+    script = (root / "build_fpk.sh").read_text(encoding="utf-8")
+    modules = sorted(
+        p.name for p in (root / "proxy").glob("*.py")
+        if p.name != "__init__.py"          # __init__.py 单独登记
+    )
+    missing = [m for m in modules if f'proxy/{m}' not in script]
+    assert not missing, (
+        f"这些模块没被 build_fpk.sh 登记，装上去会 ImportError: {missing}"
+    )
+
+
+def test_fpk_payload_selfcheck_covers_every_proxy_module():
+    """自检那段清单也必须覆盖，否则"结构/载荷校验通过"是假的。"""
+    root = _repo_root()
+    script = (root / "build_fpk.sh").read_text(encoding="utf-8")
+    modules = sorted(
+        p.name for p in (root / "proxy").glob("*.py")
+        if p.name not in ("__init__.py", "version.py")
+    )
+    # 自检清单里既可能写 proxy/x.py 也可能只写文件名，这里两种都接受
+    missing = [m for m in modules if m not in script]
+    assert not missing, f"payload 自检清单漏了: {missing}"

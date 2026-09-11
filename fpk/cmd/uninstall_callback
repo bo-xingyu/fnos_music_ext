@@ -70,7 +70,7 @@ if is_true "${REMOVE_LIB}"; then
                 *..*) log "跳过可疑路径记录: ${stem}"; continue ;;
             esac
             matched=0
-            for ext in mp3 flac wav ogg opus m4a aac ape wv dsf dff tta lrc; do
+            for ext in mp3 flac wav ogg opus m4a aac ape wv dsf dff tta lrc fnmusic.json; do
                 if [ -f "${stem}.${ext}" ]; then
                     rm -f "${stem}.${ext}" && removed=$((removed + 1)) && matched=1
                 fi

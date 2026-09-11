@@ -16,17 +16,30 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from netease_ext import (
+    BEST_QUALITY_CHAIN,
+    album_songs as ne_album_songs,
     auth_detail as ne_auth_detail,
     batch_song_details,
+    best_url_info as ne_best_url_info,
+    category_playlists as ne_category_playlists,
     check_is_logged_in as ne_check_is_logged_in,
     daily_songs as ne_daily_songs,
     filter_playable_song_ids,
     invalidate_login_cache,
+    new_albums as ne_new_albums,
+    personal_fm as ne_personal_fm,
+    playlist_categories as ne_playlist_categories,
+    playlist_track_ids as ne_playlist_track_ids,
+    recommend_playlists as ne_recommend_playlists,
     reset_api_instance,
     search_songs as ne_search_songs,
+    song_like as ne_song_like,
     song_lyric_pair,
     song_raw_detail,
     song_url_info,
+    songs_by_ids as ne_songs_by_ids,
+    toplists as ne_toplists,
+    user_playlists as ne_user_playlists,
 )
 import runner
 from runner import MusicboxTimeoutError, ensure_xdg_dirs
@@ -587,3 +600,248 @@ def auth_login_qr_text():
     if not qr_ascii.endswith("\n"):
         qr_ascii += "\n"
     return Response(content=qr_ascii, media_type="text/plain; charset=utf-8")
+
+
+# ===========================================================================
+# 歌单 / 推荐口径 / 红心 / 最高品质直链
+#
+# 全部进程内实现，不走 CLI：CLI 的歌单/专辑/下载都经 dig_info（任一首取不到直链
+# 就整表清空），且每次 spawn 子进程冷启动实测 47s（见 2.1.6）。
+#
+# 登录门槛的处理原则：只有**内容确实与账号绑定**的口径才要求登录
+# （账户歌单、推荐歌单、私人FM、红心）。排行榜/分类歌单/新碟是无登录语义的公共
+# 内容，未登录也照常给，否则用户会误以为"没生效"。
+# ===========================================================================
+
+
+def _login_or_error(action: str, logged_in: bool | None = None):
+    """统一的未登录应答。返回 None 表示已登录可继续。"""
+    if logged_in is None:
+        try:
+            logged_in = ne_check_is_logged_in()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("login check failed for %s: %s: %s", action, type(exc).__name__, exc)
+            logged_in = False
+    if not logged_in:
+        return {"ok": False, "error": "not_logged_in", "data": []}
+    return None
+
+
+@app.get("/api/v1/playlists/user")
+def playlists_user(uid: int = Query(0), limit: int = Query(100, ge=1, le=200)):
+    """账户歌单（自建 + 收藏）。需登录。
+
+    uid 传 0 时自动用当前登录账号的 id —— 让代理侧不必自己去解析账号。
+    """
+    gate = _login_or_error("playlists/user")
+    if gate:
+        return gate
+    if not uid:
+        try:
+            uid = int(auth_detail().get("user_id") or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("resolve uid failed: %s: %s", type(exc).__name__, exc)
+            uid = 0
+    if not uid:
+        return {"ok": False, "error": "uid_unavailable", "data": [],
+                "hint": "无法确定当前账号 uid，请显式传 uid"}
+    try:
+        rows = ne_user_playlists(uid, offset=0, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("user_playlists failed uid=%s: %s: %s", uid, type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": []}
+    return {"ok": True, "data": rows, "uid": uid, "engine": "in-process"}
+
+
+@app.get("/api/v1/playlists/recommend")
+def playlists_recommend():
+    """网易云按账号口味的推荐歌单列表。需登录。"""
+    gate = _login_or_error("playlists/recommend")
+    if gate:
+        return gate
+    try:
+        rows = ne_recommend_playlists()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("recommend_resource failed: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": []}
+    return {"ok": True, "data": rows, "engine": "in-process"}
+
+
+@app.get("/api/v1/playlists/toplists")
+def playlists_toplists():
+    """排行榜清单（63 个左右）。无需登录。"""
+    try:
+        rows = ne_toplists()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("fetch_toplists failed: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": []}
+    return {"ok": True, "data": rows, "count": len(rows), "engine": "in-process"}
+
+
+@app.get("/api/v1/playlists/category")
+def playlists_category(cat: str = Query("华语"), order: str = Query("hot"),
+                       limit: int = Query(20, ge=1, le=50)):
+    """分类歌单。无需登录。order ∈ {hot,new}，非法值一律按 hot。"""
+    try:
+        rows = ne_category_playlists(cat, order, limit)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("top_playlists failed cat=%s: %s: %s", cat, type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": []}
+    return {"ok": True, "data": rows, "cat": cat, "order": order, "engine": "in-process"}
+
+
+@app.get("/api/v1/playlists/categories")
+def playlists_categories():
+    """歌单分类目录 {大类: [子类]}，供管理页做下拉选择。无需登录。"""
+    try:
+        return {"ok": True, "data": ne_playlist_categories()}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("playlist_catelogs failed: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
+
+
+@app.get("/api/v1/playlists/newalbums")
+def playlists_newalbums(limit: int = Query(20, ge=1, le=50)):
+    """新碟上架（专辑维度）。无需登录。"""
+    try:
+        return {"ok": True, "data": ne_new_albums(limit), "engine": "in-process"}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("new_albums failed: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": []}
+
+
+@app.get("/api/v1/radio/fm")
+def radio_fm(limit: int = Query(10, ge=1, le=20)):
+    """私人FM 曲目（一次一批，需登录）。"""
+    gate = _login_or_error("radio/fm")
+    if gate:
+        return gate
+    try:
+        rows = ne_personal_fm()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("personal_fm failed: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": []}
+    return {"ok": True, "data": rows[:limit], "engine": "in-process"}
+
+
+@app.get("/api/v1/playlist/{playlist_id}/tracks")
+def playlist_tracks(playlist_id: int = Path(..., ge=1), limit: int = Query(300, ge=1, le=1000)):
+    """歌单内的可播曲目。
+
+    不用 CLI ``playlist show``：它经 dig_info，任一首取不到直链就把整个歌单清空。
+    上游 playlist_songlist 返回的 trackIds 是 **dict 列表**（含 id/v/at），
+    已在 netease_ext.playlist_track_ids 里做了兼容。
+    """
+    try:
+        ids = ne_playlist_track_ids(playlist_id, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("playlist_songlist failed id=%s: %s: %s",
+                       playlist_id, type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": []}
+    if not ids:
+        return {"ok": True, "data": [], "playlist_id": playlist_id, "total_ids": 0,
+                "engine": "in-process"}
+    try:
+        rows = ne_songs_by_ids(ids, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("songs_by_ids failed id=%s: %s: %s",
+                       playlist_id, type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": []}
+    return {"ok": True, "data": rows, "playlist_id": playlist_id,
+            "total_ids": len(ids), "playable": len(rows), "engine": "in-process"}
+
+
+@app.get("/api/v1/album/{album_id}/tracks")
+def album_tracks(album_id: int = Path(..., ge=1), limit: int = Query(200, ge=1, le=1000)):
+    """专辑内可播曲目（新碟口径用）。不用 CLI ``album``（同样经 dig_info）。"""
+    try:
+        rows = ne_album_songs(album_id, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("album_songs failed id=%s: %s: %s", album_id, type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": []}
+    return {"ok": True, "data": rows, "album_id": album_id, "engine": "in-process"}
+
+
+@app.get("/api/v1/song/{song_id}/best_url")
+def song_best_url(song_id: int = Path(..., ge=1)):
+    """该账号能拿到的**最高品质**直链。
+
+    按 jymaster → hires → lossless → exhigh 逐档降级，命中的第一档即返回，
+    并附 best_quality 说明实际档位。收藏落盘下载走这个端点。
+    """
+    try:
+        info = ne_best_url_info(song_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("best_url_info failed id=%s: %s: %s", song_id, type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
+    if not info:
+        return {"ok": False, "error": "no_playable_quality", "data": {},
+                "tried": list(BEST_QUALITY_CHAIN)}
+    return {"ok": True, "data": info, "best_quality": info.get("best_quality"),
+            "tried": list(BEST_QUALITY_CHAIN), "engine": "in-process"}
+
+
+@app.post("/api/v1/song/{song_id}/like")
+@app.get("/api/v1/song/{song_id}/like")
+def song_like_toggle(song_id: int = Path(..., ge=1), like: bool = Query(True)):
+    """收藏同步回网易云：加红心 / 取消红心。需登录。
+
+    **这是对用户账号的写操作**，因此不静默失败：上游返回 False 或抛异常都如实
+    回传 error 字段，让代理侧能记日志并告知用户。
+    ``like=False``（取消红心）在 NEMbox 源码里从未被调用过，属未验证分支，
+    这里同样如实回传结果而不做乐观假设。
+    """
+    gate = _login_or_error("song/like")
+    if gate:
+        return gate
+    res = ne_song_like(song_id, like=like)
+    if not res.get("ok"):
+        logger.warning("song_like failed id=%s like=%s -> %s", song_id, like, res)
+    return {"ok": bool(res.get("ok")), "data": res, "engine": "in-process"}
+
+
+@app.get("/api/v1/channels/selftest")
+def channels_selftest():
+    """逐口径自检：每个推荐/歌单口径各自能不能取到数据、取到几条。
+
+    这些口径分散在上游不同接口，登录要求与返回字段都不一致，出问题时必须能一眼看出
+    **是哪一路挂了**，而不是只看到"歌单没出来"。管理页与诊断页共用。
+    """
+    logged_in = False
+    try:
+        logged_in = ne_check_is_logged_in()
+    except Exception:  # noqa: BLE001
+        logged_in = False
+
+    report: dict[str, Any] = {"logged_in": logged_in, "best_quality_chain": list(BEST_QUALITY_CHAIN)}
+
+    def probe(name, fn, needs_login=False):
+        if needs_login and not logged_in:
+            report[name] = {"skipped": "not_logged_in"}
+            return
+        try:
+            rows = fn()
+            n = len(rows) if isinstance(rows, (list, dict)) else 0
+            extra = ""
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                first = rows[0]
+                extra = str(first.get("name") or first.get("song_name") or "")[:24]
+            report[name] = {"ok": True, "count": n, "sample": extra}
+        except Exception as exc:  # noqa: BLE001
+            report[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+    def _probe_user_playlists():
+        # uid 必须解析成真实账号 id，传 0 上游只会给出无意义结果
+        uid = int((auth_detail() or {}).get("user_id") or 0)
+        if not uid:
+            raise RuntimeError("uid_unavailable: 无法确定当前登录账号 id")
+        return ne_user_playlists(uid)
+
+    probe("toplists", ne_toplists)
+    probe("category", lambda: ne_category_playlists("华语", "hot", 5))
+    probe("categories", ne_playlist_categories)
+    probe("new_albums", lambda: ne_new_albums(5))
+    probe("user_playlists", _probe_user_playlists, needs_login=True)
+    probe("recommend_playlists", ne_recommend_playlists, needs_login=True)
+    probe("personal_fm", ne_personal_fm, needs_login=True)
+    return {"ok": True, "data": report}
