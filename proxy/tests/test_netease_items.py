@@ -145,3 +145,70 @@ def test_apply_song_detail_never_downgrades_lossless():
                                            "album_pic_url": "http://c"})
     assert item["ext"] == "flac"
     assert item["cover_url"] == "http://c"
+
+
+# ===========================================================================
+# 代理侧试听判定 —— 与 musicbox 侧同源的这个坑
+#
+# proxy/app.py 曾用 item.get("freeTrialInfo") or item.get("freeTrialPrivilege")
+# 判试听。freeTrialPrivilege 是网易云每条 song/url 响应都必带的结构体，恒为真理值，
+# 于是任何喂进上游原始条目的调用方（is_playable_online_track 共 5 处调用，
+# 其中之一直接吃 raw）都会把全部曲目杀光。
+# ===========================================================================
+
+from proxy.app import _has_trial_fragment, is_playable_online_track
+
+_REAL_OK = {
+    "title": "拉布拉多", "id": 1998849460,
+    "download_url": "http://m701.music.126.net/x.mp3?vuutv=abc",
+    "url": "http://m701.music.126.net/x.mp3?vuutv=abc",
+    "fee": 8, "code": 200,
+    "freeTrialInfo": None,            # None = 无试听
+    "freeTrialPrivilege": {           # 恒存在，存在 ≠ 试听
+        "resConsumable": False, "userConsumable": False,
+        "listenType": None, "cannotListenReason": None,
+        "playReason": None, "freeLimitTagType": None,
+    },
+}
+
+
+def test_free_trial_privilege_presence_does_not_reject():
+    """核心回归：带恒存在的 freeTrialPrivilege 的正常曲目必须放行。"""
+    assert _has_trial_fragment(_REAL_OK) is False
+    assert is_playable_online_track(_REAL_OK) is True, "修复前这里必被误杀"
+
+
+@pytest.mark.parametrize("flag_key", ["resConsumable", "userConsumable"])
+def test_trial_detected_via_inner_booleans(flag_key):
+    bad = dict(_REAL_OK)
+    bad["freeTrialPrivilege"] = dict(_REAL_OK["freeTrialPrivilege"], **{flag_key: True})
+    assert _has_trial_fragment(bad) is True
+    assert is_playable_online_track(bad) is False
+    # 不同接口序列化不一致，字符串 "true" 也要认
+    s = dict(_REAL_OK)
+    s["freeTrialPrivilege"] = dict(_REAL_OK["freeTrialPrivilege"], **{flag_key: "true"})
+    assert _has_trial_fragment(s) is True
+
+
+def test_free_trial_info_non_empty_means_trial():
+    """freeTrialInfo 语义相反：非空即真试听，None/空才是无试听。"""
+    t = dict(_REAL_OK)
+    t["freeTrialInfo"] = {"st": 0, "et": 60}
+    assert _has_trial_fragment(t) is True
+    assert is_playable_online_track(t) is False
+
+    assert _has_trial_fragment({"freeTrialInfo": None}) is False
+    assert _has_trial_fragment({"freeTrialInfo": {}}) is False
+
+
+def test_is_trial_flag_still_honoured():
+    """显式 is_trial 标记照旧拦截，别被这次修复顺手放宽。"""
+    t = dict(_REAL_OK, is_trial=True)
+    assert is_playable_online_track(t) is False
+
+
+def test_has_trial_fragment_never_raises_on_junk():
+    for junk in ({}, {"freeTrialPrivilege": None}, {"freeTrialPrivilege": "x"},
+                 {"freeTrialInfo": []}, {"freeTrialPrivilege": 7}):
+        assert _has_trial_fragment(junk) is False
+    assert _has_trial_fragment({"freeTrialInfo": "y"}) is True

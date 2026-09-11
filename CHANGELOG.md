@@ -3,6 +3,94 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.1.5] - 2026-09-11
+
+**这一版才是「搜不到任何在线歌曲 / 每日推荐永远为空」的真正根因。**
+
+2.1.3 与 2.1.4 修的都是真实存在的 bug（`dig_info` 全或无、cookie 单例过期），但都不是
+这个症状的原因。装完 2.1.4 后的真机诊断显示：登录态三层已完全一致（`auth/status`、
+`auth/detail`、登录态探测全部为已登录 VIP，`free_only=false`），
+日志也确实出现「已重建 NEMbox 实例」——**然而搜索与日推依旧为空**，
+且连 CLI 回退也是 0 条。CLI 是全新子进程、读的就是最新 cookie，它同样拿不到数据，
+说明问题已经不在登录态与 cookie 上。
+
+### 根因
+
+可播性判定把 NetEase 响应里**恒存在**的结构体当成了试听标记：
+
+```python
+free_trial = item.get("freeTrialInfo") or item.get("freeTrialPrivilege")
+if not url or not str(url).strip() or code == 404 or free_trial:
+    continue          # ← 100% 曲目在这里被剔除
+```
+
+真机匿名调用 `api.songs_url()` 抓到的真实响应里，**每一条**都长这样：
+
+```python
+'freeTrialInfo': None,                                          # 假值
+'freeTrialPrivilege': {'resConsumable': False,
+                       'userConsumable': False, ...},           # 非空 dict＝真理值
+```
+
+`freeTrialInfo` 为 `None` 于是 `or` 落到 `freeTrialPrivilege`——它是网易云 song/url
+接口**每条响应都必带**的标准结构体，永远是非空 dict。因此 `free_trial` **恒为真**，
+每一首歌无论是否登录、是否 VIP、是否真拿到直链，都被判成「试听片段」剔除。
+
+实测复现（匿名，真实上游）：
+
+| | `songs_url` 原始结果 | 我们的 `filter_playable_song_ids` |
+| --- | --- | --- |
+| 修复前 | 5 条，其中 3 条带真实 320k 直链 | **0 / 5** |
+| 修复后 | 同上 | **4 / 5** |
+
+这也解释了为什么前三轮修复都没能让症状消失——它们各自修对了真 bug，
+但没有一个触及这一行。
+
+两个字段的语义**恰好相反**，混用真值判断是错误来源：
+
+- `freeTrialPrivilege`：**恒存在**，存在与否不代表试听；只有内部的
+  `resConsumable` / `userConsumable` 为 True 才表示正在消耗试听额度。
+- `freeTrialInfo`：`None` 表示**无**试听，只有确实是试听曲目才带非空内容
+  （形如 `{"st": 起始秒, "et": 结束秒}`），对它做存在性判断才是安全的。
+
+### 修复
+
+- `musicbox-service/netease_ext.py`：抽出 `is_trial_snippet()` 按上述真实语义判定，
+  替换 `playable_url_map()` 里的真值误判。
+- `proxy/app.py`：抽出 `_has_trial_fragment()` 修正 `is_playable_online_track()` 里的
+  **同源缺陷**。该函数共 5 处调用，其中第 1034 行直接把上游原始条目（`raw`）喂进去——
+  当前主链路因 musicbox 已做字段映射而未触发，属于潜伏 bug，一并修掉。
+- 判定只返回布尔、对任意坏字段类型都不抛异常，避免把整批搜索打成空。
+
+### 验证
+
+用真实 `NetEase-MusicBox 0.5.3` + 真实上游接口端到端复验（匿名账号）：
+
+- 搜索「拉布拉多」→ musicbox 侧 3 条，经代理两道可播性关卡后**存活 3 条**，
+  均为 `HD 320k` 且带真实直链；修复前为 **0 条**。
+- 搜索「周杰伦」→ 0 条，**这是正确行为**：匿名下上游对该关键词全部 8 首返回
+  `code=404`、`url=null`（网易云拒绝对未登录用户发放直链）。真机为已登录 VIP，
+  会正常拿到直链。特意核对这一点，是为了不把「上游拒绝」误当成「我们的 bug」。
+
+### 测试
+
+新增 12 个用例（**495 passed / 1 skipped**，真实 NEMbox 环境；
+**491 passed / 5 skipped**，系统 python）：
+
+- 用**真机抓到的完整真实响应结构**钉住「`freeTrialPrivilege` 恒存在 ≠ 试听」
+- 试听只能通过内部布尔位（`resConsumable` / `userConsumable`）识别，
+  且 `True` 与字符串 `"true"` 都要认（不同接口序列化不一致）
+- `freeTrialInfo` 非空即试听、`None` 与空 dict 不算
+- 显式 `is_trial` 标记照旧拦截，不被本次修复顺手放宽
+- 各类坏字段（`None` / 字符串 / 数字 / 列表）只返回布尔、绝不抛异常
+- `playable_url_map` 与 `search_songs` 喂真实响应必须放行并给出正确音质
+  （`br=320000 → HD 320k`）
+- 代理侧同上（同源缺陷必须一并守住）
+
+> 附带修正：上一版为 `test_get_api_rebuilds_when_cookie_file_changes` 等 4 个用例
+> 引入的「需要真实 NEMbox 包」跳过机制工作正常，本次未改动。
+
+
 ## [2.1.4] - 2026-09-11
 
 修复「扫码登录明明成功了，搜索与每日推荐依然是空的」——这是 2.1.3 之后仍然复现的

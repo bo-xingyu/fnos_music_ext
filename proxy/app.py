@@ -192,6 +192,28 @@ ONLINE_TRIAL_MARKERS = (
 )
 
 
+def _has_trial_fragment(item: dict) -> bool:
+    """条目是否只是「试听片段」。
+
+    不能用 ``item.get("freeTrialInfo") or item.get("freeTrialPrivilege")`` 这种写法：
+    ``freeTrialPrivilege`` 是网易云**每条 song/url 响应都必带**的标准结构体，
+    正常曲目也一定存在且是非空 dict（真理值）。用它做真值判断会把**每一首歌**都判成
+    试听而剔除，与是否登录、是否 VIP 完全无关，表现为「搜不到任何在线歌曲」。
+    真正的信号在这个结构体**内部的布尔位**：``resConsumable`` / ``userConsumable``
+    为 True 才表示正在消耗试听额度。``freeTrialInfo`` 语义正好相反：None 表示无试听，
+    **只有确实是试听曲目才带非空内容**（形如 ``{"st": 起始秒, "et": 结束秒}``），
+    因此对它做存在性判断是安全的。两者混在一起做真值判断正是本 bug 的成因。
+    """
+    def flag(d, k):
+        v = d.get(k) if isinstance(d, dict) else None
+        return v is True or str(v).lower() == "true"
+
+    priv = item.get("freeTrialPrivilege")
+    if flag(priv, "resConsumable") or flag(priv, "userConsumable"):
+        return True
+    return bool(item.get("freeTrialInfo"))
+
+
 def is_playable_online_track(item: dict, require_id: bool = False) -> bool:
     """最终防线校验：过滤无音频流或试听标记的不可播曲目。"""
     if not isinstance(item, dict):
@@ -211,7 +233,7 @@ def is_playable_online_track(item: dict, require_id: bool = False) -> bool:
         return False
 
     # 2. 字段试听标记
-    if item.get("is_trial") is True or item.get("freeTrialInfo") or item.get("freeTrialPrivilege"):
+    if item.get("is_trial") is True or _has_trial_fragment(item):
         return False
     if int(item.get("is_free_part") or 0) != 0 or int(item.get("fail_process") or 0) == 4:
         return False

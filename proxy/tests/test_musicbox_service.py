@@ -1066,3 +1066,123 @@ def test_playable_filter_uses_current_login_state(real_cookie_dir, monkeypatch):
     ne2.invalidate_login_cache()
     # 第二次：账号已登录 -> VIP 曲放行
     assert ne2.filter_playable_song_ids([1, 2]) == {1, 2}
+
+
+# ===========================================================================
+# 试听片段判定 —— 「搜不到任何在线歌曲」的真正根因
+#
+# 真机抓到的 NetEase song/url 响应里，**每一条**都带 freeTrialPrivilege 结构体：
+#     'freeTrialInfo': None,
+#     'freeTrialPrivilege': {'resConsumable': False, 'userConsumable': False, ...}
+# 而判定曾写成：
+#     free_trial = item.get("freeTrialInfo") or item.get("freeTrialPrivilege")
+#     if ... or free_trial: continue
+# freeTrialInfo 为 None（假值）→ 取 freeTrialPrivilege → 永远是非空 dict（真理值）
+# → 5/5 条全部被当成试听片段剔除。与是否登录、是否 VIP 完全无关，
+# 所以前面修 cookie 单例、修 dig_info 逐首过滤后症状都不消失。
+# 真正的试听信号在结构体内部的 resConsumable / userConsumable 布尔位。
+# ===========================================================================
+
+# 真机匿名调用 api.songs_url() 抓到的真实条目（fee=8 有直链的正常曲目）
+_REAL_TRACK_OK = {
+    "id": 1998849460,
+    "url": "http://m701.music.126.net/20260911213658/935a/jdymusic/x.mp3?vuutv=abc",
+    "br": 320000, "size": 9653856, "code": 200, "type": "mp3",
+    "fee": 8, "payed": 0, "flag": 2064646,
+    "freeTrialInfo": None,                     # ← None 表示无试听
+    "level": "exhigh",
+    "freeTrialPrivilege": {                    # ← 每条必带，存在≠试听
+        "resConsumable": False, "userConsumable": False,
+        "listenType": None, "cannotListenReason": None,
+        "playReason": None, "freeLimitTagType": None,
+    },
+    "freeTimeTrialPrivilege": {
+        "resConsumable": False, "userConsumable": False, "type": 0, "remainTime": 0,
+    },
+}
+
+
+def test_free_trial_privilege_presence_is_not_a_trial_flag():
+    """核心回归：freeTrialPrivilege 恒存在，不能拿它的存在当试听判定。"""
+    assert ne2.is_trial_snippet(_REAL_TRACK_OK) is False, (
+        "正常曲目被误判为试听片段 —— 这就是「搜不到任何在线歌曲」的根因"
+    )
+
+
+def test_trial_detected_only_via_inner_booleans():
+    """只有内部布尔位为 True 才算试听。"""
+    for flag_key in ("resConsumable", "userConsumable"):
+        bad = dict(_REAL_TRACK_OK)
+        bad["freeTrialPrivilege"] = dict(_REAL_TRACK_OK["freeTrialPrivilege"],
+                                         **{flag_key: True})
+        assert ne2.is_trial_snippet(bad) is True, f"{flag_key}=True 应判定为试听"
+        # 字符串 "true" 也要认（不同接口序列化不一致）
+        s = dict(_REAL_TRACK_OK)
+        s["freeTrialPrivilege"] = dict(_REAL_TRACK_OK["freeTrialPrivilege"],
+                                       **{flag_key: "true"})
+        assert ne2.is_trial_snippet(s) is True
+
+
+def test_trial_info_struct_is_a_real_trial():
+    """freeTrialInfo 语义相反：非空即真试听，None/空才是无试听。"""
+    t = dict(_REAL_TRACK_OK)
+    t["freeTrialInfo"] = {"st": 0, "et": 60}
+    assert ne2.is_trial_snippet(t) is True, "带试听区间 = 试听片段"
+
+    f = dict(_REAL_TRACK_OK)
+    f["freeTrialInfo"] = {"resConsumable": True}
+    assert ne2.is_trial_snippet(f) is True
+
+    assert ne2.is_trial_snippet(dict(_REAL_TRACK_OK)) is False
+    assert ne2.is_trial_snippet({"freeTrialInfo": None}) is False
+    assert ne2.is_trial_snippet({"freeTrialInfo": {}}) is False, "空结构体不算试听"
+
+
+def test_is_trial_snippet_never_raises_on_junk():
+    """坏字段类型只能返回布尔，绝不能抛出去把整批搜索打成空。"""
+    for junk in ({}, {"freeTrialPrivilege": None}, {"freeTrialPrivilege": "x"},
+                 {"freeTrialInfo": []}, {"freeTrialInfo": ""},
+                 {"freeTrialInfo": 0}, {"freeTrialPrivilege": 7}):
+        assert ne2.is_trial_snippet(junk) is False
+    # 非空未知值按上游语义保守判为试听，但同样不能抛
+    assert ne2.is_trial_snippet({"freeTrialInfo": "y"}) is True
+
+
+def test_playable_url_map_keeps_real_world_payload(monkeypatch):
+    """端到端：把真机抓到的响应喂给 playable_url_map，必须放行。"""
+    monkeypatch.setattr(ne2, "check_is_logged_in", lambda force=False: False)
+    monkeypatch.setitem(_REAL_TRACK_OK, "id", 1998849460)
+
+    class _Api:
+        def songs_url(self, ids):
+            return [dict(_REAL_TRACK_OK)]
+
+    monkeypatch.setattr(ne2, "_get_api", lambda: _Api())
+    kept = ne2.filter_playable_song_ids([1998849460])
+    assert kept == {1998849460}, "修复前这里是 set() —— 全被误杀"
+
+    m = ne2.playable_url_map([1998849460])
+    assert m[1998849460]["code"] == 200
+
+
+def test_search_songs_returns_tracks_for_real_payload(monkeypatch):
+    """搜索链路：原始响应含恒存在的 freeTrialPrivilege 时结果不能为空。"""
+    raw_songs = [{"id": 1998849460, "name": "拉布拉多",
+                  "ar": [{"name": "孙这"}], "al": {"id": 1, "picUrl": ""},
+                  "dt": 241285}]
+
+    class _Api:
+        def search(self, kw, limit=50, **kw2):
+            return {"songs": list(raw_songs), "songCount": 1}
+
+        def songs_url(self, ids):
+            return [dict(_REAL_TRACK_OK)]
+
+    monkeypatch.setattr(ne2, "_get_api", lambda: _Api())
+    monkeypatch.setattr(ne2, "check_is_logged_in", lambda force=False: True)
+    out = ne2.search_songs("拉布拉多", limit=5)
+    assert len(out) == 1
+    assert out[0]["song_name"] == "拉布拉多"
+    assert out[0]["artist"] == "孙这"
+    assert out[0]["mp3_url"].startswith("http")
+    assert out[0]["quality"], "音质必须判定出来（br=320000 -> HD 320k）"

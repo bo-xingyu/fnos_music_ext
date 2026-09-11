@@ -262,6 +262,35 @@ def filter_playable_song_ids(ids: list[int]) -> set[int]:
     return set(playable_url_map(ids).keys())
 
 
+def _flag_of(d: Any, key: str) -> bool:
+    v = d.get(key) if isinstance(d, dict) else None
+    return v is True or str(v).lower() == "true"
+
+
+def is_trial_snippet(item: dict[str, Any]) -> bool:
+    """判定该曲目是否只是「试听片段」（不能真正播放）。
+
+    .. warning:: 千万不要写成 ``item.get("freeTrialInfo") or item.get("freeTrialPrivilege")``。
+
+    ``freeTrialPrivilege`` 是网易云**每条 song/url 响应都必带**的标准结构体，即使
+    一切正常也存在，且是个非空 dict（＝真理值）。用它做真值判断会让**每一首歌**都被
+    判成试听片段而剔除 —— 与是否登录、是否 VIP 完全无关，表现为「搜不到任何在线歌曲、
+    每日推荐永远为空」。真正的试听信号在这个结构体**内部的布尔位**里：
+
+    ``resConsumable`` / ``userConsumable`` 为 True 表示正在消耗试听额度。
+
+    ``freeTrialInfo`` 则相反：它为 None 时表示无试听，**只有确实是试听曲目才带非空内容**
+    （形如 ``{"st": 起始秒, "et": 结束秒}``），因此对它做存在性判断是安全的。
+
+    两个字段的语义刚好相反，混在一起用真值判断正是本 bug 的成因。
+    """
+    priv = item.get("freeTrialPrivilege")
+    if _flag_of(priv, "resConsumable") or _flag_of(priv, "userConsumable"):
+        return True
+    info = item.get("freeTrialInfo")
+    return bool(info) and info is not None
+
+
 def playable_url_map(ids: list[int]) -> dict[int, dict[str, Any]]:
     """返回 {song_id: 直链信息} ——只包含当前账号**真实可播**的曲目。
 
@@ -302,10 +331,9 @@ def playable_url_map(ids: list[int]) -> dict[int, dict[str, Any]]:
         url = item.get("url")
         code = item.get("code")
         fee = item.get("fee", 0)
-        free_trial = item.get("freeTrialInfo") or item.get("freeTrialPrivilege")
 
         # 核心铁律：拿不到真实直链一律不放行，试听片段同样不放行
-        if not url or not str(url).strip() or code == 404 or free_trial:
+        if not url or not str(url).strip() or code == 404 or is_trial_snippet(item):
             continue
         # 未登录时降级：只保留免费曲目（fee 0=免费，8=VIP 但未登录必然无 url，已被上面挡掉）
         if not logged_in and FREE_ONLY_ON_LOGOUT and fee not in (0, 8):
