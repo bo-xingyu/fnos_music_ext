@@ -3,6 +3,128 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.1.7] - 2026-09-11
+
+2.1.6 之后播放已经正常。本版处理真机反馈的三个问题：**每次装新版都要重新扫码**、
+**搜索结果与每日推荐没有封面**、**点开一首歌到出声约 4 秒**。三者根因互不相同。
+
+### 1. 登录凭证持久化：装新版不再需要重新扫码
+
+**根因是卸载脚本里一个写错的条件**：
+
+```bash
+if is_true "${REMOVE_DATA}" || is_true "${REMOVE_LIB}" || true; then
+    rm -rf "${RUN_DIR}"     # ← 末尾的 || true 让它恒为真
+fi
+```
+
+紧挨着它上面的注释写的是「用户数据默认保留；`wizard_remove_data` /
+`wizard_remove_library_cache` 为 true 时才删除」——`|| true` 使注释与代码完全相反：
+**无论用户是否勾选，运行目录整个被删**。而网易云登录凭证当时住在
+`${RUN_DIR}/musicbox-data` 里，于是每装一次新版就丢一次 cookie。
+
+手动安装 fpk 走的正是「卸载 + 安装」而不是「保留数据的升级」（真机诊断日志里
+每次安装前都有 `uninstall.log` 与完整 stop 流程，可与此对上），所以表现为**必现**。
+
+修复分两层：
+
+- **凭证搬家**：网易云 cookie 与 NEMbox 运行时数据迁到 `${PKGVAR}/musicbox-data`，
+  即 RUN_DIR **之外**。依据是 `${PKGVAR}/logs` 本就能跨安装留存（诊断里能看到多次
+  安装的历史日志），说明 PKGVAR 自身在卸载/重装后不会被清空。服务的
+  `XDG_DATA_HOME/CACHE_HOME/CONFIG_HOME` 随之指向新位置。
+- **改回尊重勾选**：默认保留运行数据；只有勾选删除数据时才连凭证一起清理。
+  即便不删，也会把 `.env` 快照到 `${PKGVAR}/.env.preserved`，重装时若向导里
+  PushPlus token 为空就自动恢复，免得重填。
+
+迁移逻辑（`lib_migrate_musicbox_data`）刻意保守，全部有真实 bash 执行的测试覆盖：
+
+- 幂等；旧目录不存在时安静跳过，绝不让安装失败
+- **新位置已有 cookie 时绝不覆盖**——否则会把用户刚扫好的码冲掉，比不迁移更糟
+- 迁移后把 `cookie.txt` 收紧到 **0600**、目录 0700；且这个 `chmod` 不能写在
+  「能取到包用户名」的判断之后（原先如此），否则异常环境下敏感凭证停留在 0644，
+  本机其他用户可读
+
+### 2. 封面：改为由 NAS 代抓回传，不再依赖客户端直连网易云 CDN
+
+先排除了一种猜测：**不是 HTTPS 混合内容问题**——实测上游 `al.picUrl` 返回的
+就是 `https://p1.music.126.net/...`。也验证了我们这侧的输出完全正确：
+
+| 检查项 | 实测结果 |
+| --- | --- |
+| 搜索列表 JSON 的 `cover_url` / `coverUrl` | 已填充 https 封面（enrich 生效） |
+| `/static/cover` 裸冒号 / `%3A` 编码 / 双重编码 / query / path | 5 种形态**全部** 302 到正确封面 |
+
+原实现是 `RedirectResponse(302)`，把取图这件事完全交给客户端。它依赖两件我们无法
+保证的事：客户端能直连 `p1.music.126.net`，且该 CDN 不校验 Referer/Origin。
+任一不成立，界面表现就是「列表里没有封面」。
+
+因此改为**由 NAS 代抓图片字节再回传**，并附 `Cache-Control: public, max-age=86400`；
+代抓失败时**退回原来的 302**，不把好走的那条路也堵死。
+
+顺带发现并修掉一处浪费：封面端点原先调 `_online_info`，而它会**顺带去拉一次歌词**
+（另一个上游往返）——为一张缩略图取歌词毫无意义。新增 `_online_cover_url()`
+只打一次 `/song/{id}/info` 取 `al.picUrl`。
+
+另据实测记录一笔：上游 `search` 接口返回的 `al` 是**完全空的**（`picUrl=None`），
+封面必须靠 `/api/v1/songs/detail` 补齐；这一步本来就有（0.16s），无需新增。
+
+### 3. 点开歌曲约 4 秒：元数据重复回源
+
+实测拆解（真实 NEMbox + 真实上游）：
+
+| 环节 | 耗时 |
+| --- | --- |
+| 流式转发首字节（Range 命中刚落盘的缓存） | **0.02s** |
+| 流式转发首字节（含从网易云拉 1.78MB 整首） | 0.84s |
+| `resolve_netease_url` | 0.13s |
+| `resolve_netease_url` + `_online_info` 并发 | 0.30s |
+
+音频流转本身没问题，时间耗在**元数据重复回源**上：`_online_info` 原先**没有任何缓存**，
+而 `/static/metadata`、`/lyric/list`、`/static/cover` 与播放路径都各自调它一次，
+每次都是 `/song/{id}/info` + `/song/{id}/lyric` 两个上游往返。点开一首歌要重复好几轮。
+
+单曲的标题/艺术家/专辑/时长/封面/歌词是**静态**数据，因此加 TTL 缓存
+（元数据默认 3600s、封面 86400s，可用 `FNMUSIC_INFO_CACHE_TTL` /
+`FNMUSIC_COVER_CACHE_TTL` 调整），命中后**零上游往返**。
+
+两条设计取舍：
+
+- **只缓存成功结果**：失败多半是上游瞬时抖动，缓存下来会把一次偶发失败
+  固化成整段 TTL 内都没有元数据，比多回源一次更糟。空封面同理。
+- `_online_info` 成功时**顺带填封面缓存**，随后的 `/static/cover` 直接命中。
+  缓存有上限（默认 2000 条），超限按写入时间淘汰最旧的一半，不会无界增长。
+- 登录成功后经 `/_ext/cache/invalidate` 一并清空（新增 `online_info_entries` 计数字段）。
+
+### 测试
+
+新增 29 个用例（**540 passed / 5 skipped**，系统 python；
+**544 passed / 1 skipped**，真实 `NetEase-MusicBox 0.5.3`）。
+
+新建 `proxy/tests/test_fpk_persistence.py`，对安装/卸载脚本做**真实 bash 执行**验证，
+而不只是比对文本：
+
+- `|| true` 恒真条件的回归断言；凭证目录必须在 RUN_DIR 之外，且
+  `fnmusic-lib.sh` 与 `uninstall_callback` 两处定义必须一致（脚本间契约）
+- `start.sh` 的三个 XDG 变量必须都指向持久目录，且不得再出现旧路径
+- `chmod 600` 必须排在「包用户名存在」判断之前
+- 真实执行迁移：搬迁成功且内容原样、权限 0600/0700、幂等、**绝不覆盖新扫的码**、
+  旧目录缺失时安全跳过、建出 NEMbox 需要的三级目录
+- 真实执行 `uninstall_callback` 两个分支：默认保留凭证并生成 `.env` 快照；
+  勾选删除时才删凭证与运行目录，且日志如实记录
+
+缓存与封面：
+
+- 第二次 `_online_info` 零上游往返；TTL 过期后必须回源；**失败不缓存**且允许重试
+- `_online_info` 成功后必须填上封面缓存
+- `_online_cover_url` **只打一次 `/info`、绝不打 `/lyric`**；空封面不缓存
+- `invalidate_online_info_cache` 清空两份缓存；`_cache_put_prune` 淘汰最旧一半而非最新
+- `/static/cover` 代抓成功时返回图片字节 + `image/*` + `Cache-Control: max-age`；
+  代抓失败时退回 302 且 `Location` 为原封面地址
+
+> 测试基建：conftest 的 autouse fixture 增加清理这两份新缓存。它们是进程级 dict，
+> 不清会让「同 guid 第二次调用」静默命中上一个用例的数据，排查起来极其迷惑。
+
+
 ## [2.1.6] - 2026-09-11
 
 修复 2.1.5 之后暴露的下一个症状：**「搜索结果和歌单都出来了，但一直缓冲、无法播放」**。

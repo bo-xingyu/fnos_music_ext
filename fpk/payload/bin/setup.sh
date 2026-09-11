@@ -67,17 +67,13 @@ stage_code() {
     done
     # 数据目录（首次创建，之后一律保留）
     mkdir -p "${RUN_DIR}/cache" "${RUN_DIR}/online_favorites" \
-             "${RUN_DIR}/play_history" "${RUN_DIR}/recommend_cache" \
-             "${RUN_DIR}/musicbox-data/cache/netease-musicbox" \
-             "${RUN_DIR}/musicbox-data/config/netease-musicbox" \
-             "${RUN_DIR}/musicbox-data/netease-musicbox" || true
+             "${RUN_DIR}/play_history" "${RUN_DIR}/recommend_cache" || true
     chmod +x "${RUN_DIR}/restore.sh" "${RUN_DIR}/netease_login.sh" \
              "${RUN_DIR}/proxy/run_proxy.sh" "${RUN_DIR}"/bin/*.sh 2>/dev/null || true
-    # 网易云登录凭证必须归包用户所有，降权运行的 musicbox 才写得进去
-    if [ -n "${TRIM_USERNAME:-}" ] && id "${TRIM_USERNAME}" >/dev/null 2>&1; then
-        chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME:-${TRIM_USERNAME}}" \
-            "${RUN_DIR}/musicbox-data" 2>/dev/null || true
-    fi
+    # 网易云登录凭证放在 ${PKGVAR}/musicbox-data（RUN_DIR 之外），跨安装/重装持久；
+    # 先把旧版本的凭证迁过来，再确保目录结构与属主正确。
+    lib_migrate_musicbox_data
+    lib_ensure_musicbox_data_dirs
     return 0
 }
 
@@ -90,6 +86,14 @@ write_env_file() {
         # token 留空 = 保持已保存值不变（避免配置页误提交把 token 冲掉）
         local kept
         kept="$(lib_read_env_value FNMUSIC_PUSHPLUS_TOKEN "")"
+        if [ -z "${kept}" ] && [ -f "${PKGVAR}/.env.preserved" ]; then
+            # 「卸载+重装」后 RUN_DIR 已被删除，.env 不在了。手动安装新版 fpk 走的
+            # 正是这条路径，向导里的 token 又是空的 —— 从卸载前快照恢复，
+            # 免得用户每次重装都要重新填 PushPlus token。
+            kept="$(grep -E '^FNMUSIC_PUSHPLUS_TOKEN=' "${PKGVAR}/.env.preserved" 2>/dev/null |
+                    tail -n 1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//')"
+            [ -n "${kept}" ] && lib_log "已从 ${PKGVAR}/.env.preserved 恢复 PushPlus token（值不落日志）"
+        fi
         token_line="$(dq "${kept}")"
     fi
 

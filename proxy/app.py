@@ -1491,9 +1491,10 @@ async def ext_cache_invalidate():
         logger.warning("purge daily cache failed: %s", exc)
 
     netease_auth.invalidate_state()
+    purged_info = invalidate_online_info_cache()
     logger.info(
-        "cache invalidated: search=%d daily_tasks=%d daily_files=%d login_state=reset",
-        dropped_search, daily_tasks, purged_daily,
+        "cache invalidated: search=%d daily_tasks=%d daily_files=%d info=%d login_state=reset",
+        dropped_search, daily_tasks, purged_daily, purged_info,
     )
     return {
         "ok": True,
@@ -1501,6 +1502,7 @@ async def ext_cache_invalidate():
             "search_entries": dropped_search,
             "daily_tasks": daily_tasks,
             "daily_cache_files": purged_daily,
+            "online_info_entries": purged_info,
             "login_state": True,
         },
     }
@@ -1996,8 +1998,112 @@ async def track_transcode(request: Request):
     )
 
 
+# ---------------------------------------------------------------------------
+# 在线曲目元数据缓存
+#
+# 单曲的标题/艺术家/专辑/时长/封面/歌词是**静态**数据，不会变。原先每次
+# /static/metadata、/lyric/list、/static/cover、播放路径都各自向 musicbox 发一次
+# /api/v1/song/{id}/info + 一次 /api/v1/song/{id}/lyric（两个上游往返），
+# 一首歌点开要重复好几轮 —— 实测这是「点击到出声约 4s」的主要构成
+# （真正的流式转发改进后首字节仅 0.02~0.84s）。
+#
+# 只缓存**成功**结果：失败多半是上游瞬时抖动，缓存下来会把一次偶发失败
+# 固化成一整段 TTL 里都无元数据，比多回源一次更糟。
+# ---------------------------------------------------------------------------
+
+_ONLINE_INFO_CACHE: dict[str, tuple[float, dict]] = {}
+_ONLINE_INFO_TTL = float(os.environ.get("FNMUSIC_INFO_CACHE_TTL", "3600"))
+_ONLINE_INFO_MAX = int(os.environ.get("FNMUSIC_INFO_CACHE_MAX", "2000"))
+
+# 封面单独一份缓存：取封面只需要 /info 里的 al.picUrl，绝不该顺带去拉歌词
+# （歌词是另一个上游往返，对一张缩略图毫无意义）。
+_ONLINE_COVER_CACHE: dict[str, tuple[float, str]] = {}
+_ONLINE_COVER_TTL = float(os.environ.get("FNMUSIC_COVER_CACHE_TTL", "86400"))
+
+
+def _cache_put_prune(store: dict, max_entries: int) -> None:
+    """超过上限时按写入时间淘汰最旧的一半，避免无界增长。"""
+    if len(store) <= max_entries:
+        return
+    for k in sorted(store, key=lambda kk: store[kk][0])[: max(1, max_entries // 2)]:
+        store.pop(k, None)
+
+
+def invalidate_online_info_cache() -> int:
+    """清空元数据与封面缓存，返回丢弃条目数。"""
+    n = len(_ONLINE_INFO_CACHE) + len(_ONLINE_COVER_CACHE)
+    _ONLINE_INFO_CACHE.clear()
+    _ONLINE_COVER_CACHE.clear()
+    return n
+
+
+async def _fetch_cover_bytes(url: str) -> tuple[bytes, str] | None:
+    """代抓封面图片字节。抽成函数是为了给测试留一个干净的接缝。
+
+    返回 ``(图片字节, content-type)``；抓不到或不是图片则返回 ``None``。
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as pic_client:
+            pic = await pic_client.get(url)
+        if pic.status_code != 200 or not pic.content:
+            return None
+        ctype = (pic.headers.get("content-type") or "").split(";")[0].strip()
+        if ctype and not ctype.startswith("image/"):
+            return None
+        return pic.content, ctype or "image/jpeg"
+    except Exception as e:  # noqa: BLE001
+        logger.warning("proxying cover failed for %s: %s: %s", url[:80], type(e).__name__, e)
+        return None
+
+
+async def _online_cover_url(request: Request, guid: str) -> str:
+    """只取封面地址，不拉歌词。命中缓存时零上游往返。"""
+    now = time.time()
+    hit = _ONLINE_COVER_CACHE.get(guid)
+    if hit and now - hit[0] < _ONLINE_COVER_TTL:
+        return hit[1]
+
+    song_id = song_id_from_online_guid(guid).split(":")[-1]
+    if not song_id:
+        return ""
+    src = source_from_online_guid(guid)
+    if src and src != NETEASE_SOURCE:
+        return ""
+
+    cover = ""
+    try:
+        r = await get_musicbox_client(request.app).get(
+            f"/api/v1/song/{song_id}/info", timeout=10.0
+        )
+        if r.status_code == 200:
+            res = r.json()
+            if isinstance(res, dict) and res.get("ok") is not False:
+                data = res.get("data")
+                if isinstance(data, dict):
+                    al = data.get("al")
+                    if not isinstance(al, dict):
+                        al = {}
+                    cover = str(al.get("picUrl") or al.get("pic_url") or "").strip()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("online cover fetch failed for %s: %s: %s",
+                       guid, type(e).__name__, e)
+        return ""
+
+    # 空结果不缓存：那多半是上游瞬时失败，缓存会让封面长时间空白
+    if not cover:
+        return ""
+    _ONLINE_COVER_CACHE[guid] = (now, cover)
+    _cache_put_prune(_ONLINE_COVER_CACHE, _ONLINE_INFO_MAX)
+    return cover
+
+
 async def _online_info(request: Request, guid: str) -> dict | None:
-    """在线曲目元数据：只走网易云（唯一音源）。"""
+    """在线曲目元数据：只走网易云（唯一音源）。结果按 TTL 缓存。"""
+    now = time.time()
+    hit = _ONLINE_INFO_CACHE.get(guid)
+    if hit and now - hit[0] < _ONLINE_INFO_TTL:
+        return hit[1]
+
     src = source_from_online_guid(guid)
     if src and src != NETEASE_SOURCE:
         return None
@@ -2061,7 +2167,7 @@ async def _online_info(request: Request, guid: str) -> dict | None:
             logger.warning("musicbox lyric fetch in _online_info failed for %s: %s: %s",
                          guid, type(l_err).__name__, l_err)
 
-        return {
+        record = {
             "id": f"{NETEASE_SOURCE}:{song_id}",
             "source": NETEASE_SOURCE,
             "title": str(data.get("name") or ""),
@@ -2073,6 +2179,13 @@ async def _online_info(request: Request, guid: str) -> dict | None:
             "file_size": file_size,
             "lyric": lyric_text,
         }
+        if cover_url:
+            # 顺带把封面缓存也填上：/static/cover 随后就能零上游往返命中
+            _ONLINE_COVER_CACHE[guid] = (time.time(), cover_url)
+            _cache_put_prune(_ONLINE_COVER_CACHE, _ONLINE_INFO_MAX)
+        _ONLINE_INFO_CACHE[guid] = (time.time(), record)
+        _cache_put_prune(_ONLINE_INFO_CACHE, _ONLINE_INFO_MAX)
+        return record
     except Exception as e:
         logger.warning("musicbox /info failed for %s: %s: %s", guid, type(e).__name__, e)
         return None
@@ -2147,12 +2260,29 @@ async def static_cover(request: Request, subpath: str = ""):
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
-    data = await _online_info(request, guid)
-    cover = (data or {}).get("cover_url") or ""
-    if cover:
-        return RedirectResponse(cover, status_code=302)
-    # 无封面时返回 404，避免把 JSON 当成图片导致客户端裂图
-    return Response(status_code=404)
+    cover = await _online_cover_url(request, guid)
+    if not cover:
+        # 退回元数据（可能是缓存里已有的整条记录），再取不到才 404
+        data = await _online_info(request, guid)
+        cover = (data or {}).get("cover_url") or ""
+    if not cover:
+        # 无封面时返回 404，避免把 JSON 当成图片导致客户端裂图
+        return Response(status_code=404)
+
+    headers = {
+        # 封面是静态资源，让客户端缓存住：列表滚动/来回切歌不再重复回源
+        "Cache-Control": "public, max-age=86400",
+    }
+    # 由 NAS 代抓图片再回传，而不是 302 让浏览器直连网易云 CDN。
+    # 302 依赖两件我们无法保证的事：客户端能直连 p1.music.126.net，且该 CDN
+    # 不校验 Referer/Origin。任一不成立就表现为「列表里没有封面」。
+    # 代抓失败时再退回 302，至少保留原来那条能走通的路。
+    fetched = await _fetch_cover_bytes(cover)
+    if fetched:
+        content, ctype = fetched
+        headers["Content-Type"] = ctype
+        return Response(content=content, headers=headers)
+    return RedirectResponse(cover, status_code=302, headers=headers)
 
 
 # === online favorites ===

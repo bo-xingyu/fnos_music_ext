@@ -32,9 +32,9 @@ start_musicbox() {
     lib_spawn "${MUSICBOX_PID}" "${MUSICBOX_LOG}" env \
         PATH="${PYTHON_BIN}:${PATH}" \
         PYTHONUNBUFFERED=1 \
-        XDG_DATA_HOME="${RUN_DIR}/musicbox-data" \
-        XDG_CACHE_HOME="${RUN_DIR}/musicbox-data/cache" \
-        XDG_CONFIG_HOME="${RUN_DIR}/musicbox-data/config" \
+        XDG_DATA_HOME="${MUSICBOX_DATA_DIR}" \
+        XDG_CACHE_HOME="${MUSICBOX_DATA_DIR}/cache" \
+        XDG_CONFIG_HOME="${MUSICBOX_DATA_DIR}/config" \
         FNMUSIC_FREE_ONLY_ON_LOGOUT="$(lib_read_env_value FNMUSIC_FREE_ONLY_ON_LOGOUT true)" \
         "${venv}/bin/uvicorn" app:app \
             --app-dir "${RUN_DIR}/musicbox-service" \

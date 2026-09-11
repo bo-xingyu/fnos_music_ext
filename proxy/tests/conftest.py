@@ -23,11 +23,25 @@ def _reset_singleton_state():
     """每个用例前后都清空登录态缓存、推送节流窗口与后台巡检任务。"""
     netease_auth.reset_for_test()
     pushplus.reset_throttle()
+    _reset_online_info_caches()
     try:
         yield
     finally:
         netease_auth.reset_for_test()
         pushplus.reset_throttle()
+        _reset_online_info_caches()
+
+
+def _reset_online_info_caches():
+    """清空在线元数据/封面缓存。
+
+    这两份缓存是 2.1.7 为消掉重复上游往返而加的进程级 dict，不清会让
+    「同 guid 第二次调用」静默命中上一个用例的数据，排查起来极其迷惑。
+    """
+    from proxy.app import _ONLINE_COVER_CACHE, _ONLINE_INFO_CACHE
+
+    _ONLINE_INFO_CACHE.clear()
+    _ONLINE_COVER_CACHE.clear()
 
 
 @pytest.fixture

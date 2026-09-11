@@ -1495,3 +1495,202 @@ def test_search_cache_empty_result_not_served_after_login(monkeypatch, _isolate_
         monkeypatch.setattr(proxy_app, "fetch_netease_search", _fake_fetch)
         client.post("/_ext/cache/invalidate")
         assert "林俊杰" not in _SEARCH_CACHE
+
+
+# ===========================================================================
+# 在线元数据 / 封面缓存（2.1.7：点开一首歌约 4s 的主要构成）
+#
+# 单曲的标题/艺术家/专辑/时长/封面/歌词是静态数据，不会变。原先每次
+# /static/metadata、/lyric/list、/static/cover 与播放路径都各自向 musicbox 发一次
+# /api/v1/song/{id}/info + 一次 /api/v1/song/{id}/lyric（两个上游往返），
+# 一首歌点开要重复好几轮。实测：真正的流式转发首字节仅 0.02~0.84s，
+# 代理自身 resolve+info 也只 0.30s，剩下的时间就耗在这些重复往返上。
+# ===========================================================================
+
+import proxy.app as P            # noqa: E402  (静态封面用例要打桩 P.httpx)
+from proxy.app import (          # noqa: E402
+    _ONLINE_COVER_CACHE,
+    _ONLINE_COVER_TTL,
+    _ONLINE_INFO_CACHE,
+    _ONLINE_INFO_TTL,
+    _cache_put_prune,
+    _online_cover_url,
+    invalidate_online_info_cache,
+)
+
+PIC = "https://p1.music.126.net/CoverKey==/109951168064202445.jpg"
+
+
+def _mb_request(songs, hit_log, *, lyric=True, fail=False):
+    """构造 musicbox 侧 MockTransport：可按需禁用歌词、模拟失败、记录调用。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        hit_log.append(path)
+        if fail:
+            return httpx.Response(500, json={"ok": False})
+        sid = path.split("/")[-2] if "/song/" in path else ""
+        if path.endswith("/info"):
+            return httpx.Response(200, json={"ok": True, "data": songs.get(sid, {})})
+        if path.endswith("/lyric"):
+            return httpx.Response(200, json={"ok": True, "data": {"lyric": "[00:01]测"}})
+        return httpx.Response(404)
+
+    return httpx.MockTransport(handler)
+
+
+_SONG_RAW = {
+    "id": 186016, "name": "说好不哭",
+    "ar": [{"name": "周杰伦"}],
+    "al": {"name": "说好不哭", "picUrl": PIC},
+    "dt": 180000, "sq": None, "hr": None, "h": {"size": 4500000, "br": 320000},
+}
+
+
+def _req_for(monkeypatch, transport):
+    app.state.musicbox_client = httpx.AsyncClient(transport=transport,
+                                                 base_url="http://127.0.0.1:8770")
+    from starlette.requests import Request as StarletteRequest
+
+    return StarletteRequest({"type": "http", "app": app})
+
+
+@pytest.mark.anyio
+async def test_online_info_second_call_hits_cache(monkeypatch):
+    hits = []
+    req = _req_for(monkeypatch, _mb_request({"186016": _SONG_RAW}, hits))
+    guid = "online:netease:186016"
+
+    first = await _online_info(req, guid)
+    n_after_first = len(hits)
+    second = await _online_info(req, guid)
+    assert second == first
+    assert len(hits) == n_after_first, "第二次必须命中缓存，零上游往返"
+    assert hits[:1] == ["/api/v1/song/186016/info"]
+
+
+@pytest.mark.anyio
+async def test_online_info_cache_expires_by_ttl(monkeypatch):
+    hits = []
+    req = _req_for(monkeypatch, _mb_request({"186016": _SONG_RAW}, hits))
+    guid = "online:netease:186016"
+    await _online_info(req, guid)
+    before = len(hits)
+    # 把写入时间推到 TTL 之前
+    ts, val = _ONLINE_INFO_CACHE[guid]
+    _ONLINE_INFO_CACHE[guid] = (ts - _ONLINE_INFO_TTL - 1, val)
+    await _online_info(req, guid)
+    assert len(hits) > before, "过期后必须重新回源"
+
+
+@pytest.mark.anyio
+async def test_online_info_failure_is_not_cached(monkeypatch):
+    """失败不缓存：那多半是上游瞬时抖动，缓存住会把偶发失败固化成整段 TTL 无元数据。"""
+    hits = []
+    req = _req_for(monkeypatch, _mb_request({}, hits, fail=True))
+    guid = "online:netease:186016"
+    assert await _online_info(req, guid) is None
+    assert guid not in _ONLINE_INFO_CACHE
+    assert await _online_info(req, guid) is None
+    assert len(hits) >= 2, "失败后应允许重试回源"
+
+
+@pytest.mark.anyio
+async def test_online_info_populates_cover_cache(monkeypatch):
+    hits = []
+    req = _req_for(monkeypatch, _mb_request({"186016": _SONG_RAW}, hits))
+    info = await _online_info(req, "online:netease:186016")
+    assert info["cover_url"] == PIC
+    assert _ONLINE_COVER_CACHE["online:netease:186016"][1] == PIC, (
+        "元数据里已有封面，应顺带填上封面缓存，让随后的 /static/cover 零往返命中"
+    )
+
+
+@pytest.mark.anyio
+async def test_online_cover_url_never_fetches_lyric(monkeypatch):
+    """取一张缩略图绝不该顺带去拉歌词——那是另一个上游往返，对封面毫无意义。"""
+    hits = []
+    req = _req_for(monkeypatch, _mb_request({"186016": _SONG_RAW}, hits))
+    cover = await _online_cover_url(req, "online:netease:186016")
+    assert cover == PIC
+    assert hits == ["/api/v1/song/186016/info"], f"只应打一次 /info，实际 {hits}"
+
+    hits.clear()
+    assert await _online_cover_url(req, "online:netease:186016") == PIC
+    assert hits == [], "第二次必须命中封面缓存"
+
+
+@pytest.mark.anyio
+async def test_online_cover_url_empty_is_not_cached(monkeypatch):
+    hits = []
+    req = _req_for(monkeypatch, _mb_request({"186016": {"id": 186016, "al": {}}}, hits))
+    assert await _online_cover_url(req, "online:netease:186016") == ""
+    assert "online:netease:186016" not in _ONLINE_COVER_CACHE
+    await _online_cover_url(req, "online:netease:186016")
+    assert len(hits) == 2, "空封面多为瞬时失败，不应缓存，应允许重试"
+
+
+@pytest.mark.anyio
+async def test_invalidate_online_info_cache_clears_both(monkeypatch):
+    hits = []
+    req = _req_for(monkeypatch, _mb_request({"186016": _SONG_RAW}, hits))
+    await _online_info(req, "online:netease:186016")
+    assert _ONLINE_INFO_CACHE and _ONLINE_COVER_CACHE
+    n = invalidate_online_info_cache()
+    assert n >= 2
+    assert not _ONLINE_INFO_CACHE and not _ONLINE_COVER_CACHE
+
+
+def test_cache_put_prune_bounds_size():
+    store = {str(i): (float(i), {}) for i in range(10)}
+    _cache_put_prune(store, 100)
+    assert len(store) == 10, "未超上限不动"
+    _cache_put_prune(store, 6)
+    assert len(store) < 10, "超上限必须淘汰"
+    assert "9" in store and "0" not in store, "应淘汰最旧的一半而不是最新的"
+
+
+@pytest.mark.anyio
+async def test_static_cover_streams_bytes_with_cache_header(monkeypatch):
+    """封面由 NAS 代抓回传，而不是 302 让客户端直连网易云 CDN。
+
+    302 依赖两件我们无法保证的事：客户端能直连 p1.music.126.net，且该 CDN 不校验
+    Referer/Origin。任一不成立就表现为「列表里没有封面」。
+    """
+    hits = []
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=_mb_request({"186016": _SONG_RAW}, hits), base_url="http://127.0.0.1:8770")
+
+    img = b"\xff\xd8\xff\xe0FAKEJPEGDATA"
+    called = []
+
+    async def fake_fetch(url):
+        called.append(url)
+        return img, "image/jpeg"
+
+    monkeypatch.setattr(P, "_fetch_cover_bytes", fake_fetch)
+    with TestClient(app) as c:
+        r = c.get("/music/api/v1/static/cover",
+                  params={"coverId": "online:netease:186016"}, follow_redirects=False)
+    assert called == [PIC], "应按上游返回的 https picUrl 代抓"
+    assert r.status_code == 200
+    assert r.content == img
+    assert r.headers["content-type"].startswith("image/")
+    assert "max-age" in r.headers.get("cache-control", ""), "静态封面必须给客户端缓存指令"
+
+
+@pytest.mark.anyio
+async def test_static_cover_falls_back_to_redirect_when_fetch_fails(monkeypatch):
+    """代抓失败时退回 302，至少保留原来那条能走通的路，别把封面彻底打死。"""
+    hits = []
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=_mb_request({"186016": _SONG_RAW}, hits), base_url="http://127.0.0.1:8770")
+    async def fail_fetch(url):
+        return None
+
+    monkeypatch.setattr(P, "_fetch_cover_bytes", fail_fetch)
+    with TestClient(app) as c:
+        r = c.get("/music/api/v1/static/cover",
+                  params={"coverId": "online:netease:186016"}, follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == PIC

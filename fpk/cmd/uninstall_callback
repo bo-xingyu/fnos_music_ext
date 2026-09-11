@@ -15,6 +15,9 @@ APP_NAME="fnmusicext"
 APPDEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
 PKGVAR="${TRIM_PKGVAR:-/vol1/@appvar/${APP_NAME}}"
 RUN_DIR="${PKGVAR}/app"
+# 网易云登录凭证持久目录（与 fnmusic-lib.sh 中定义保持一致；本回调不 source 那个库，
+# 因为卸载阶段 APPDEST 可能已被移除，只能就地定义，避免变量为空导致清理静默失效）
+MUSICBOX_DATA_DIR="${PKGVAR}/musicbox-data"
 
 # 卸载回调阶段 APPDEST 可能已被移除，回落到 stage 过的一份副本
 BIN="${APPDEST}/bin"
@@ -83,15 +86,22 @@ else
     log "保留曲库中已落盘的在线音频缓存"
 fi
 
-# 2. 运行目录（含 .env / PushPlus token / 网易云登录凭证 / 缓存 / 收藏）
-if is_true "${REMOVE_DATA}" || is_true "${REMOVE_LIB}" || true; then
-    # RUN_DIR 属于本应用私有运行目录，卸载时一并清理；
-    # 但用户的曲库目录（外部共享目录）绝不动。
+# 2. 运行目录与持久数据
+#
+# 【曾经的 bug】这里的条件尾部写了 `|| true`，使它**恒为真**：无论用户是否勾选
+# 「删除数据」，RUN_DIR 都会被整个 rm -rf。而网易云登录凭证当时正住在
+# ${RUN_DIR}/musicbox-data 里，于是**每次手动安装新版 fpk**（走的就是卸载+安装，
+# 不是保留数据的升级）都会把 cookie 删掉，用户被迫重新扫码 —— 频繁扫码登录正是
+# 网易云风控最敏感的行为之一。
+#
+# 现已把凭证迁到 ${PKGVAR}/musicbox-data（RUN_DIR 之外，跨安装持久），
+# 并把这里改回尊重用户勾选：默认保留，只有明确勾选删除时才清理。
+if is_true "${REMOVE_DATA}" || is_true "${REMOVE_LIB}"; then
     if [ -n "${RUN_DIR}" ] && [ -d "${RUN_DIR}" ]; then
         # 安全护栏：确认要删的确实是本应用的 stage 目录
         case "${RUN_DIR}" in
             */@appvar/fnmusicext/app|*/fnmusicext/app)
-                log "删除运行目录 ${RUN_DIR}（含 .env / 登录凭证 / 缓存 / 收藏）"
+                log "按用户选择删除运行目录 ${RUN_DIR}（含 .env / 缓存 / 收藏）"
                 rm -rf "${RUN_DIR}" 2>/dev/null || log "删除 ${RUN_DIR} 失败"
                 ;;
             *)
@@ -99,7 +109,22 @@ if is_true "${REMOVE_DATA}" || is_true "${REMOVE_LIB}" || true; then
                 ;;
         esac
     fi
-    rm -f "${PKGVAR}/.env.upgrade.bak" 2>/dev/null
+    if is_true "${REMOVE_DATA}"; then
+        # 只有用户明确选择删除数据时，才连网易云登录凭证一起清理
+        if [ -d "${MUSICBOX_DATA_DIR}" ]; then
+            log "按用户选择删除网易云登录凭证 ${MUSICBOX_DATA_DIR}"
+            rm -rf "${MUSICBOX_DATA_DIR}" 2>/dev/null || log "删除 ${MUSICBOX_DATA_DIR} 失败"
+        fi
+        rm -f "${PKGVAR}/.env.upgrade.bak" "${PKGVAR}/.env.preserved" 2>/dev/null
+    fi
+else
+    log "保留运行数据（未勾选删除）"
+    # 即便不删，也备份一份配置：飞牛「卸载+重装」是手动安装新版 fpk 的常见路径，
+    # 重装后向导里 PushPlus token 是空的，靠这份快照恢复，免得用户重填。
+    if [ -f "${RUN_DIR}/.env" ]; then
+        cp -a "${RUN_DIR}/.env" "${PKGVAR}/.env.preserved" 2>/dev/null \
+            && log "已快照 .env 到 ${PKGVAR}/.env.preserved（重装时恢复 token）"
+    fi
 fi
 
 # 3. systemd 残留（本应用不注册 unit，但 v1.x 脚本式安装可能留过）

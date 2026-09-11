@@ -30,6 +30,80 @@ RUN_DIR="${PKGVAR}/app"
 LOG_DIR="${PKGVAR}/logs"
 ENV_FILE="${RUN_DIR}/.env"
 
+# 网易云登录凭证（cookie）与 NEMbox 运行时数据的**持久目录**。
+#
+# 必须放在 ${PKGVAR} 下、RUN_DIR 之外：RUN_DIR(=${PKGVAR}/app) 是每次安装都会被
+# stage 覆盖、并在「卸载 + 重装」流程里被整体 rm -rf 的运行目录。此前凭证放在
+# ${RUN_DIR}/musicbox-data，于是手动安装新版 fpk（走卸载+安装而非升级）就会把
+# cookie 一起删掉，用户每装一次就得重新扫码一次 —— 频繁扫码登录正是网易云风控
+# 最敏感的行为之一。
+#
+# ${PKGVAR}/logs 能跨安装留存（诊断日志里能看到多次安装的历史），证明 PKGVAR 本身
+# 在卸载/重装后不会被清空，因此凭证放这里可以真正跨版本持久。
+MUSICBOX_DATA_DIR="${PKGVAR}/musicbox-data"
+# 旧版凭证位置（迁移用）
+LEGACY_MUSICBOX_DATA_DIR="${RUN_DIR}/musicbox-data"
+
+
+lib_migrate_musicbox_data() {
+    # 把旧位置 ${RUN_DIR}/musicbox-data 下的 cookie 等凭证迁到持久目录。
+    # 幂等：新位置已有 cookie 就不动（宁可用新的登录，也不覆盖用户刚扫的码）；
+    # 只在新位置缺失、旧位置存在时搬迁，且不删除旧目录（交回给 stage/卸载逻辑处理）。
+    local legacy="${LEGACY_MUSICBOX_DATA_DIR}"
+    [ -d "${legacy}" ] || return 0
+
+    local legacy_cookie new_cookie
+    legacy_cookie="$(find "${legacy}" -maxdepth 3 -name 'cookie.txt' -type f 2>/dev/null | head -n 1)"
+    [ -n "${legacy_cookie}" ] || return 0
+
+    new_cookie="${MUSICBOX_DATA_DIR}/netease-musicbox/cookie.txt"
+    if [ -s "${new_cookie}" ]; then
+        return 0
+    fi
+
+    mkdir -p "${MUSICBOX_DATA_DIR}" 2>/dev/null || return 0
+    # 逐个文件复制，保留权限与时间戳；目录结构照搬
+    ( cd "${legacy}" && find . -type d -print0 2>/dev/null ) |
+        while IFS= read -r -d '' d; do
+            mkdir -p "${MUSICBOX_DATA_DIR}/${d}" 2>/dev/null || true
+        done
+    ( cd "${legacy}" && find . -type f -print0 2>/dev/null ) |
+        while IFS= read -r -d '' f; do
+            [ -e "${MUSICBOX_DATA_DIR}/${f}" ] && continue
+            cp -a "${legacy}/${f}" "${MUSICBOX_DATA_DIR}/${f}" 2>/dev/null || true
+        done
+
+    if [ -s "${new_cookie}" ]; then
+        lib_log "已迁移网易云登录凭证到持久目录 ${MUSICBOX_DATA_DIR}"
+        lib_chown_musicbox_data
+    fi
+    return 0
+}
+
+
+lib_chown_musicbox_data() {
+    # cookie 是敏感凭证：先无条件收紧到 0600，再在能确定包用户时改属主。
+    # 顺序很重要——原先 chmod 被写在 `TRIM_USERNAME 存在` 的判断之后，
+    # 一旦拿不到包用户名（异常环境）敏感文件就保持 644，本机其他用户可读。
+    find "${MUSICBOX_DATA_DIR}" -name 'cookie.txt' -type f -exec chmod 600 {} + 2>/dev/null || true
+
+    # 登录凭证必须归包用户所有：降权运行的 musicbox 进程才写得出 cookie；
+    # 属主错了扫码会"看起来成功但落不了盘"。
+    local target="${TRIM_USERNAME:-}"
+    [ -n "${target}" ] || return 0
+    id "${target}" >/dev/null 2>&1 || return 0
+    chown -R "${target}:${TRIM_GROUPNAME:-${target}}" "${MUSICBOX_DATA_DIR}" 2>/dev/null || true
+}
+
+
+lib_ensure_musicbox_data_dirs() {
+    mkdir -p "${MUSICBOX_DATA_DIR}/cache/netease-musicbox" \
+             "${MUSICBOX_DATA_DIR}/config/netease-musicbox" \
+             "${MUSICBOX_DATA_DIR}/netease-musicbox" 2>/dev/null || true
+    chmod 700 "${MUSICBOX_DATA_DIR}" 2>/dev/null || true
+    lib_chown_musicbox_data
+}
+
 PROXY_PID="${PKGVAR}/proxy.pid"
 MUSICBOX_PID="${PKGVAR}/musicbox.pid"
 UI_PID="${PKGVAR}/ui.pid"
