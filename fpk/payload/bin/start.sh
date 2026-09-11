@@ -1,0 +1,147 @@
+#!/bin/bash
+# ==============================================================================
+# fnmusic-ext fpk：启动
+#   1. 网易云音源服务（降权到专用包用户，监听 8770）
+#   2. Unix Socket 接管 + 代理服务（必须 root，见 fnmusic-lib.sh 头部说明）
+#
+# 幂等：已在运行则直接返回成功。
+# ==============================================================================
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./fnmusic-lib.sh
+. "${SCRIPT_DIR}/fnmusic-lib.sh"
+
+start_musicbox() {
+    if lib_pid_alive "${MUSICBOX_PID}"; then
+        lib_log "musicbox 已在运行 (pid=$(head -n 1 "${MUSICBOX_PID}"))"
+        return 0
+    fi
+    local venv="${RUN_DIR}/.venv-musicbox"
+    if [ ! -x "${venv}/bin/uvicorn" ]; then
+        lib_fail "未找到 ${venv}/bin/uvicorn，音源服务无法启动。请在应用中心重新安装本应用以重建虚拟环境。"
+        return 1
+    fi
+    local bind
+    bind="$(lib_read_env_value FNMUSIC_MUSICBOX_BIND "0.0.0.0")"
+    lib_log "启动 musicbox 音源服务 ${bind}:${MUSICBOX_PORT}（降权到 ${TRIM_USERNAME:-当前用户}）"
+
+    # 音源服务不需要 root：只监听 TCP 端口、读写自己数据目录，
+    # 按官方「长期运行并对外提供访问的进程应尽可能以非 root 运行」要求降权。
+    # PID 由子进程自己写入 pidfile（见 lib_spawn 说明），确保 stop 能杀到真身。
+    lib_spawn "${MUSICBOX_PID}" "${MUSICBOX_LOG}" env \
+        PATH="${PYTHON_BIN}:${PATH}" \
+        PYTHONUNBUFFERED=1 \
+        XDG_DATA_HOME="${RUN_DIR}/musicbox-data" \
+        XDG_CACHE_HOME="${RUN_DIR}/musicbox-data/cache" \
+        XDG_CONFIG_HOME="${RUN_DIR}/musicbox-data/config" \
+        FNMUSIC_FREE_ONLY_ON_LOGOUT="$(lib_read_env_value FNMUSIC_FREE_ONLY_ON_LOGOUT true)" \
+        "${venv}/bin/uvicorn" app:app \
+            --app-dir "${RUN_DIR}/musicbox-service" \
+            --host "${bind}" \
+            --port "${MUSICBOX_PORT}"
+
+    if ! lib_wait_pidfile "${MUSICBOX_PID}"; then
+        lib_fail "musicbox 启动后未能写入 PID 或立刻退出。日志: ${MUSICBOX_LOG}"
+        tail -n 20 "${MUSICBOX_LOG}" >> "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null
+        return 1
+    fi
+
+    if lib_wait_http "${MUSICBOX_URL}/healthz" 30 1; then
+        lib_log "musicbox 就绪 ${MUSICBOX_URL}/healthz (pid=$(head -n 1 "${MUSICBOX_PID}"))"
+        return 0
+    fi
+    # 音源未就绪不致命：代理仍可接管并透传本地曲库，但在线功能会不可用
+    if lib_pid_alive "${MUSICBOX_PID}"; then
+        lib_warn "musicbox 30s 内未通过 healthz，仍在运行中；在线音源可能暂不可用。日志: ${MUSICBOX_LOG}"
+        return 0
+    fi
+    lib_fail "musicbox 启动后立刻退出。日志: ${MUSICBOX_LOG}"
+    tail -n 20 "${MUSICBOX_LOG}" >> "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null
+    return 1
+}
+
+start_proxy() {
+    if lib_pid_alive "${PROXY_PID}" && lib_probe_proxy; then
+        lib_log "代理已在运行且接管正常 (pid=$(head -n 1 "${PROXY_PID}"))"
+        return 0
+    fi
+    # 一律用 bash 显式解释执行：tar 包内脚本是 644（无执行位），且社区实测部分
+    # 文件系统上 chmod +x 可能不生效，靠 -x 判断会把可运行的脚本误判为缺失。
+    if [ ! -f "${RUN_DIR}/proxy/run_proxy.sh" ]; then
+        lib_fail "未找到 ${RUN_DIR}/proxy/run_proxy.sh，无法接管 socket。"
+        return 1
+    fi
+    if [ ! -f "${RUN_DIR}/.venv-proxy/bin/uvicorn" ]; then
+        lib_fail "未找到 ${RUN_DIR}/.venv-proxy/bin/uvicorn，请在应用中心重新安装本应用以重建虚拟环境。"
+        return 1
+    fi
+    if [ ! -S "${TARGET_SOCK}" ] && [ ! -S "${UPSTREAM_SOCK}" ]; then
+        lib_fail "未探测到飞牛音乐套接字 ${TARGET_SOCK}。请先在应用中心安装并启动「飞牛音乐」，然后重新启动本应用。"
+        return 1
+    fi
+
+    lib_log "启动代理（socket 接管）..."
+    # run_proxy.sh 内部实现了幂等接管：探测 trim/proxy/stale 三态、
+    # 平滑 mv 官方 socket 到 upstream、再以 --uds 绑定原路径。
+    # 必须 --as-root：uvicorn 要在 /var/run 下创建 bind socket，包用户没有该目录写权限。
+    lib_spawn "${PROXY_PID}" "${PROXY_LOG}" --as-root \
+        env PATH="${PYTHON_BIN}:${PATH}" bash "${RUN_DIR}/proxy/run_proxy.sh"
+
+    # run_proxy.sh 最多等 60s 探测官方 socket，这里给足启动窗口
+    local i=0
+    while [ "${i}" -lt 75 ]; do
+        if lib_probe_proxy; then
+            # 官方 nginx 需要能连上该 socket
+            chmod 666 "${TARGET_SOCK}" 2>/dev/null || true
+            lib_log "代理接管成功 ${TARGET_SOCK} (pid=$(head -n 1 "${PROXY_PID}"))"
+            log_login_hint
+            return 0
+        fi
+        if ! lib_pid_alive "${PROXY_PID}"; then
+            break
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+
+    lib_fail "代理未能完成 socket 接管（75s 超时或进程提前退出）。日志: ${PROXY_LOG}"
+    tail -n 25 "${PROXY_LOG}" >> "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null
+    rm -f "${PROXY_PID}" 2>/dev/null
+    return 1
+}
+
+log_login_hint() {
+    # 只在日志里给提示，绝不因为未登录就判定启动失败
+    local detail
+    detail="$(curl -s --max-time 5 "${MUSICBOX_URL}/api/v1/auth/detail" 2>/dev/null || true)"
+    if [ -z "${detail}" ]; then
+        return 0
+    fi
+    local logged_in
+    logged_in="$(printf '%s' "${detail}" | jq -r '.data.logged_in // false' 2>/dev/null || echo false)"
+    if [ "${logged_in}" = "true" ]; then
+        local nick vip days
+        nick="$(printf '%s' "${detail}" | jq -r '.data.nickname // "已登录用户"' 2>/dev/null || echo '已登录用户')"
+        vip="$(printf '%s' "${detail}" | jq -r '.data.vip_type // 0' 2>/dev/null || echo 0)"
+        lib_log "网易云登录态: 已登录 (${nick}), vip_type=${vip}"
+    else
+        lib_warn "网易云尚未扫码登录 → 当前只能播放免费曲目，「每日推荐」不可用。请在 SSH 终端执行: bash ${RUN_DIR}/netease_login.sh"
+    fi
+}
+
+main() {
+    lib_log "=== start 开始 ==="
+    mkdir -p "${LOG_DIR}" "${PKGVAR}" 2>/dev/null
+
+    start_musicbox || return 1
+    start_proxy || {
+        # 代理起不来就别留着音源服务空转
+        lib_stop_pid "musicbox" "${MUSICBOX_PID}" 10
+        return 1
+    }
+    lib_log "=== start 完成 ==="
+    return 0
+}
+
+main "$@"

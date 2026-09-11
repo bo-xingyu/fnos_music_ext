@@ -1,0 +1,83 @@
+#!/bin/bash
+# config_init —— 应用设置【提交前】执行：校验向导值
+#
+# 只做校验，不写任何文件。把非法值挡在落盘之前，避免生成一份让服务
+# 起不来的 .env。
+#
+# 官方约定：生命周期脚本应尽量幂等；失败前把用户可见错误写入 $TRIM_TEMP_LOGFILE。
+set -uo pipefail
+
+export PATH="/var/apps/python312/target/bin:${PATH}"
+
+APP_NAME="fnmusicext"
+APPDEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
+PKGVAR="${TRIM_PKGVAR:-/vol1/@appvar/${APP_NAME}}"
+RUN_DIR="${PKGVAR}/app"
+
+# 卸载回调阶段 APPDEST 可能已被移除，回落到 stage 过的一份副本
+BIN="${APPDEST}/bin"
+if [ ! -f "${BIN}/fnmusic-lib.sh" ]; then
+    BIN="${RUN_DIR}/bin"
+fi
+
+fail() {
+    local msg="$1"
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "${msg}" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    fi
+    echo "[fnmusic-ext] ${msg}" >&2
+}
+
+need() {
+    local script="$1"
+    if [ ! -f "${BIN}/${script}" ]; then
+        fail "找不到 ${BIN}/${script}，无法完成本步骤。请重新安装本应用。"
+        return 1
+    fi
+    return 0
+}
+
+fail_if() { fail "$1"; exit 1; }
+
+q="$(echo "${wizard_netease_quality:-lossless}" | tr '[:upper:]' '[:lower:]')"
+case "${q}" in
+    lossless|exhigh|higher|standard) ;;
+    *) fail_if "音质取值非法：'${wizard_netease_quality:-}'（可选 lossless / exhigh / higher / standard）" ;;
+esac
+
+t="$(echo "${wizard_pushplus_template:-markdown}" | tr '[:upper:]' '[:lower:]')"
+case "${t}" in
+    markdown|html|txt|json) ;;
+    *) fail_if "PushPlus 模板取值非法：'${wizard_pushplus_template:-}'（可选 markdown / html / txt / json）" ;;
+esac
+
+b="${wizard_musicbox_bind:-0.0.0.0}"
+case "${b}" in
+    0.0.0.0|127.0.0.1) ;;
+    *) fail_if "音源服务监听地址非法：'${b}'（可选 0.0.0.0 / 127.0.0.1）" ;;
+esac
+
+lim="${wizard_daily_limit:-20}"
+case "${lim}" in
+    ''|*[!0-9]*) fail_if "每日推荐曲目数必须是数字：'${lim}'" ;;
+esac
+if [ "${lim}" -lt 1 ] || [ "${lim}" -gt 100 ]; then
+    fail_if "每日推荐曲目数应在 1..100 之间，当前为 ${lim}"
+fi
+
+idx="${wizard_pip_index:-}"
+if [ -n "${idx}" ]; then
+    case "${idx}" in
+        http://*|https://*) ;;
+        *) fail_if "pip 镜像源必须以 http:// 或 https:// 开头：'${idx}'" ;;
+    esac
+fi
+
+# token 只做长度合理性提示，绝不回显内容
+tok="${wizard_pushplus_token:-}"
+if [ -n "${tok}" ] && [ "${#tok}" -lt 8 ]; then
+    fail "PushPlus token 长度异常（少于 8 位），请重新到 pushplus.plus 个人中心复制完整 token。"
+    exit 1
+fi
+
+exit 0

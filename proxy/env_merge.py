@@ -24,13 +24,38 @@ from pathlib import Path
 
 _LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 
-# 第三音源 lxmusic（洛雪音乐源）默认配置：合并时自动识别并安全补齐
-LX_COMMENT = "洛雪音乐源 lxmusic（第三音源，宿主机端口 8772 -> 容器 8000）"
-LX_DEFAULTS: "list[tuple[str, str]]" = [
-    ("FNMUSIC_LX_ENABLED", "true"),
-    ("FNMUSIC_LX_URL", "http://127.0.0.1:8772"),
+# v2.0 单源化后新增的配置项：合并时自动识别并安全补齐（不覆盖用户已有值）
+NEW_KEYS_COMMENT = "网易云单源 + PushPlus 提醒配置（v2.0 新增，缺失时自动补齐）"
+# 与 proxy/pushplus.py 的 DEFAULT_URL 保持一致；此处不 import pushplus，
+# 因为 env_merge 由 install.sh 用系统 python3 直接调用，不能依赖 httpx。
+DEFAULT_PUSHPLUS_URL = "https://www.pushplus.plus/send"
+NEW_DEFAULTS: "list[tuple[str, str]]" = [
+    ("FNMUSIC_FREE_ONLY_ON_LOGOUT", "true"),
+    ("FNMUSIC_DAILY_ENABLED", "true"),
+    ("FNMUSIC_DAILY_LIMIT", "20"),
+    ("FNMUSIC_LOGIN_STATE_TTL", "300"),
+    ("FNMUSIC_LOGIN_CHECK_INTERVAL", "3600"),
+    ("FNMUSIC_VIP_WARN_DAYS", "7"),
+    ("FNMUSIC_PUSHPLUS_ENABLED", "true"),
+    ("FNMUSIC_PUSHPLUS_TOKEN", ""),
+    ("FNMUSIC_PUSHPLUS_TOPIC", ""),
+    ("FNMUSIC_PUSHPLUS_TEMPLATE", "markdown"),
+    ("FNMUSIC_PUSHPLUS_URL", DEFAULT_PUSHPLUS_URL),
 ]
-LX_PREFIX = "FNMUSIC_LX_"
+NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOGIN_", "FNMUSIC_VIP_", "FNMUSIC_PUSHPLUS_")
+
+# v2.0 已废弃的配置项：升级合并时从 .env 中清理，避免残留误导。
+# 只删「确定已无代码读取」的键；FNMUSIC_MODE / BASE_IMAGE / PIP_INDEX 等 docker 相关项保留。
+OBSOLETE_EXACT = {
+    "FNMUSIC_ONLINE_SOURCES",
+    "FNMUSIC_APT_MIRROR",
+    "FNMUSIC_DEPLOY_MODE",
+}
+OBSOLETE_PREFIXES = (
+    "FNMUSIC_MUSICDL_",
+    "FNMUSIC_LX_",
+    "FNMUSIC_LLM_",
+)
 
 
 def escape_single_quoted(value: str) -> str:
@@ -120,25 +145,47 @@ def merge_env(
     return result, summary
 
 
+def is_obsolete_key(key: str) -> bool:
+    """v2.0 起已无代码读取的配置项（musicdl / lxmusic / LLM 每日推荐等）。"""
+    if key in OBSOLETE_EXACT:
+        return True
+    return any(key.startswith(p) for p in OBSOLETE_PREFIXES)
+
+
+def drop_obsolete(kv: "list[tuple[str, str]]") -> "tuple[list[tuple[str, str]], list[str]]":
+    """清理废弃配置项；返回 (保留列表, 被删除的键列表)。"""
+    kept: "list[tuple[str, str]]" = []
+    removed: "list[str]" = []
+    for key, val in kv:
+        if is_obsolete_key(key):
+            removed.append(key)
+            continue
+        kept.append((key, val))
+    return kept, removed
+
+
 def ensure_prefix_defaults(
     kv: "list[tuple[str, str]]",
-    defaults: "list[tuple[str, str]]" = None,
-    prefix: str = LX_PREFIX,
+    defaults: "list[tuple[str, str]] | None" = None,
+    prefixes: "tuple[str, ...]" = NEW_PREFIXES,
 ) -> "tuple[list[tuple[str, str]], list[str]]":
-    """自动识别并补齐指定前缀（默认 FNMUSIC_LX_*）的缺失配置项。
+    """自动识别并补齐指定前缀的缺失配置项。
 
-    已存在的键一律不动（保留用户现有值，包括 false / 自定义 URL），
+    已存在的键一律不动（保留用户现有值，包括空 token / false），
     仅追加缺失键；返回 (新列表, 追加的键列表)。
     """
     if defaults is None:
-        defaults = LX_DEFAULTS
+        defaults = NEW_DEFAULTS
     known = {k for k, _ in kv}
     out = list(kv)
     added: list[str] = []
     for key, val in defaults:
-        if key.startswith(prefix) and key not in known:
-            out.append((key, val))
-            added.append(key)
+        if key in known:
+            continue
+        if prefixes and not key.startswith(prefixes):
+            continue
+        out.append((key, val))
+        added.append(key)
     return out, added
 
 
@@ -191,17 +238,28 @@ def main(argv: "list[str] | None" = None) -> int:
     explicit = {k.strip() for k in args.explicit.split(",") if k.strip()}
     merged, summary = merge_env(existing_kv, desired_kv, explicit)
 
-    # 第三音源 FNMUSIC_LX_* 自动识别：缺失时安全补齐（带注释）
-    merged, lx_added = ensure_prefix_defaults(merged)
-    summary["added"].extend(lx_added)
+    # v2.0 单源化：清理已无代码读取的废弃键（musicdl / lxmusic / LLM）
+    merged, obsolete_removed = drop_obsolete(merged)
+    if obsolete_removed:
+        summary["removed"] = obsolete_removed
+        dropped = set(obsolete_removed)
+        summary["custom_kept"] = [k for k in summary.get("custom_kept", []) if k not in dropped]
+
+    # 新配置项自动识别：缺失时安全补齐
+    merged, new_added = ensure_prefix_defaults(merged)
+    summary["added"].extend(new_added)
 
     write_env_atomic(
         args.output,
-        render_env(merged, args.header, comments={k: LX_COMMENT for k, _ in LX_DEFAULTS}),
+        render_env(
+            merged,
+            args.header,
+            comments={NEW_DEFAULTS[0][0]: NEW_KEYS_COMMENT},
+        ),
     )
     if not args.quiet:
-        for action in ("added", "updated", "preserved", "custom_kept"):
-            keys = summary[action]
+        for action in ("removed", "added", "updated", "preserved", "custom_kept"):
+            keys = summary.get(action) or []
             if keys:
                 print(f"{action}: {','.join(sorted(keys))}", file=sys.stderr)
     return 0

@@ -1,0 +1,67 @@
+#!/bin/bash
+# upgrade_callback —— 升级【之后】执行：重建环境并拉起服务
+#
+# 重新 stage 新代码、按新 requirements 重建虚拟环境、保留用户 .env 与
+# 网易云登录凭证，然后启动。升级前若服务是停止状态，这里不会强行拉起。
+#
+# 官方约定：生命周期脚本应尽量幂等；失败前把用户可见错误写入 $TRIM_TEMP_LOGFILE。
+set -uo pipefail
+
+export PATH="/var/apps/python312/target/bin:${PATH}"
+
+APP_NAME="fnmusicext"
+APPDEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
+PKGVAR="${TRIM_PKGVAR:-/vol1/@appvar/${APP_NAME}}"
+RUN_DIR="${PKGVAR}/app"
+
+# 卸载回调阶段 APPDEST 可能已被移除，回落到 stage 过的一份副本
+BIN="${APPDEST}/bin"
+if [ ! -f "${BIN}/fnmusic-lib.sh" ]; then
+    BIN="${RUN_DIR}/bin"
+fi
+
+fail() {
+    local msg="$1"
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "${msg}" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    fi
+    echo "[fnmusic-ext] ${msg}" >&2
+}
+
+need() {
+    local script="$1"
+    if [ ! -f "${BIN}/${script}" ]; then
+        fail "找不到 ${BIN}/${script}，无法完成本步骤。请重新安装本应用。"
+        return 1
+    fi
+    return 0
+}
+
+need "setup.sh" || exit 1
+need "start.sh" || exit 1
+
+log_file="${PKGVAR}/logs/upgrade.log"
+mkdir -p "$(dirname "${log_file}")" 2>/dev/null
+{
+    echo "=== $(date '+%F %T') upgrade_callback (new=${TRIM_APPVER:-?}) ==="
+} >> "${log_file}" 2>/dev/null
+
+# 升级前被 stop.sh 停掉，这里判断是否需要恢复运行：
+# 若存在 we_were_running 标记则拉起。upgrade_init 无条件停机，因此默认拉起，
+# 这也是用户在应用中心点"更新"后期望的行为。
+if bash "${BIN}/setup.sh" >> "${log_file}" 2>&1; then
+    echo "运行环境已按新版本重建（.env / 登录凭证 / 缓存均已保留）" >> "${log_file}" 2>/dev/null
+else
+    fail "升级后重建运行环境失败。详见 ${log_file}。飞牛音乐当前为官方直连状态，可正常使用。"
+    tail -n 30 "${log_file}" >> "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null
+    exit 1
+fi
+
+if bash "${BIN}/start.sh" >> "${log_file}" 2>&1; then
+    echo "[fnmusic-ext] 已升级到 ${TRIM_APPVER:-新版本} 并重新启动。"
+    exit 0
+fi
+
+fail "升级后启动失败。飞牛音乐仍处于官方直连状态（可正常使用），详见 ${log_file}"
+tail -n 30 "${log_file}" >> "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null
+exit 1

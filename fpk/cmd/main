@@ -1,0 +1,61 @@
+#!/bin/bash
+# main —— 处理 start / stop / status（$1）
+#
+# start: 先起网易云音源服务，再接管 socket 起代理。
+# stop : 先停代理，再把 socket 还原给飞牛官方后端，最后停音源服务。
+# status: 代理存活且确实接管成功才算 running（exit 0），否则 exit 3。
+#
+# 官方约定：生命周期脚本应尽量幂等；失败前把用户可见错误写入 $TRIM_TEMP_LOGFILE。
+set -uo pipefail
+
+export PATH="/var/apps/python312/target/bin:${PATH}"
+
+APP_NAME="fnmusicext"
+APPDEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
+PKGVAR="${TRIM_PKGVAR:-/vol1/@appvar/${APP_NAME}}"
+RUN_DIR="${PKGVAR}/app"
+
+# 卸载回调阶段 APPDEST 可能已被移除，回落到 stage 过的一份副本
+BIN="${APPDEST}/bin"
+if [ ! -f "${BIN}/fnmusic-lib.sh" ]; then
+    BIN="${RUN_DIR}/bin"
+fi
+
+fail() {
+    local msg="$1"
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "${msg}" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    fi
+    echo "[fnmusic-ext] ${msg}" >&2
+}
+
+need() {
+    local script="$1"
+    if [ ! -f "${BIN}/${script}" ]; then
+        fail "找不到 ${BIN}/${script}，无法完成本步骤。请重新安装本应用。"
+        return 1
+    fi
+    return 0
+}
+
+case "${1:-}" in
+    start)
+        need "start.sh" || exit 1
+        bash "${BIN}/start.sh"
+        exit $?
+        ;;
+    stop)
+        need "stop.sh" || exit 1
+        bash "${BIN}/stop.sh"
+        exit $?
+        ;;
+    status)
+        need "status.sh" || exit 1
+        bash "${BIN}/status.sh"
+        exit $?
+        ;;
+    *)
+        fail "未知操作：'${1:-}'（应为 start / stop / status）"
+        exit 1
+        ;;
+esac

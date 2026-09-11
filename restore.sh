@@ -4,7 +4,8 @@ set -euo pipefail
 # ==============================================================================
 # fnmusic-ext 一键还原脚本 (Unix Socket 接管架构)
 # 功能：停用代理服务并复位 trim-music 原生 Unix Socket
-# 参数：--full 额外停止并删除音源容器/宿主机 unit（musicdl、musicbox、lxmusic）
+# 参数：--full 额外停止并删除网易云 musicbox 容器/宿主机 unit，
+#       并清理 v1.x 遗留的 musicdl / lxmusic 历史残留容器与 unit
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,7 +20,8 @@ for arg in "$@"; do
             ;;
         -h|--help)
             echo "用法: $0 [--full]"
-            echo "  --full: 还原 socket 与代理服务的同时，停止并删除 musicdl/musicbox/lxmusic 容器与宿主机 unit"
+            echo "  --full: 还原 socket 与代理服务的同时，停止并删除网易云 musicbox 容器与宿主机 unit，"
+            echo "          并清理 v1.x 遗留的 musicdl / lxmusic 历史残留（升级用户彻底清场）"
             exit 0
             ;;
         *)
@@ -208,17 +210,17 @@ else
     log_warn "直连验证未收到预期响应: ${verify_resp:-无响应}"
 fi
 
-# 6. full 模式额外清理音源
+# 6. full 模式额外清理：停止网易云 musicbox，并清理 v1.x 遗留的 musicdl/lxmusic 残留
 if [ "${FULL_RESTORE}" -eq 1 ]; then
-    log_info "(--full 模式) 停止并移除音源容器与宿主机 unit..."
+    log_info "(--full 模式) 停止并移除网易云 musicbox 容器与宿主机 unit，同时清理 v1.x 遗留的 musicdl/lxmusic 残留..."
     rm_out=""
-    if ! rm_out="$(run_docker rm -f fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic 2>&1)"; then
+    if ! rm_out="$(run_docker rm -f fnmusic-musicbox fnmusic-musicdl fnmusic-lxmusic 2>&1)"; then
         log_warn "音源容器移除出现错误（可能部分未删除）: ${rm_out}"
     fi
     if [ -f "${BASE_DIR}/docker-compose.yml" ]; then
         (cd "${BASE_DIR}" && run_docker compose -f docker-compose.yml down --remove-orphans 2>/dev/null) || true
     fi
-    for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
+    for unit in fnmusic-musicbox fnmusic-musicdl fnmusic-lxmusic; do
         sudo systemctl disable --now "${unit}.service" 2>/dev/null || true
         if [ -f "/etc/systemd/system/${unit}.service" ]; then
             sudo rm -f "/etc/systemd/system/${unit}.service"
@@ -226,7 +228,7 @@ if [ "${FULL_RESTORE}" -eq 1 ]; then
     done
     # 如实校验清理结果：容器可能被其他副本/并发任务重建，绝不静默假成功
     leftover=""
-    for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
+    for unit in fnmusic-musicbox fnmusic-musicdl fnmusic-lxmusic; do
         if run_docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "${unit}"; then
             leftover="${leftover} ${unit}"
         fi
@@ -235,10 +237,10 @@ if [ "${FULL_RESTORE}" -eq 1 ]; then
         log_warn "以下容器仍存在（可能刚被其他副本或并发任务重建）:${leftover}"
         log_warn "如需彻底清理，请手动执行: docker rm -f${leftover}"
     else
-        log_info "musicdl / musicbox / lxmusic 容器与宿主机 unit 已清理完毕。"
+        log_info "网易云 musicbox（及 v1.x 遗留 musicdl/lxmusic）容器与宿主机 unit 已清理完毕。"
     fi
 else
-    log_info "默认保留音源容器/unit 与 cache/ 目录。"
+    log_info "默认保留网易云 musicbox 容器/unit 与 cache/ 目录。"
 fi
 
 # 7. 移除代理 systemd unit

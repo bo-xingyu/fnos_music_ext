@@ -1,11 +1,18 @@
 """Optional NEMbox internals for batch detail / lyrics (NetEase-MusicBox)."""
 from __future__ import annotations
 
+import os
 import threading
 from typing import Any
 
 _api_lock = threading.Lock()
 _api_instance = None
+
+# 未登录时是否降级为只播免费曲目（默认开；关掉则未登录直接不放行任何在线曲目）
+FREE_ONLY_ON_LOGOUT = (
+    os.environ.get("FNMUSIC_FREE_ONLY_ON_LOGOUT", "true").strip().lower()
+    in ("true", "1", "yes", "on")
+)
 
 
 def _get_api():
@@ -63,12 +70,70 @@ def check_is_logged_in() -> bool:
         return False
 
 
+def _pick(d: dict[str, Any], *keys: str) -> Any:
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def auth_detail() -> dict[str, Any]:
+    """登录态详情：是否登录、昵称、userId、VIP 类型与到期时间。
+
+    只读取 NEMbox 已有的 get_account_info()，不额外发请求；任何字段缺失都
+    以 None/0 返回，不编造。VIP 到期时间字段名在各版本网易返回里不完全一致，
+    这里按常见几种命名依次尝试。
+    """
+    try:
+        api = _get_api()
+        with _api_lock:
+            info = api.get_account_info() or {}
+    except Exception as exc:  # noqa: BLE001 - 上游异常统一降级为未登录
+        return {"logged_in": False, "error": str(exc)[:200]}
+
+    if not isinstance(info, dict):
+        return {"logged_in": False}
+
+    profile = info.get("profile") if isinstance(info.get("profile"), dict) else {}
+    account = info.get("account") if isinstance(info.get("account"), dict) else {}
+    src: dict[str, Any] = profile or account or info
+
+    nickname = _pick(src, "nickname", "userName", "nick_name", "name")
+    user_id = _pick(src, "userId", "user_id", "id") or _pick(info, "userId", "user_id")
+    vip_type = _pick(src, "vipType", "vip_type") or _pick(account, "vipType")
+    vip_expire = _pick(src, "vipExpiryTime", "vipExpiry", "vip_expire") or _pick(
+        account, "vipExpiryTime", "vip_expire"
+    )
+    logged_in = bool(profile or account or (nickname and user_id))
+
+    try:
+        vip_type_int = int(vip_type) if vip_type is not None else 0
+    except (TypeError, ValueError):
+        vip_type_int = 0
+    try:
+        vip_expire_int = int(vip_expire) if vip_expire is not None else 0
+    except (TypeError, ValueError):
+        vip_expire_int = 0
+
+    return {
+        "logged_in": logged_in,
+        "nickname": str(nickname or ""),
+        "user_id": str(user_id or ""),
+        "vip_type": vip_type_int,
+        "vip_expires_ms": vip_expire_int,
+    }
+
+
 def filter_playable_song_ids(ids: list[int]) -> set[int]:
     """根据真实可播放状态过滤歌曲 ID。
 
-    - 未登录时：使用 api.songs_url 批量获取真实可播状态。凡是 url 为空/404、或者带有 freeTrialInfo（试听片段）且 fee != 0 的曲目，一律过滤掉。
-    - 已登录时：如果有账号权限能取到完整真实 url 且非试听，则允许返回；若无权限仍过滤。
-    - 只能试听30~45秒片段（带 freeTrialInfo/试听限制）的歌曲，绝不能当作可播放曲目返回。
+    音源只来自当前扫码登录的那个私人网易云账号，因此：
+
+    - **已登录**：账号自身权益内的曲目（含 VIP / 无损 / 已购付费专辑）只要能拿到
+      完整真实直链就放行；无权益的曲目仍然过滤。
+    - **未登录**：降级为只播免费曲目（``FNMUSIC_FREE_ONLY_ON_LOGOUT``，默认开）。
+    - 只能试听片段（带 freeTrialInfo）的曲目，无论是否登录都绝不当作可播返回。
     """
     if not ids:
         return set()
@@ -97,17 +162,13 @@ def filter_playable_song_ids(ids: list[int]) -> set[int]:
         url = item.get("url")
         code = item.get("code")
         fee = item.get("fee", 0)
-        free_trial = item.get("freeTrialInfo")
+        free_trial = item.get("freeTrialInfo") or item.get("freeTrialPrivilege")
 
-        # 核心铁律：url 为空或 code == 404，坚决过滤
-        if not url or not str(url).strip() or code == 404:
+        # 核心铁律：拿不到真实直链（url 为空 / 404）一律过滤，试听片段同样过滤
+        if not url or not str(url).strip() or code == 404 or free_trial:
             continue
-        # 凡是带有 freeTrialInfo（试听片段）且 fee != 0 的曲目，一律过滤掉
-        # 并且只能试听片段的歌曲绝不当作可播返回
-        if free_trial:
-            continue
-        # 未登录状态下，收费/VIP/专辑曲目坚决不返回
-        if not logged_in and fee != 0 and fee not in (0, 8):
+        # 未登录时降级：只保留免费曲目（fee 0=免费，8=VIP 曲但未登录必然无 url，已被上面挡掉）
+        if not logged_in and FREE_ONLY_ON_LOGOUT and fee not in (0, 8):
             continue
 
         playable_ids.add(sid_int)

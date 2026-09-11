@@ -1,0 +1,279 @@
+#!/bin/bash
+# ==============================================================================
+# fnmusic-ext fpk 共享函数库
+#
+# 设计要点：
+#   1. 生命周期脚本（cmd/*）以 root 运行，因为「接管 /var/run/trim_music.socket」
+#      必须在 /var/run 下重命名与新建 socket 文件，包用户没有该目录写权限。
+#   2. 网易云音源服务（musicbox）不对外暴露接管能力，按官方要求降权到
+#      $TRIM_USERNAME（专用包用户）运行。
+#   3. 代理进程无法降权：uvicorn 需要在 /var/run 下创建 bind socket，非 root
+#      缺少目录写权限。这是 socket 接管架构的固有代价，已在 README / fpk
+#      文档中明示。
+#   4. 全部运行时代码 stage 到 $RUN_DIR（= $TRIM_PKGVAR/app），使其目录布局
+#      与仓库根完全一致，从而**原样复用** proxy/run_proxy.sh 与 restore.sh 中
+#      已经过生产验证的 socket 接管 / 复位逻辑，不在 fpk 里另写一份。
+#
+# 依赖：仅 bash / coreutils / curl / jq（jq 缺失时扫码登录脚本会自行降级）
+# ==============================================================================
+
+APP_NAME="fnmusicext"
+PYTHON_APP="python312"
+PYTHON_BIN="/var/apps/${PYTHON_APP}/target/bin"
+
+APPDEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
+PKGVAR="${TRIM_PKGVAR:-/vol1/@appvar/${APP_NAME}}"
+RUN_DIR="${PKGVAR}/app"
+LOG_DIR="${PKGVAR}/logs"
+ENV_FILE="${RUN_DIR}/.env"
+
+PROXY_PID="${PKGVAR}/proxy.pid"
+MUSICBOX_PID="${PKGVAR}/musicbox.pid"
+PROXY_LOG="${LOG_DIR}/proxy.log"
+MUSICBOX_LOG="${LOG_DIR}/musicbox.log"
+INFO_LOG="${LOG_DIR}/info.log"
+
+TARGET_SOCK="/var/run/trim_music.socket"
+UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
+MUSICBOX_PORT="${FNMUSIC_MUSICBOX_PORT:-8770}"
+MUSICBOX_URL="http://127.0.0.1:${MUSICBOX_PORT}"
+
+lib_log() {
+    mkdir -p "${LOG_DIR}" 2>/dev/null
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [$$] $*" >> "${INFO_LOG}" 2>/dev/null
+}
+
+# 生命周期脚本失败时，用户可见错误必须写入 TRIM_TEMP_LOGFILE（官方约定）
+lib_fail() {
+    local msg="$1"
+    lib_log "ERROR: ${msg}"
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "${msg}" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    fi
+    echo "[fnmusic-ext] ${msg}" >&2
+}
+
+lib_warn() {
+    lib_log "WARN: $*"
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "警告: $*" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    fi
+    echo "[fnmusic-ext] 警告: $*" >&2
+}
+
+lib_python() {
+    # 官方运行时包路径优先；缺失时回落到系统 python3（便于开发机自测）
+    if [ -x "${PYTHON_BIN}/python3" ]; then
+        echo "${PYTHON_BIN}/python3"
+    else
+        command -v python3 || echo ""
+    fi
+}
+
+lib_check_python() {
+    local py
+    py="$(lib_python)"
+    if [ -z "${py}" ]; then
+        lib_fail "找不到 Python 运行时。请确认已在应用中心安装依赖包 ${PYTHON_APP}，或系统存在 python3。"
+        return 1
+    fi
+    if [ ! -x "${PYTHON_BIN}/python3" ]; then
+        lib_warn "未检测到 ${PYTHON_BIN}/python3，改用系统 python3（$(py_ver "${py}")）。生产环境建议安装 ${PYTHON_APP} 依赖包。"
+    fi
+    echo "${py}"
+    return 0
+}
+
+py_ver() {
+    "$1" -c 'import sys;print(".".join(map(str,sys.version_info[:3])))' 2>/dev/null || echo "unknown"
+}
+
+lib_pid_alive() {
+    local file="$1"
+    [ -r "${file}" ] || return 1
+    local pid
+    pid="$(head -n 1 "${file}" | tr -d '[:space:]')"
+    [ -n "${pid}" ] || return 1
+    kill -0 "${pid}" 2>/dev/null
+}
+
+# TERM -> 等待 -> KILL 两段式停止（官方 native 案例同款模式）
+lib_stop_pid() {
+    local name="$1" file="$2" wait_s="${3:-15}"
+    if ! lib_pid_alive "${file}"; then
+        rm -f "${file}" 2>/dev/null
+        lib_log "${name} 未在运行，跳过停止"
+        return 0
+    fi
+    local pid count=0
+    pid="$(head -n 1 "${file}" | tr -d '[:space:]')"
+    lib_log "停止 ${name} (pid=${pid})，发送 TERM..."
+    kill -TERM "${pid}" 2>/dev/null || true
+    while kill -0 "${pid}" 2>/dev/null && [ "${count}" -lt "${wait_s}" ]; do
+        sleep 1
+        count=$((count + 1))
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+        lib_log "${name} ${wait_s}s 内未退出，发送 KILL"
+        kill -KILL "${pid}" 2>/dev/null || true
+        sleep 1
+    fi
+    rm -f "${file}" 2>/dev/null
+    lib_log "${name} 已停止"
+    return 0
+}
+
+lib_wait_http() {
+    local url="$1" tries="${2:-30}" interval="${3:-1}" i=0
+    while [ "${i}" -lt "${tries}" ]; do
+        if curl -s --max-time 3 -f "${url}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep "${interval}"
+        i=$((i + 1))
+    done
+    return 1
+}
+
+lib_read_env_value() {
+    local key="$1" default="${2:-}"
+    if [ -r "${ENV_FILE}" ]; then
+        local v
+        v="$(sed -n "s/^${key}='\{0,1\}\([^']*\)'\{0,1\}\s*$/\1/p" "${ENV_FILE}" 2>/dev/null | tail -n 1)"
+        if [ -n "${v}" ]; then
+            echo "${v}"
+            return 0
+        fi
+    fi
+    echo "${default}"
+}
+
+# ------------------------------------------------------------------------------
+# 降级运行：把不需要 root 的进程切到专用包用户
+# ------------------------------------------------------------------------------
+
+# 探测当前是否【能够】降权到目标用户。用一条空命令试探，避免把子命令自身的
+# 失败误判为"降权不可用"。结果缓存，避免每个进程都试一次。
+_DROP_CAPABLE=""
+lib_can_drop_to() {
+    local target="$1"
+    if [ -n "${_DROP_CAPABLE}" ]; then
+        # 已探测过：no 表示不可降权，其余（yes / yes:su）表示可降权
+        [ "${_DROP_CAPABLE}" != "no" ]
+        return $?
+    fi
+    _DROP_CAPABLE="no"
+    if [ "$(id -un)" = "root" ] && id "${target}" >/dev/null 2>&1; then
+        if command -v runuser >/dev/null 2>&1 && runuser -u "${target}" -- /bin/true >/dev/null 2>&1; then
+            _DROP_CAPABLE="yes"
+        elif command -v su >/dev/null 2>&1 && su -s /bin/bash "${target}" -c '/bin/true' >/dev/null 2>&1; then
+            _DROP_CAPABLE="yes:su"
+        fi
+    fi
+    [ "${_DROP_CAPABLE}" != "no" ]
+}
+
+lib_as_app_user() {
+    # 用法：lib_as_app_user <cmd> [args...]
+    #
+    # 官方要求「长期运行并对外提供访问的进程应尽可能以非 root 用户运行」，
+    # 因此音源服务尽量降权。降权确实不可用时（受限容器 / 包用户未创建）
+    # 如实告警后继续以当前身份运行，而不是让整个应用启动失败。
+    local target="${TRIM_USERNAME:-}"
+    if [ -z "${target}" ] || [ "$(id -un)" = "${target}" ]; then
+        # 没有可降权的目标，或本来就是该用户 —— 无需降权
+        "$@"
+        return $?
+    fi
+
+    # 先调用探测（会设置全局 _DROP_CAPABLE），再读结果——
+    # 不能放进 $( ) 里，子 shell 会把缓存丢掉。
+    local can=1
+    lib_can_drop_to "${target}" && can=0
+
+    if [ "${can}" -eq 0 ]; then
+        case "${_DROP_CAPABLE}" in
+            yes)
+                runuser -u "${target}" -- "$@"
+                return $?
+                ;;
+            yes:su)
+                su -s /bin/bash "${target}" -c "$(printf '%q ' "$@")"
+                return $?
+                ;;
+        esac
+    fi
+
+    lib_warn "无法降权到用户 ${target}（受限环境或该用户不存在），改以 $(id -un) 运行：$(basename "$1")"
+    "$@"
+}
+
+# ------------------------------------------------------------------------------
+# 后台守护进程启动：pidfile 必须指向真身
+# ------------------------------------------------------------------------------
+#
+# 直接把「函数调用」放到后台再取 $! 是错的：$! 拿到的是执行该函数的 bash 子壳，
+# 子壳随后退出、真正的服务进程被 reparent 到 init，于是 stop 时 kill 的是一个
+# 早已死亡的 PID，服务进程永久泄漏。降权场景更糟——runuser/su 是中间父进程，
+# 且默认不转发信号。
+#
+# 解法：让子进程【自己】把 $$ 写进 pidfile，然后 exec 成目标程序。
+# bash -c 里的 $$ 与 exec 后的进程 PID 相同，所以 pidfile 永远指向服务真身，
+# 中间的 runuser/su 是否存活都不影响停机准确性。
+lib_spawn() {
+    # 用法: lib_spawn <pidfile> <logfile> [--as-root] <cmd> [args...]
+    #   --as-root  显式要求以当前(root)身份运行，不降权。
+    #              只用于必须在 /var/run 下创建 bind socket 的代理进程。
+    local pidfile="$1" logfile="$2"
+    shift 2
+    local force_root=0
+    if [ "${1:-}" = "--as-root" ]; then
+        force_root=1
+        shift
+    fi
+    mkdir -p "$(dirname "${logfile}")" 2>/dev/null
+
+    local inner script
+    inner="$(printf '%q ' "$@")"
+    script="printf '%s' \$\$ > $(printf '%q' "${pidfile}"); exec ${inner}"
+
+    local target="${TRIM_USERNAME:-}"
+    if [ "${force_root}" -eq 0 ] && [ -n "${target}" ] && [ "$(id -un)" != "${target}" ]; then
+        local can=1
+        lib_can_drop_to "${target}" && can=0
+        if [ "${can}" -eq 0 ] && [ "${_DROP_CAPABLE}" = "yes" ]; then
+            runuser -u "${target}" -- bash -c "${script}" >> "${logfile}" 2>&1 &
+            return 0
+        elif [ "${can}" -eq 0 ]; then
+            su -s /bin/bash "${target}" -c "$(printf '%q ' bash -c "${script}")" \
+                >> "${logfile}" 2>&1 &
+            return 0
+        fi
+        lib_warn "无法降权到 ${target}，以 $(id -un) 启动：$(basename "$1")"
+    fi
+    bash -c "${script}" >> "${logfile}" 2>&1 &
+    return 0
+}
+
+lib_wait_pidfile() {
+    # pidfile 由子进程自己写入，启动瞬间可能还没落盘，最多等 5s
+    local file="$1" i=0
+    while [ "${i}" -lt 50 ]; do
+        if [ -s "${file}" ] && lib_pid_alive "${file}"; then
+            return 0
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    [ -s "${file}" ] && lib_pid_alive "${file}"
+}
+
+lib_probe_proxy() {
+    # 代理自身健康端点
+    local resp
+    resp="$(curl -s --max-time 3 --unix-socket "${TARGET_SOCK}" http://localhost/_ext/healthz 2>/dev/null || true)"
+    case "${resp}" in
+        *'"upstream"'*) return 0 ;;
+        *) return 1 ;;
+    esac
+}

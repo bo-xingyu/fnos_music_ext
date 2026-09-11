@@ -1,0 +1,66 @@
+#!/bin/bash
+# config_callback —— 应用设置【提交后】执行：重写 .env 并重启
+#
+# 只重写配置、不重建虚拟环境（REBUILD_VENV=0），随后重启使新配置生效。
+# 重启会经过完整的 socket 停机/接管流程，飞牛音乐在此窗口内短暂回到官方直连。
+#
+# 官方约定：生命周期脚本应尽量幂等；失败前把用户可见错误写入 $TRIM_TEMP_LOGFILE。
+set -uo pipefail
+
+export PATH="/var/apps/python312/target/bin:${PATH}"
+
+APP_NAME="fnmusicext"
+APPDEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
+PKGVAR="${TRIM_PKGVAR:-/vol1/@appvar/${APP_NAME}}"
+RUN_DIR="${PKGVAR}/app"
+
+# 卸载回调阶段 APPDEST 可能已被移除，回落到 stage 过的一份副本
+BIN="${APPDEST}/bin"
+if [ ! -f "${BIN}/fnmusic-lib.sh" ]; then
+    BIN="${RUN_DIR}/bin"
+fi
+
+fail() {
+    local msg="$1"
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "${msg}" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    fi
+    echo "[fnmusic-ext] ${msg}" >&2
+}
+
+need() {
+    local script="$1"
+    if [ ! -f "${BIN}/${script}" ]; then
+        fail "找不到 ${BIN}/${script}，无法完成本步骤。请重新安装本应用。"
+        return 1
+    fi
+    return 0
+}
+
+need "setup.sh" || exit 1
+need "start.sh" || exit 1
+need "stop.sh" || exit 1
+
+log_file="${PKGVAR}/logs/config.log"
+mkdir -p "$(dirname "${log_file}")" 2>/dev/null
+{
+    echo "=== $(date '+%F %T') config_callback ==="
+} >> "${log_file}" 2>/dev/null
+
+# 只更新配置，跳过耗时的虚拟环境重建
+if ! FNMUSICEXT_REBUILD_VENV=false bash "${BIN}/setup.sh" >> "${log_file}" 2>&1; then
+    fail "写入新配置失败，详见 ${log_file}"
+    tail -n 20 "${log_file}" >> "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null
+    exit 1
+fi
+
+# 重启以加载新配置（配置里的 PushPlus token 等只在进程启动时读取）
+bash "${BIN}/stop.sh" >> "${log_file}" 2>&1
+if bash "${BIN}/start.sh" >> "${log_file}" 2>&1; then
+    echo "[fnmusic-ext] 配置已更新并重启生效。"
+    exit 0
+fi
+
+fail "配置已写入但重启失败。飞牛音乐当前为官方直连状态（可正常使用），详见 ${log_file}"
+tail -n 20 "${log_file}" >> "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null
+exit 1

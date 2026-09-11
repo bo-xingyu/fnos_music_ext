@@ -265,3 +265,209 @@ def test_musicbox_search_logged_in_vip_playable(monkeypatch):
         assert data["data"][0]["song_id"] == 201
 
 
+
+
+# ---------------------------------------------------------------------------
+# v2.0 新增接口：/api/v1/auth/detail 与 /api/v1/recommend/daily
+# ---------------------------------------------------------------------------
+
+import app as mb_app
+
+
+def test_auth_detail_returns_login_and_vip_info(monkeypatch):
+    monkeypatch.setattr(
+        mb_app, "ne_auth_detail",
+        lambda: {"logged_in": True, "nickname": "张三", "user_id": "10086",
+                 "vip_type": 11, "vip_expires_ms": 1800000000000},
+    )
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/auth/detail")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["data"]["logged_in"] is True
+        assert body["data"]["nickname"] == "张三"
+        assert body["data"]["vip_type"] == 11
+        assert body["data"]["vip_expires_ms"] == 1800000000000
+
+
+def test_auth_detail_logged_out(monkeypatch):
+    monkeypatch.setattr(
+        mb_app, "ne_auth_detail",
+        lambda: {"logged_in": False, "nickname": "", "user_id": "", "vip_type": 0,
+                 "vip_expires_ms": 0},
+    )
+    with TestClient(app) as client:
+        body = client.get("/api/v1/auth/detail").json()
+        assert body["ok"] is True
+        assert body["data"]["logged_in"] is False
+
+
+def test_auth_detail_never_returns_500_on_upstream_error(monkeypatch):
+    """账号信息读取异常必须降级成"未登录"，不能让整个音源服务 500。"""
+
+    def boom():
+        raise RuntimeError("NEMbox 内部炸了")
+
+    monkeypatch.setattr(mb_app, "ne_auth_detail", boom)
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/auth/detail")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["data"]["logged_in"] is False
+        assert "error" in body["data"]
+
+
+def test_auth_detail_error_message_is_truncated(monkeypatch):
+    def boom():
+        raise RuntimeError("x" * 5000)
+
+    monkeypatch.setattr(mb_app, "ne_auth_detail", boom)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/auth/detail").json()
+        assert len(body["data"]["error"]) <= 200
+
+
+_DAILY_ROWS = [
+    {"song_id": 1, "song_name": "晴天", "artist": "周杰伦", "album_name": "叶惠美",
+     "duration": 269, "quality": "SQ", "mp3_url": "http://m1"},
+    {"song_id": 2, "song_name": "VIP曲", "artist": "歌手", "album_name": "专辑",
+     "duration": 200, "quality": "LD", "mp3_url": ""},
+    {"song_id": 3, "song_name": "夜曲", "artist": "周杰伦", "album_name": "十一月的萧邦",
+     "duration": 226, "quality": "HR", "mp3_url": "http://m3"},
+]
+
+
+def test_recommend_daily_success(monkeypatch):
+    seen = {}
+
+    def mock_run_musicbox(args, timeout=30.0):
+        seen["args"] = args
+        seen["timeout"] = timeout
+        return 0, __import__("json").dumps({"ok": True, "data": _DAILY_ROWS}), ""
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    monkeypatch.setattr(mb_app, "filter_playable_song_ids", lambda ids: {1, 3})
+
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/recommend/daily", params={"limit": 20})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        # 不可播的 VIP 曲被过滤掉
+        assert [s["song_id"] for s in body["data"]] == [1, 3]
+        assert body["data"][0]["song_name"] == "晴天"
+
+    assert seen["args"] == ["recommend", "songs", "--limit", "20", "--json"]
+    assert seen["timeout"] == 40.0
+
+
+def test_recommend_daily_not_logged_in(monkeypatch):
+    """musicbox CLI 退出码 3 = 未登录，必须如实上报而不是 502。"""
+    def mock_run_musicbox(args, timeout=30.0):
+        return 3, "", "not logged in"
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/recommend/daily")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body == {"ok": False, "error": "not_logged_in", "data": []}
+
+
+def test_recommend_daily_exit_code_matches_constant():
+    assert mb_app.CLI_EXIT_NOT_LOGGED_IN == 3
+
+
+def test_recommend_daily_timeout_is_504(monkeypatch):
+    def mock_run_musicbox(args, timeout=30.0):
+        raise runner.MusicboxTimeoutError("musicbox timed out after 40s")
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/recommend/daily")
+        assert resp.status_code == 504
+        assert resp.json()["ok"] is False
+        assert resp.json()["error"] == "timeout"
+
+
+@pytest.mark.parametrize("code", [1, 2, 4, 5, 10, 127])
+def test_recommend_daily_other_exit_codes_are_502(monkeypatch, code):
+    monkeypatch.setattr(runner, "run_musicbox", lambda args, timeout=30.0: (code, "", "boom"))
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/recommend/daily")
+        assert resp.status_code == 502
+        body = resp.json()
+        assert body["ok"] is False
+        assert body["error"] == "upstream_error"
+        assert body["exit_code"] == code
+
+
+def test_recommend_daily_bad_json_is_502(monkeypatch):
+    monkeypatch.setattr(runner, "run_musicbox", lambda args, timeout=30.0: (0, "不是 JSON", ""))
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/recommend/daily")
+        assert resp.status_code == 502
+        assert resp.json()["error"] == "bad_upstream_json"
+
+
+def test_recommend_daily_honors_limit(monkeypatch):
+    monkeypatch.setattr(runner, "run_musicbox",
+                        lambda args, timeout=30.0: (0, __import__("json").dumps(
+                            {"ok": True, "data": _DAILY_ROWS}), ""))
+    monkeypatch.setattr(mb_app, "filter_playable_song_ids", lambda ids: {1, 2, 3})
+    with TestClient(app) as client:
+        assert len(client.get("/api/v1/recommend/daily", params={"limit": 1}).json()["data"]) == 1
+        assert len(client.get("/api/v1/recommend/daily", params={"limit": 2}).json()["data"]) == 2
+
+
+@pytest.mark.parametrize("limit", [0, -1, 101, 999])
+def test_recommend_daily_rejects_out_of_range_limit(limit):
+    """越界 limit 被拒。本服务用自定义 RequestValidationError handler 统一返回 400
+    （而非 FastAPI 默认的 422），与 /api/v1/search 的表现保持一致。"""
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/recommend/daily", params={"limit": limit})
+        assert resp.status_code == 400
+        assert resp.json()["detail"], "必须带可读的校验详情"
+
+
+@pytest.mark.parametrize("limit", [1, 100])
+def test_recommend_daily_accepts_boundary_limits(monkeypatch, limit):
+    monkeypatch.setattr(runner, "run_musicbox",
+                        lambda args, timeout=30.0: (0, __import__("json").dumps(
+                            {"ok": True, "data": []}), ""))
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/recommend/daily", params={"limit": limit})
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "data": []}
+
+
+def test_recommend_daily_tolerates_malformed_rows(monkeypatch):
+    """上游返回混入 null / 字符串 / 缺字段行时不崩，只保留合法曲目。"""
+    rows = [None, "junk", 42, {"song_name": "无 id"}, _DAILY_ROWS[0]]
+    monkeypatch.setattr(runner, "run_musicbox",
+                        lambda args, timeout=30.0: (0, __import__("json").dumps(
+                            {"ok": True, "data": rows}), ""))
+    monkeypatch.setattr(mb_app, "filter_playable_song_ids", lambda ids: {1})
+    with TestClient(app) as client:
+        body = client.get("/api/v1/recommend/daily").json()
+        assert body["ok"] is True
+        assert len(body["data"]) == 1
+        assert body["data"][0]["song_id"] == 1
+
+
+def test_recommend_daily_default_limit_is_20(monkeypatch):
+    """不传 limit 时按 20 请求上游（CLI --limit 20），且不因缺参报错。"""
+    seen = {}
+
+    def mock_run_musicbox(args, timeout=30.0):
+        seen["args"] = args
+        return 0, __import__("json").dumps({"ok": True, "data": []}), ""
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/recommend/daily")
+        assert resp.status_code == 200
+    assert seen["args"] == ["recommend", "songs", "--limit", "20", "--json"]

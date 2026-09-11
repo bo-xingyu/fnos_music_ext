@@ -1,0 +1,66 @@
+#!/bin/bash
+# uninstall_init —— 卸载【之前】执行：停机并把 socket 还给官方
+#
+# 这是卸载流程里最关键的一步。若跳过，/var/run/trim_music.socket 会指向一个
+# 已被删除的代理，飞牛音乐将彻底无法工作，用户极难自行排查。
+#
+# 官方约定：生命周期脚本应尽量幂等；失败前把用户可见错误写入 $TRIM_TEMP_LOGFILE。
+set -uo pipefail
+
+export PATH="/var/apps/python312/target/bin:${PATH}"
+
+APP_NAME="fnmusicext"
+APPDEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
+PKGVAR="${TRIM_PKGVAR:-/vol1/@appvar/${APP_NAME}}"
+RUN_DIR="${PKGVAR}/app"
+
+# 卸载回调阶段 APPDEST 可能已被移除，回落到 stage 过的一份副本
+BIN="${APPDEST}/bin"
+if [ ! -f "${BIN}/fnmusic-lib.sh" ]; then
+    BIN="${RUN_DIR}/bin"
+fi
+
+fail() {
+    local msg="$1"
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "${msg}" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    fi
+    echo "[fnmusic-ext] ${msg}" >&2
+}
+
+need() {
+    local script="$1"
+    if [ ! -f "${BIN}/${script}" ]; then
+        fail "找不到 ${BIN}/${script}，无法完成本步骤。请重新安装本应用。"
+        return 1
+    fi
+    return 0
+}
+
+need "stop.sh" || exit 1
+
+log_file="${PKGVAR}/logs/uninstall.log"
+mkdir -p "$(dirname "${log_file}")" 2>/dev/null
+{
+    echo "=== $(date '+%F %T') uninstall_init ==="
+} >> "${log_file}" 2>/dev/null
+
+bash "${BIN}/stop.sh" >> "${log_file}" 2>&1
+rc=$?
+if [ "${rc}" -ne 0 ]; then
+    fail "卸载前停止服务失败（rc=${rc}），已尽力还原 socket。详见 ${log_file}"
+fi
+
+# 兜底核实：原路径必须已经是官方后端，绝不能是我们的代理
+resp="$(curl -s --max-time 3 --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz 2>/dev/null || true)"
+case "${resp}" in
+    *'"upstream"'*)
+        fail "严重：卸载后 /var/run/trim_music.socket 仍由本扩展接管。请到应用中心重启「飞牛音乐」以重建官方套接字。"
+        exit 1
+        ;;
+esac
+
+if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+    echo "已停止扩展并把 /var/run/trim_music.socket 还原给飞牛官方后端，飞牛音乐恢复原生直连。" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+fi
+exit 0

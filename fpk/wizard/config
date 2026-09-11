@@ -1,0 +1,109 @@
+[
+  {
+    "stepTitle": "网易云音源",
+    "items": [
+      {
+        "type": "select",
+        "field": "wizard_netease_quality",
+        "label": "音质",
+        "initValue": "lossless",
+        "options": [
+          { "label": "无损 lossless", "value": "lossless" },
+          { "label": "极高 exhigh (320k)", "value": "exhigh" },
+          { "label": "较高 higher (192k)", "value": "higher" },
+          { "label": "标准 standard (128k)", "value": "standard" }
+        ]
+      },
+      {
+        "type": "switch",
+        "field": "wizard_free_only_on_logout",
+        "label": "未登录时降级为只播免费曲目",
+        "initValue": "true"
+      },
+      {
+        "type": "switch",
+        "field": "wizard_daily_enabled",
+        "label": "启用网易云官方「每日推荐」歌单",
+        "initValue": "true"
+      },
+      {
+        "type": "text",
+        "field": "wizard_daily_limit",
+        "label": "每日推荐曲目数",
+        "initValue": "20",
+        "rules": [
+          { "pattern": "^[0-9]+$", "message": "请填写数字" },
+          { "min": 1, "message": "至少 1 首" },
+          { "max": 100, "message": "最多 100 首" }
+        ]
+      },
+      {
+        "type": "select",
+        "field": "wizard_musicbox_bind",
+        "label": "音源服务监听地址",
+        "initValue": "0.0.0.0",
+        "helpText": "改为 127.0.0.1 后无法再用局域网浏览器扫码，只能用终端 netease_login.sh。",
+        "options": [
+          { "label": "0.0.0.0（可局域网浏览器扫码）", "value": "0.0.0.0" },
+          { "label": "127.0.0.1（仅本机，最安全）", "value": "127.0.0.1" }
+        ]
+      }
+    ]
+  },
+  {
+    "stepTitle": "PushPlus 推送提醒",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "token 输入框留空表示「保持当前已保存的 token 不变」。要清空推送请关闭上方开关，不要把 token 填成空格。"
+      },
+      {
+        "type": "switch",
+        "field": "wizard_pushplus_enabled",
+        "label": "启用推送提醒",
+        "initValue": "true"
+      },
+      {
+        "type": "password",
+        "field": "wizard_pushplus_token",
+        "label": "PushPlus 用户 token",
+        "initValue": "",
+        "helpText": "留空 = 不修改现有 token。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_pushplus_topic",
+        "label": "PushPlus 群组编码",
+        "initValue": "",
+        "helpText": "留空则只推送给自己。"
+      },
+      {
+        "type": "select",
+        "field": "wizard_pushplus_template",
+        "label": "消息模板",
+        "initValue": "markdown",
+        "options": [
+          { "label": "markdown（推荐）", "value": "markdown" },
+          { "label": "html", "value": "html" },
+          { "label": "txt 纯文本", "value": "txt" },
+          { "label": "json", "value": "json" }
+        ]
+      }
+    ]
+  },
+  {
+    "stepTitle": "依赖安装",
+    "items": [
+      {
+        "type": "text",
+        "field": "wizard_pip_index",
+        "label": "pip 镜像源",
+        "initValue": "https://pypi.tuna.tsinghua.edu.cn/simple",
+        "helpText": "修改后需重装依赖才会生效（升级应用时自动重建虚拟环境）。",
+        "rules": [
+          { "pattern": "^https?://", "message": "必须以 http:// 或 https:// 开头" }
+        ]
+      }
+    ]
+  }
+]

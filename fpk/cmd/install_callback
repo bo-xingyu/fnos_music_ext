@@ -1,0 +1,63 @@
+#!/bin/bash
+# install_callback —— 安装文件落地【之后】执行：建运行环境
+#
+# 把包载荷 stage 到 $TRIM_PKGVAR/app、创建虚拟环境并安装依赖、
+# 按向导值生成 .env（权限 600）。全程幂等，可重复执行。
+# 这里【不】启动服务：ctl_stop=true 时由飞牛在随后调用 cmd/main start。
+#
+# 官方约定：生命周期脚本应尽量幂等；失败前把用户可见错误写入 $TRIM_TEMP_LOGFILE。
+set -uo pipefail
+
+export PATH="/var/apps/python312/target/bin:${PATH}"
+
+APP_NAME="fnmusicext"
+APPDEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
+PKGVAR="${TRIM_PKGVAR:-/vol1/@appvar/${APP_NAME}}"
+RUN_DIR="${PKGVAR}/app"
+
+# 卸载回调阶段 APPDEST 可能已被移除，回落到 stage 过的一份副本
+BIN="${APPDEST}/bin"
+if [ ! -f "${BIN}/fnmusic-lib.sh" ]; then
+    BIN="${RUN_DIR}/bin"
+fi
+
+fail() {
+    local msg="$1"
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "${msg}" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    fi
+    echo "[fnmusic-ext] ${msg}" >&2
+}
+
+need() {
+    local script="$1"
+    if [ ! -f "${BIN}/${script}" ]; then
+        fail "找不到 ${BIN}/${script}，无法完成本步骤。请重新安装本应用。"
+        return 1
+    fi
+    return 0
+}
+
+need "setup.sh" || exit 1
+
+log_file="${PKGVAR}/logs/setup.log"
+mkdir -p "$(dirname "${log_file}")" 2>/dev/null
+
+if bash "${BIN}/setup.sh" >> "${log_file}" 2>&1; then
+    echo "[fnmusic-ext] 运行环境已就绪。下一步：在应用中心启动本应用，然后按提示扫码登录网易云。"
+    # 把登录指引也写进用户可见日志，避免用户装完不知道还要扫码
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        {
+            echo ""
+            echo "安装完成。请继续两步操作："
+            echo "  1) 在应用中心启动「${TRIM_APPNAME:-fnmusicext}」；"
+            echo "  2) SSH 登录 NAS 并执行：bash ${RUN_DIR}/netease_login.sh"
+            echo "     用网易云音乐 App 扫码。未登录时只能播放免费曲目，且不会出现「每日推荐」。"
+        } >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    fi
+    exit 0
+fi
+
+fail "准备运行环境失败（虚拟环境创建或依赖安装出错）。完整日志：${PKGVAR}/logs/setup.log"
+tail -n 30 "${log_file}" >> "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null
+exit 1

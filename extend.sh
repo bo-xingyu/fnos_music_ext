@@ -12,9 +12,7 @@ FNMUSIC_VERSION="$(head -n 1 "${BASE_DIR}/VERSION" 2>/dev/null | tr -d '[:space:
 FNMUSIC_VERSION="${FNMUSIC_VERSION:-0.0.0}"
 TARGET_SOCK="/var/run/trim_music.socket"
 UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
-MUSICDL_URL="http://127.0.0.1:8768"
 MUSICBOX_URL="http://127.0.0.1:8770"
-LX_URL="http://127.0.0.1:8772"
 FORCE_RELOAD=0
 
 for arg in "$@"; do
@@ -125,18 +123,16 @@ set -a
 # shellcheck disable=SC1091
 source "${BASE_DIR}/.env"
 set +a
-MUSICDL_URL="${FNMUSIC_MUSICDL_URL:-${MUSICDL_URL}}"
 MUSICBOX_URL="${FNMUSIC_MUSICBOX_URL:-${MUSICBOX_URL}}"
-LX_URL="${FNMUSIC_LX_URL:-${LX_URL}}"
-DEPLOY_MODE="${FNMUSIC_DEPLOY_MODE:-}"
-ENABLE_MUSICDL=0
+# v2.0 单源化：部署形态读 FNMUSIC_MODE（docker|host）
+SRC_MODE="${FNMUSIC_MODE:-}"
+# 网易云 musicbox 是唯一在线音源
 ENABLE_MUSICBOX=0
-ENABLE_LX=0
-is_enabled "${FNMUSIC_MUSICDL_ENABLED:-true}" && ENABLE_MUSICDL=1
 is_enabled "${FNMUSIC_NETEASE_ENABLED:-true}" && ENABLE_MUSICBOX=1
-is_enabled "${FNMUSIC_LX_ENABLED:-false}" && ENABLE_LX=1
-if [ "${ENABLE_MUSICDL}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 0 ] && [ "${ENABLE_LX}" -eq 0 ]; then
-    log_err "至少需要启用一个音源（FNMUSIC_MUSICDL_ENABLED / FNMUSIC_NETEASE_ENABLED / FNMUSIC_LX_ENABLED）。"
+if [ "${ENABLE_MUSICBOX}" -eq 0 ]; then
+    log_err "FNMUSIC_NETEASE_ENABLED=false：v2.0 起网易云（musicbox）是唯一在线音源，"
+    log_err "关闭它会导致本扩展没有任何可用在线音源、失去意义。请在 .env 中置为 true，"
+    log_err "或执行 ./restore.sh 一键还原为官方直连。"
     exit 1
 fi
 
@@ -240,129 +236,205 @@ verify_acceptance() {
     fi
     log_info "验收 6a 通过：INVALID TOKEN 正确透传，耗时 ${time_total}s (< 3s)。"
 
-    # 6b. 在线音频取流与全链路测试 (Range: bytes=0-1048575 -> 200/206)
-    log_info "验收 6b: 验证在线播放全链路取流 (Range 200/206 及数据流传输)..."
+    # 6b. 网易云单源直链验收：搜索 -> 首个 song_id -> /api/v1/song/{id}/url -> HTTP 探活
+    #     (Range: bytes=0-1024 -> 200/206 且 Content-Type 不是 text/html)
+    log_info "验收 6b: 验证网易云 musicbox 搜索与直链探活 (Range bytes=0-1024 -> 200/206)..."
 
     local probe_keywords=("晴天" "海阔天空" "稻香")
     local search_any_result=0
+    local stream_ok=0
+    local quality="${FNMUSIC_NETEASE_QUALITY:-lossless}"
 
-    # 从指定音源搜索候选歌曲，逐行输出 id（可能为空）
-    search_probe_ids() {
-        local source="$1" keyword="$2" encoded
+    # 搜索网易云，输出首个可播 song_id（musicbox 已按账号真实可播权益过滤；可能为空）
+    netease_search_first_id() {
+        local keyword="$1" encoded
         encoded="$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "${keyword}" 2>/dev/null || true)"
         [ -z "${encoded}" ] && return 0
-        if [ "${source}" = "musicdl" ]; then
-            curl -s --max-time 20 "${MUSICDL_URL}/search?keyword=${encoded}&limit=3" 2>/dev/null | python3 -c "import sys,json
+        curl -s --max-time 20 "${MUSICBOX_URL}/api/v1/search?keyword=${encoded}&limit=3&type=song" 2>/dev/null | python3 -c "import sys,json
 try:
     d=json.load(sys.stdin)
-    for it in (d.get('items') or [])[:3]:
-        i=it.get('id')
-        if i: print(i)
 except Exception:
-    pass" 2>/dev/null || true
-        elif [ "${source}" = "lxmusic" ]; then
-            # 轮询 kg 与 wy 子源，分别获取候选歌曲，避免单一子源故障导致候选题库全灭
-            local lx_sub
-            for lx_sub in kg wy; do
-                curl -s --max-time 20 "${LX_URL}/api/v1/search?keyword=${encoded}&limit=5&sources=${lx_sub}" 2>/dev/null | python3 -c "import sys,json
-try:
-    d=json.load(sys.stdin)
-    rows=d.get('items') if isinstance(d, dict) else None
-    if not isinstance(rows, list):
-        rows=d.get('data') if isinstance(d, dict) else None
-    for it in (rows or [])[:2]:
-        i=str(it.get('id') or '')
-        if i:
-            print(i if i.startswith('lx:') else 'lx:'+i)
-except Exception:
-    pass" 2>/dev/null || true
-            done
-        else
-            curl -s --max-time 20 "${MUSICBOX_URL}/api/v1/search?keyword=${encoded}&limit=3&type=song" 2>/dev/null | python3 -c "import sys,json
-try:
-    d=json.load(sys.stdin)
-    rows=d.get('data') if isinstance(d, dict) else None
-    if not isinstance(rows, list):
-        rows=d.get('songs') if isinstance(d, dict) else None
-    for it in (rows or [])[:3]:
-        sid=str(it.get('song_id') or it.get('id') or '')
-        if sid: print('netease:'+sid)
-except Exception:
-    pass" 2>/dev/null || true
-        fi
+    sys.exit(0)
+rows=d.get('data') if isinstance(d,dict) else None
+if not isinstance(rows,list):
+    rows=d.get('songs') if isinstance(d,dict) else None
+for it in (rows or []):
+    it=it if isinstance(it,dict) else {}
+    sid=str(it.get('song_id') or it.get('id') or '')
+    if sid:
+        print(sid); break" 2>/dev/null || true
     }
 
-    # 对指定 guid 尝试全链路取流，成功返回 0
-    try_probe_stream() {
-        local probe_id="$1"
-        local stream_guid="online:${probe_id}"
-        local stream_sock="http://localhost/music/api/v1/track/stream?guid=${stream_guid}"
-        local stream_https="https://127.0.0.1:${GW_HTTPS_PORT}/music/api/v1/track/stream?guid=${stream_guid}"
-        local stream_443="https://127.0.0.1/music/api/v1/track/stream?guid=${stream_guid}"
-        local out_file http_code recv_size=0
-        out_file="$(mktemp)"
-        log_info "试播 guid=${stream_guid}"
-        http_code="$(curl -s -o "${out_file}" -w "%{http_code}" --unix-socket "${TARGET_SOCK}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_sock}" 2>/dev/null || echo "000")"
-        if [ "${http_code}" = "000" ]; then
-            log_warn "socket 取流异常，尝试 fallback 访问网关 https 端口 (${GW_HTTPS_PORT}) 取流..."
-            http_code="$(curl -sk -o "${out_file}" -w "%{http_code}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_https}" 2>/dev/null || echo "000")"
-        fi
-        if [ "${http_code}" = "000" ]; then
-            log_warn "网关 https 端口取流异常，尝试 fallback 访问 443 端口取流..."
-            http_code="$(curl -skL -o "${out_file}" -w "%{http_code}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_443}" 2>/dev/null || echo "000")"
-        fi
-        if [ -f "${out_file}" ]; then
-            recv_size="$(wc -c < "${out_file}" | tr -d ' ')"
-            rm -f "${out_file}"
-        fi
-        if { [ "${http_code}" = "206" ] || [ "${http_code}" = "200" ]; } && [ "${recv_size}" -gt 10000 ]; then
-            if [ "${recv_size}" -lt 500000 ]; then
-                log_warn "在线音频流接收大小为 ${recv_size} 字节 (偏小但已收到有效数据)。"
-            else
-                log_info "在线音频流接收大小为 ${recv_size} 字节 (≈1MB)。"
-            fi
-            return 0
-        fi
-        log_warn "取流未成功: guid=${stream_guid} HTTP=${http_code} recv=${recv_size}B"
+    # 解析指定 song_id 在 given quality 下的直链（/api/v1/song/{id}/url）；输出 URL（可能为空）
+    resolve_netease_direct_url() {
+        local sid="$1" q="$2"
+        curl -s --max-time 20 "${MUSICBOX_URL}/api/v1/song/${sid}/url?quality=${q}" 2>/dev/null | python3 -c "import sys,json
+def find_url(o):
+    if isinstance(o,dict):
+        if o.get('url'):
+            return str(o['url'])
+        for v in o.values():
+            r=find_url(v)
+            if r: return r
+    elif isinstance(o,list):
+        for v in o:
+            r=find_url(v)
+            if r: return r
+    return None
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+u=find_url(d)
+if u: print(u)" 2>/dev/null || true
+    }
+
+    # 直链 HTTP 探活：Range bytes=0-1024，期待 200/206 且 Content-Type 不是 text/html（防劫持到网页）
+    probe_direct_url() {
+        local url="$1" code ctype
+        read -r code ctype <<< "$(curl -s -o /dev/null -w '%{http_code} %{content_type}' \
+            -H 'Range: bytes=0-1024' --max-time 20 -L "${url}" 2>/dev/null || echo '000 -')"
+        case "${code}" in
+            200|206)
+                case "${ctype}" in
+                    text/html*)
+                        log_warn "直链返回 text/html（疑似被重定向到登录/错误网页）：HTTP=${code}"
+                        return 1 ;;
+                    *)
+                        log_info "直链探活成功：HTTP=${code} Content-Type=${ctype:-未知}"
+                        return 0 ;;
+                esac ;;
+        esac
+        log_warn "直链探活失败：HTTP=${code} Content-Type=${ctype:-未知}"
         return 1
     }
 
-    local sources=()
-    [ "${ENABLE_MUSICDL}" -eq 1 ] && sources+=("musicdl")
-    [ "${ENABLE_MUSICBOX}" -eq 1 ] && sources+=("musicbox")
-    [ "${ENABLE_LX}" -eq 1 ] && sources+=("lxmusic")
-
-    local src kw id first_failed_lx_id=""
-    for src in "${sources[@]}"; do
-        for kw in "${probe_keywords[@]}"; do
-            while IFS= read -r id; do
-                [ -z "${id}" ] && continue
-                search_any_result=1
-                if [ "${src}" = "lxmusic" ] && [ -z "${first_failed_lx_id}" ]; then
-                    first_failed_lx_id="${id}"
-                fi
-                if try_probe_stream "${id}"; then
-                    log_info "验收 6b 通过：音源 ${src} 在线播放流取流成功。"
-                    return 0
-                fi
-            done < <(search_probe_ids "${src}" "${kw}")
+    local kw sid url q
+    for kw in "${probe_keywords[@]}"; do
+        sid="$(netease_search_first_id "${kw}")"
+        [ -z "${sid}" ] && continue
+        search_any_result=1
+        # 无损需对应权益，失败时按 exhigh -> standard 依次降级重试直链
+        url=""
+        for q in "${quality}" exhigh standard; do
+            url="$(resolve_netease_direct_url "${sid}" "${q}")"
+            [ -n "${url}" ] && break
         done
+        if [ -n "${url}" ] && probe_direct_url "${url}"; then
+            log_info "验收 6b 通过：网易云搜索 -> 直链 -> HTTP 探活成功（关键词=${kw}, song_id=${sid}）。"
+            stream_ok=1
+            break
+        fi
+        log_warn "关键词=${kw}（song_id=${sid}）未能完成直链探活，尝试下一候选..."
     done
 
     # 外部音源网络波动不阻断部署：仅输出警告，绝不触发 return 1 / rollback
-    if [ "${search_any_result}" -eq 0 ]; then
-        log_warn "所有已启用音源 (${sources[*]}) 搜索结果均为空：可能是外部网络异常或第三方平台限流。"
-    else
-        log_warn "所有候选歌曲均未能成功取流 (外部音源网络波动，不阻断部署)。"
-        if [ "${ENABLE_LX}" -eq 1 ] && [ -n "${first_failed_lx_id}" ]; then
-            local lx_diag
-            lx_diag="$(curl -s --max-time 5 "${LX_URL}/api/v1/track/url?id=${first_failed_lx_id}&quality=standard" 2>/dev/null || echo "")"
-            if [ -n "${lx_diag}" ]; then
-                log_warn "洛雪音源直链诊断 (${first_failed_lx_id}): ${lx_diag}"
-            fi
+    if [ "${stream_ok}" -eq 0 ]; then
+        if [ "${search_any_result}" -eq 0 ]; then
+            log_warn "网易云 musicbox 搜索结果均为空：可能是外部网络异常、尚未扫码登录或网易限流。"
+        else
+            log_warn "所有候选歌曲均未能完成直链探活（网易云网络波动或登录权益受限，不阻断部署）。"
         fi
+        log_warn "跳过在线播放自动验收，建议稍后在飞牛音乐 Web 端手动搜索试播验证。"
     fi
-    log_warn "跳过在线播放自动验收，建议稍后在飞牛音乐 Web 端手动搜索试播验证。"
+
+    # 6c. 登录态验收与提示（v2.0 单源：全部权益来自扫码登录的网易云账号）
+    log_info "验收 6c: 校验网易云登录态与官方每日推荐..."
+    verify_login_state
+    return 0
+}
+
+# ------------------------------------------------------------------------------
+# 登录态验收（网易云单源）：读取 /api/v1/auth/detail
+#   - 未登录：醒目告警「免费曲目降级」模式（VIP/无损不可播、每日推荐不出），提示扫码登录
+#   - 已登录：打印昵称与 VIP 剩余天数，并附带验收 /api/v1/recommend/daily（仅告警不判失败）
+# ------------------------------------------------------------------------------
+verify_login_state() {
+    local detail_json parsed nickname vip_days warn_days daily_json daily_count
+    detail_json="$(curl -s --max-time 10 "${MUSICBOX_URL}/api/v1/auth/detail" 2>/dev/null || true)"
+    if [ -z "${detail_json}" ]; then
+        log_warn "无法访问 ${MUSICBOX_URL}/api/v1/auth/detail，跳过登录态验收（未能确认网易云登录状态）。"
+        return 0
+    fi
+    parsed="$(printf '%s' "${detail_json}" | python3 -c "
+import sys,json,time
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print('ERR'); sys.exit(0)
+data=d.get('data') if isinstance(d,dict) else None
+if not isinstance(data,dict):
+    print('ERR'); sys.exit(0)
+if not data.get('logged_in'):
+    print('OUT'); sys.exit(0)
+nick=str(data.get('nickname') or data.get('user_id') or '')
+ms=data.get('vip_expires_ms') or 0
+try:
+    ms=int(ms)
+except Exception:
+    ms=0
+days=''
+if ms>0:
+    days=str(int((ms/1000.0 - time.time())/86400))
+print('IN::'+nick+'::'+days)
+" 2>/dev/null || echo ERR)"
+    case "${parsed}" in
+        OUT)
+            log_warn "============================================================"
+            log_warn "【网易云未登录】当前处于「免费曲目降级」模式："
+            log_warn "  - VIP / 无损曲目无法在线播放，仅提供免费曲目；"
+            log_warn "  - 网易云官方「每日推荐」不会出现在飞牛音乐中。"
+            log_warn "  扫码登录（推荐）：./extend.sh --qr 或 ./netease_login.sh"
+            log_warn "  浏览器图片扫码：http://<NAS_IP>:8770/api/v1/auth/login/qr.png"
+            log_warn "  登录后重跑 ./extend.sh --force，即可恢复 VIP/无损与每日推荐。"
+            log_warn "============================================================"
+            ;;
+        IN::*)
+            nickname="${parsed#IN::}"; nickname="${nickname%%::*}"
+            vip_days="${parsed##*::}"
+            warn_days="${FNMUSIC_VIP_WARN_DAYS:-7}"
+            if [ -n "${vip_days}" ]; then
+                log_info "网易云已登录：昵称=${nickname:-未知}，VIP 剩余约 ${vip_days} 天。"
+                if [ "${vip_days}" -le "${warn_days}" ] 2>/dev/null; then
+                    log_warn "VIP 临期（≤${warn_days} 天）；如已配置 PushPlus 将收到微信提醒。"
+                fi
+            else
+                log_info "网易云已登录：昵称=${nickname:-未知}（当前非 VIP 或无到期信息）。"
+            fi
+            # 顺带验收官方每日推荐能否拿到数据（拿不到只 warn 不 fail）
+            daily_json="$(curl -s --max-time 40 "${MUSICBOX_URL}/api/v1/recommend/daily?limit=5" 2>/dev/null || true)"
+            daily_count="$(printf '%s' "${daily_json}" | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print('ERR'); sys.exit(0)
+if isinstance(d,dict) and d.get('ok') and isinstance(d.get('data'),list):
+    print(len(d['data']))
+else:
+    print(str(d.get('error')) if isinstance(d,dict) and d.get('error') else 'ERR')
+" 2>/dev/null || echo ERR)"
+            case "${daily_count}" in
+                ''|*[!0-9]*)
+                    if [ "${daily_count}" = "not_logged_in" ]; then
+                        log_warn "每日推荐接口返回未登录（not_logged_in），与 auth/detail 不一致；建议重新扫码登录后重试。"
+                    else
+                        log_warn "每日推荐未能拿到数据（返回：${daily_count:-空}）；不影响部署，可稍后自查 /api/v1/recommend/daily?limit=5。"
+                    fi
+                    ;;
+                *)
+                    if [ "${daily_count}" -gt 0 ]; then
+                        log_info "每日推荐验收通过：/api/v1/recommend/daily 返回 ${daily_count} 首。"
+                    else
+                        log_warn "每日推荐返回 0 首（可能今日暂无推荐或网易限流），不影响部署。"
+                    fi
+                    ;;
+            esac
+            ;;
+        *)
+            log_warn "无法解析网易云登录态（auth/detail 返回格式异常），跳过登录验收。"
+            ;;
+    esac
     return 0
 }
 
@@ -405,7 +477,7 @@ if [ ! -S "${TARGET_SOCK}" ] && [ ! -S "${UPSTREAM_SOCK}" ]; then
     exit 1
 fi
 
-# 1.4 检查 / 自动拉起已启用的音源（按 DEPLOY_MODE 只走 docker 或 host，避免双轨冲突）
+# 1.4 检查 / 自动拉起网易云 musicbox 音源（按 FNMUSIC_MODE 只走 docker 或 host，避免双轨冲突）
 ensure_source() {
     local name="$1" url="$2" compose_svc="$3" unit="$4"
     if curl -sf --max-time 5 "${url}/healthz" >/dev/null 2>&1; then
@@ -413,7 +485,7 @@ ensure_source() {
         return 0
     fi
     log_warn "${name} 未就绪，正在拉起..."
-    local mode="${DEPLOY_MODE}"
+    local mode="${SRC_MODE}"
     if [ -z "${mode}" ]; then
         if systemctl list-unit-files "${unit}" 2>/dev/null | grep -q "${unit}"; then
             mode="host"
@@ -452,22 +524,12 @@ ensure_source() {
     return 1
 }
 
-if [ "${ENABLE_MUSICDL}" -eq 1 ]; then
-    if ! ensure_source "musicdl" "${MUSICDL_URL}" "musicdl" "fnmusic-musicdl.service"; then
-        exit 1
-    fi
-fi
 if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     mkdir -p "${BASE_DIR}/musicbox-data/cache/netease-musicbox" \
         "${BASE_DIR}/musicbox-data/config/netease-musicbox" \
         "${BASE_DIR}/musicbox-data/netease-musicbox"
     chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
     if ! ensure_source "musicbox" "${MUSICBOX_URL}" "musicbox" "fnmusic-musicbox.service"; then
-        exit 1
-    fi
-fi
-if [ "${ENABLE_LX}" -eq 1 ]; then
-    if ! ensure_source "lxmusic" "${LX_URL}" "lxmusic" "fnmusic-lxmusic.service"; then
         exit 1
     fi
 fi
@@ -548,7 +610,10 @@ log_info "==> 步骤 4/5: 等待代理服务接管完成并就绪..."
 READY=0
 for i in $(seq 1 30); do
     STATUS_JSON="$(curl -s --max-time 2 --unix-socket "${TARGET_SOCK}" http://localhost/_ext/healthz 2>/dev/null || true)"
-    if echo "${STATUS_JSON}" | grep -q '"ok":[[:space:]]*true' && echo "${STATUS_JSON}" | grep -q '"upstream":[[:space:]]*"ok"'; then
+    # v2.0 单源：接管就绪 = upstream 透传 ok 且 musicbox（网易云）ok；healthz 已按单源重构，仅保留 musicbox 字段。
+    # 不以聚合 "ok":true 作门槛——未登录且 free_only=false 时 ok 会为 false，但接管本身仍可用（登录态由 6c 另行告警，不阻断）。
+    if echo "${STATUS_JSON}" | grep -q '"upstream":[[:space:]]*"ok"' \
+        && echo "${STATUS_JSON}" | grep -q '"musicbox":[[:space:]]*"ok"'; then
         READY=1
         break
     fi
@@ -573,20 +638,18 @@ fi
 log_info "============================================================"
 log_info "fnmusic-ext v${FNMUSIC_VERSION} 扩展已成功部署并生效！"
 log_info "架构：Unix Socket 接管 (零侵入，不修改 nginx 配置)"
-log_info "在线音源搜索合并、在线播放与元数据代理已就绪。"
+log_info "网易云在线音源搜索合并、在线播放与元数据代理已就绪。"
 log_info "------------------------------------------------------------"
 log_info "【后续验证与使用指引】"
 log_info "1. 验证搜索与播放："
 log_info "   打开飞牛音乐 Web 端或手机 App，搜索歌曲（如“晴天”或“周杰伦”），"
 log_info "   点击在线源歌曲试听，确认可以流畅播放并显示歌词与封面。"
-if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
-    log_info "2. 网易云扫码登录（可选）："
-    log_info "   若遇到部分网易云 VIP/无损歌曲需登录："
-    log_info "   • 命令行扫码登录（推荐）: ./extend.sh --qr 或 ./netease_login.sh"
-    log_info "     （自动展示二维码、轮询登录状态、过期自动刷新，支持随时 Ctrl+C 跳过）"
-    log_info "   • 浏览器图片扫码（备选）: http://<NAS_IP>:8770/api/v1/auth/login/qr.png"
-    log_info "   • 查询登录状态: curl -s http://127.0.0.1:8770/api/v1/auth/status"
-fi
+log_info "2. 网易云扫码登录（强烈推荐）："
+log_info "   v2.0 起所有在线曲目都来自扫码登录的私人网易云账号权益，未登录仅播免费曲目："
+log_info "   • 命令行扫码登录（推荐）: ./extend.sh --qr 或 ./netease_login.sh"
+log_info "     （自动展示二维码、轮询登录状态、过期自动刷新，支持随时 Ctrl+C 跳过）"
+log_info "   • 浏览器图片扫码（备选）: http://<NAS_IP>:8770/api/v1/auth/login/qr.png"
+log_info "   • 查询登录与 VIP 状态: curl -s ${MUSICBOX_URL}/api/v1/auth/detail"
 log_info "3. 健康检查与运维："
 log_info "   • 探测状态: curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz"
 log_info "   • 查看日志: sudo journalctl -u fnmusic-ext -f"

@@ -3,6 +3,75 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.0.0] - 2026-09-11
+
+大版本重构：**在线音源收敛为网易云单一渠道，且只使用扫码登录的那个私人账号的权益。**
+
+### 移除
+
+- **musicdl 聚合音源**（酷我 / 咪咕，端口 8768）：删除 `musicdl-service/` 整个目录、
+  docker-compose service、systemd unit、安装向导多选项与相关验收分支。
+- **lxmusic 洛雪免登录解析音源**（酷狗 kg / 网易 wy / 咪咕 mg，端口 8772）：删除
+  `lxmusic-service/` 整个目录及其全部代理层解析分支（`fetch_lx_search`、`resolve_lx_url`）。
+- **LLM 每日推荐**：删除 `FNMUSIC_LLM_BASE_URL` / `FNMUSIC_LLM_API_KEY` / `FNMUSIC_LLM_MODEL`
+  配置、安装向导的模型列表拉取与选择流程、`proxy/recommend.py` 里的
+  提示词构造 / 响应解析 / 本地收听记录种子推断 / 语种识别 / 兜底曲库整套逻辑。
+- 配置项 `FNMUSIC_MUSICDL_*`、`FNMUSIC_LX_*`、`FNMUSIC_ONLINE_SOURCES`、`FNMUSIC_APT_MIRROR`、
+  `FNMUSIC_DEPLOY_MODE` 一律废弃。**升级时由 `proxy/env_merge.py` 自动从 `.env` 清理**，
+  用户自定义键与其余偏好值不受影响。
+- 音源多选参数 `--sources` 与 `--llm-*` 参数不再具有语义；为不破坏老命令行，仍接受但忽略并告警。
+
+### 新增
+
+- **`proxy/netease_auth.py` 登录态门控**：探测并缓存（默认 300s TTL）网易云登录状态、
+  昵称与 VIP 到期时间；后台每小时巡检一次（`FNMUSIC_LOGIN_CHECK_INTERVAL`）。
+- **未登录降级策略 `FNMUSIC_FREE_ONLY_ON_LOGOUT`**（默认 `true`）：未扫码或 cookie 过期时，
+  降级为只播免费曲目以保证飞牛音乐基础可用；置 `false` 则未登录完全不提供在线播放。
+  已登录时使用账号自身权益，VIP / 无损 / 已购付费专辑曲目均可取到真实直链。
+- **`proxy/pushplus.py` 推送提醒**：登录态失效、首次检测到未登录、登录成功、VIP 临期
+  （`FNMUSIC_VIP_WARN_DAYS`，默认 7 天）时通过 PushPlus 推送。token 由
+  `FNMUSIC_PUSHPLUS_TOKEN` 配置（安装向导不回显读取，`.env` 权限 0600），
+  支持自定义 `FNMUSIC_PUSHPLUS_URL` / `TOPIC` / `TEMPLATE`。内置双重节流
+  （同内容 1 小时去重 + 全局最小间隔 12s）以适配 PushPlus 免费档「每日 200 次 /
+  每分钟 5 次 / 同内容每小时 3 条」的限制；token 无效或未实名时停止重试并明确报错。
+  推送全链路失败只记日志，绝不影响播放。
+- **`proxy/netease_items.py` 共享映射层**：网易云 song_info → 扩展统一条目的映射
+  收敛为一份，消除搜索链路与日推链路的重复实现。
+- **musicbox 服务新增接口**：
+  - `GET /api/v1/auth/detail` —— 登录态详情（含 `vip_type` / `vip_expires_ms`）；
+  - `GET /api/v1/recommend/daily?limit=N` —— 网易云官方「每日推荐」，复用
+    `musicbox recommend songs` 子命令（退出码 3 判定未登录）。
+- **安装向导 PushPlus 配置环节**：`--pushplus-token` / `--pushplus-topic` /
+  `--free-only-on-logout` / `--daily` 命令行参数，交互式下 token 不回显、打印时脱敏。
+- **`extend.sh` 登录态验收**：接管完成后读取 `/api/v1/auth/detail`，未登录给出醒目的
+  降级说明与扫码指引；已登录打印昵称与 VIP 剩余天数，并顺带验收日推接口可用性
+  （失败只告警不阻断）。
+- **v1.x 残留自动清理**：`install.sh` 无条件移除旧版遗留的 `fnmusic-musicdl` /
+  `fnmusic-lxmusic` 容器与 systemd unit；`restore.sh --full` 同步清理。
+
+### 变更
+
+- **「每日推荐」歌单来源**：由大模型凭空生成改为直接抓取网易云官方日推
+  （`/weapi/v3/discovery/recommend/songs`），推荐内容与用户真实听歌画像一致。
+  代价是**必须登录**——未登录时不再注入一份内容不对的歌单，`playlist/list`
+  保持官方列表原样（此前会注入一个空壳「每日推荐」）。
+- **搜索链路**：三源并发竞速 + 首响兜底合并逻辑简化为单源两段式等待
+  （首屏预算 `FNMUSIC_NETEASE_WAIT_S` 3s → 兜底预算 `FNMUSIC_LATE_PAGE_WAIT_S` 5s），
+  行为对多源时代等价但代码量大幅下降。
+- **代理层健康检查 `/_ext/healthz` 返回体**：去掉 `musicdl` / `lxmusic` / `llm` 字段，
+  改为 `netease`（登录态子对象）+ `daily` + `pushplus`；`ok` 语义收紧为
+  「上游可用 且 音源服务可用 且（已登录 或 允许免费曲降级）」。
+- **可播性过滤**：`netease_ext.filter_playable_song_ids` 的「未登录只留免费曲」逻辑
+  改为受 `FNMUSIC_FREE_ONLY_ON_LOGOUT` 控制，并显式过滤 `freeTrialPrivilege` 试听片段、
+  移除原先冗余的 `fee != 0 and fee not in (0, 8)` 判断。
+- **版本号**：按 `proxy/version.py` 约定，破坏性大版本重构 → `2.0.0`。
+
+### 修复
+
+- `test_version_env.py` 的 VERSION 断言此前写死 `1.1.2`，与仓库真实版本 `1.2.3`
+  不符（长期处于失败状态）。改为校验语义化版本格式，并新增
+  **VERSION 与 CHANGELOG 最新条目必须一致** 的用例，防止发版只改一处。
+
 ## [1.2.3] - 2026-09-08
 
 ### 新增

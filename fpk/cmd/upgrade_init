@@ -1,0 +1,65 @@
+#!/bin/bash
+# upgrade_init —— 升级【之前】执行：安全停机并还原 socket
+#
+# 升级期间飞牛音乐必须是可用的官方直连状态，所以这里先完整 stop
+# （含 socket 复位），避免文件被替换后留下一个接管了 socket 却已损坏的代理。
+# 同时备份 .env，防止升级过程意外丢配置。
+#
+# 官方约定：生命周期脚本应尽量幂等；失败前把用户可见错误写入 $TRIM_TEMP_LOGFILE。
+set -uo pipefail
+
+export PATH="/var/apps/python312/target/bin:${PATH}"
+
+APP_NAME="fnmusicext"
+APPDEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
+PKGVAR="${TRIM_PKGVAR:-/vol1/@appvar/${APP_NAME}}"
+RUN_DIR="${PKGVAR}/app"
+
+# 卸载回调阶段 APPDEST 可能已被移除，回落到 stage 过的一份副本
+BIN="${APPDEST}/bin"
+if [ ! -f "${BIN}/fnmusic-lib.sh" ]; then
+    BIN="${RUN_DIR}/bin"
+fi
+
+fail() {
+    local msg="$1"
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "${msg}" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    fi
+    echo "[fnmusic-ext] ${msg}" >&2
+}
+
+need() {
+    local script="$1"
+    if [ ! -f "${BIN}/${script}" ]; then
+        fail "找不到 ${BIN}/${script}，无法完成本步骤。请重新安装本应用。"
+        return 1
+    fi
+    return 0
+}
+
+need "stop.sh" || exit 1
+
+log_file="${PKGVAR}/logs/upgrade.log"
+mkdir -p "$(dirname "${log_file}")" 2>/dev/null
+{
+    echo "=== $(date '+%F %T') upgrade_init (old=${TRIM_OLD_APPVER:-?} -> new=${TRIM_APPVER:-?}) ==="
+} >> "${log_file}" 2>/dev/null
+
+bash "${BIN}/stop.sh" >> "${log_file}" 2>&1
+stop_rc=$?
+if [ "${stop_rc}" -ne 0 ]; then
+    fail "升级前停止服务失败（rc=${stop_rc}）。已尽力还原 socket，详见 ${log_file}"
+fi
+
+# 备份配置（含 PushPlus token）与记录登录凭证位置，升级后由 upgrade_callback 保留
+if [ -f "${RUN_DIR}/.env" ]; then
+    cp -a "${RUN_DIR}/.env" "${PKGVAR}/.env.upgrade.bak" 2>/dev/null \
+        && echo "已备份 .env 到 ${PKGVAR}/.env.upgrade.bak" >> "${log_file}" 2>/dev/null
+fi
+
+# 明确告知哪些数据在升级中会被保留
+if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+    echo "升级前已安全停机并将 /var/run/trim_music.socket 还原给飞牛官方后端。网易云登录凭证(musicbox-data)、音频缓存与在线收藏将保留。" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+fi
+exit 0

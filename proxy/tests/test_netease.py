@@ -12,7 +12,7 @@ from proxy.app import (
     _SEARCH_CACHE,
     _set_search_cache,
     _clean_search_cache,
-    fetch_musicbox_search,
+    fetch_netease_search,
     _online_info,
     resolve_netease_url,
     resolve_online_lyric,
@@ -36,9 +36,7 @@ def setup_netease_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "netease_search_limit", 50)
     monkeypatch.setitem(CONF, "merge_suggest", False)
     monkeypatch.setitem(CONF, "lyric_field", "data.lyric")
-    monkeypatch.setitem(CONF, "musicdl_enabled", True)
     monkeypatch.setitem(CONF, "netease_enabled", True)
-    monkeypatch.setitem(CONF, "lx_enabled", False)
     monkeypatch.setitem(CONF, "netease_wait_s", 2.5)
     monkeypatch.setitem(CONF, "netease_quality", "lossless")
     monkeypatch.setitem(CONF, "search_cache_ttl", 300.0)
@@ -49,7 +47,7 @@ def setup_netease_env(tmp_path, monkeypatch):
 # 1. netease 搜索映射 (quality SQ→flac、LD→mp3; 字段映射正确)
 # =========================================================================
 @pytest.mark.anyio
-async def test_fetch_musicbox_search_mapping():
+async def test_fetch_netease_search_mapping():
     def musicbox_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v1/search":
             assert request.url.params.get("keyword") == "七里香"
@@ -130,7 +128,7 @@ async def test_fetch_musicbox_search_mapping():
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
     )
-    items = await fetch_musicbox_search(client, "七里香", 10)
+    items = await fetch_netease_search(client, "七里香", 10)
     assert items is not None
     assert len(items) == 4
 
@@ -162,20 +160,20 @@ async def test_fetch_musicbox_search_mapping():
 
 
 @pytest.mark.anyio
-async def test_fetch_musicbox_search_error_handling():
+async def test_fetch_netease_search_error_handling():
     def err_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, json={"ok": False})
 
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(err_handler), base_url="http://127.0.0.1:8770"
     )
-    items = await fetch_musicbox_search(client, "fail", 10)
+    items = await fetch_netease_search(client, "fail", 10)
     assert items is None
-    assert await fetch_musicbox_search(client, "", 10) is None
+    assert await fetch_netease_search(client, "", 10) is None
 
 
 @pytest.mark.anyio
-async def test_fetch_musicbox_search_detail_failure_fallback():
+async def test_fetch_netease_search_detail_failure_fallback():
     """songs/detail 挂掉（500）时 cover_url 留空，主结果仍在。"""
     def search_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v1/search":
@@ -202,7 +200,7 @@ async def test_fetch_musicbox_search_detail_failure_fallback():
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(search_handler), base_url="http://127.0.0.1:8770"
     )
-    items = await fetch_musicbox_search(client, "七里香", 10)
+    items = await fetch_netease_search(client, "七里香", 10)
     assert items is not None
     assert len(items) == 1
     assert items[0]["id"] == "netease:186016"
@@ -735,26 +733,6 @@ def test_search_track_pagination_and_cache_ttl(monkeypatch):
             },
         )
 
-    def musicdl_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "ok": True,
-                "items": [
-                    {
-                        "id": f"kuwo:kw_{i}",
-                        "source": "kuwo",
-                        "title": f"酷我歌曲_{i}",
-                        "artist": "歌手B",
-                        "album": "专辑B",
-                        "duration_s": 200,
-                        "ext": "flac",
-                    }
-                    for i in range(1, 4)  # 3 首
-                ],
-            },
-        )
-
     monkeypatch.setitem(CONF, "online_limit", 10)
     monkeypatch.setitem(CONF, "search_cache_ttl", 2.0)  # 短 TTL 测试过期
 
@@ -764,17 +742,14 @@ def test_search_track_pagination_and_cache_ttl(monkeypatch):
     app.state.musicbox_client = httpx.AsyncClient(
         transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
     )
-    app.state.musicdl_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
-    )
 
     with TestClient(app) as client:
         # page=1 请求
         resp1 = client.get("/music/api/v1/search/track?q=周杰伦&page=1&size=50")
         assert resp1.status_code == 200
         data1 = resp1.json()["data"]
-        # total 抬升：本地 1 + 在线 15 (12 mb + 3 mdl) = 16
-        assert data1["total"] == 16
+        # 单源后 total 抬升：本地 1 + 网易云在线 12 = 13
+        assert data1["total"] == 13
         # page=1 包含本地 1 条 + 在线前 10 条
         list1 = data1["list"]
         assert len(list1) == 11
@@ -782,18 +757,15 @@ def test_search_track_pagination_and_cache_ttl(monkeypatch):
         assert list1[1]["guid"] == "online:netease:mb_1"
         assert list1[10]["guid"] == "online:netease:mb_10"
 
-        # page=2 请求 (命中缓存，返回剩余 5 条在线：mb_11, mb_12, kw_1, kw_2, kw_3)
+        # page=2 请求（命中缓存，返回剩余 2 条在线：mb_11, mb_12）
         resp2 = client.get("/music/api/v1/search/track?q=周杰伦&page=2&size=50")
         assert resp2.status_code == 200
         data2 = resp2.json()["data"]
-        assert data2["total"] == 16
+        assert data2["total"] == 13
         list2 = data2["list"]
-        assert len(list2) == 5
+        assert len(list2) == 2
         assert list2[0]["guid"] == "online:netease:mb_11"
         assert list2[1]["guid"] == "online:netease:mb_12"
-        assert list2[2]["guid"] == "online:kuwo:kw_1"
-        assert list2[3]["guid"] == "online:kuwo:kw_2"
-        assert list2[4]["guid"] == "online:kuwo:kw_3"
 
         # 断言 page=2 与 page=1 的在线条目无重叠
         guids1 = {it["guid"] for it in list1[1:]}
@@ -804,7 +776,7 @@ def test_search_track_pagination_and_cache_ttl(monkeypatch):
         resp3_page = client.get("/music/api/v1/search/track?q=周杰伦&page=3&size=50")
         assert resp3_page.status_code == 200
         data3 = resp3_page.json()["data"]
-        assert data3["total"] == 16
+        assert data3["total"] == 13
         list3 = data3["list"]
         assert len(list3) == 0
         guids3 = {it["guid"] for it in list3}
@@ -816,7 +788,7 @@ def test_search_track_pagination_and_cache_ttl(monkeypatch):
         # 再次搜索会重新生成缓存
         resp3 = client.get("/music/api/v1/search/track?q=周杰伦&page=1&size=50")
         assert resp3.status_code == 200
-        assert resp3.json()["data"]["total"] == 16
+        assert resp3.json()["data"]["total"] == 13
 
 
 # =========================================================================
@@ -840,56 +812,184 @@ def test_search_cache_eviction():
 # =========================================================================
 # 7. healthz 探测
 # =========================================================================
-def test_healthz_netease_probe(monkeypatch):
+def _hz_mocks(monkeypatch, *, upstream=200, musicbox=200, logged_in=True):
+    """构造 healthz 需要的上游 + musicbox mock；返回调用计数。
+
+    musicbox handler 同时应答 /healthz 与 /api/v1/auth/status，
+    因为新版 healthz 会强制刷新一次登录态。
+    """
+    from proxy import netease_auth
+
+    calls = {"upstream": 0, "musicbox_health": 0, "auth_status": 0}
+
     def upstream_handler(request: httpx.Request) -> httpx.Response:
+        calls["upstream"] += 1
+        if upstream != 200:
+            return httpx.Response(upstream)
         return httpx.Response(200, json={"code": 0})
 
-    def musicdl_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"ok": True})
-
     def musicbox_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"ok": True})
+        if request.url.path == "/healthz":
+            calls["musicbox_health"] += 1
+            if musicbox != 200:
+                return httpx.Response(musicbox)
+            return httpx.Response(200, json={"ok": True})
+        if request.url.path == "/api/v1/auth/status":
+            calls["auth_status"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "data": {
+                        "logged_in": logged_in,
+                        "nickname": "测试账号" if logged_in else "",
+                        "user_id": "10086" if logged_in else "",
+                    },
+                },
+            )
+        return httpx.Response(404)
 
     app.state.upstream_client = httpx.AsyncClient(
         transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
     )
-    app.state.musicdl_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
-    )
     app.state.musicbox_client = httpx.AsyncClient(
         transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
     )
+    netease_auth.invalidate_state()
+    return calls
+
+
+def test_healthz_all_green(monkeypatch):
+    """上游 + 音源都健康且已登录 → ok=True，daily 可用。"""
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "free_only_on_logout", True)
+    monkeypatch.setitem(CONF, "daily_enabled", True)
+    monkeypatch.delenv("FNMUSIC_PUSHPLUS_TOKEN", raising=False)
+    _hz_mocks(monkeypatch, logged_in=True)
 
     with TestClient(app) as client:
-        # musicbox 正常
-        resp = client.get("/_ext/healthz")
-        assert resp.status_code == 200
-        rj = resp.json()
-        assert rj["ok"] is True
-        assert rj["musicbox"] == "ok"
+        rj = client.get("/_ext/healthz").json()
 
-    # musicbox 异常 (不影响整体 ok)
-    def musicbox_fail_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500)
+    assert rj["ok"] is True
+    assert rj["upstream"] == "ok"
+    assert rj["musicbox"] == "ok"
+    assert rj["daily"] == "ok"
+    assert rj["pushplus"] == "disabled"
+    ne = rj["netease"]
+    assert ne["logged_in"] is True
+    assert ne["nickname"] == "测试账号"
+    assert ne["free_only"] is False
+    # v2.0 单源化后不再有这些字段
+    for gone in ("musicdl", "lxmusic", "llm"):
+        assert gone not in rj
 
-    app.state.musicbox_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(musicbox_fail_handler), base_url="http://127.0.0.1:8770"
-    )
+
+def test_healthz_logged_out_with_free_only_degradation(monkeypatch):
+    """未登录 + 允许降级 → 服务仍 ok，但 netease.free_only=True、daily=need_login。"""
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "free_only_on_logout", True)
+    monkeypatch.setitem(CONF, "daily_enabled", True)
+    _hz_mocks(monkeypatch, logged_in=False)
+
     with TestClient(app) as client:
-        resp = client.get("/_ext/healthz")
-        assert resp.status_code == 200
-        rj = resp.json()
-        assert rj["ok"] is True
-        assert rj["musicbox"] == "fail"
+        rj = client.get("/_ext/healthz").json()
 
-    # netease_enabled = False -> disabled
+    assert rj["ok"] is True, "降级模式下服务仍应视为可用"
+    assert rj["musicbox"] == "ok"
+    assert rj["netease"]["logged_in"] is False
+    assert rj["netease"]["free_only"] is True
+    assert rj["daily"] == "need_login"
+
+
+def test_healthz_logged_out_without_degradation_is_unhealthy(monkeypatch):
+    """未登录 + 关闭降级 → 在线音源不可用，ok=False。"""
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "free_only_on_logout", False)
+    monkeypatch.setitem(CONF, "daily_enabled", True)
+    _hz_mocks(monkeypatch, logged_in=False)
+
+    with TestClient(app) as client:
+        rj = client.get("/_ext/healthz").json()
+
+    assert rj["ok"] is False
+    assert rj["musicbox"] == "ok", "音源服务进程是活的，只是没登录"
+    assert rj["netease"]["logged_in"] is False
+
+
+def test_healthz_musicbox_down_is_unhealthy(monkeypatch):
+    """单源时代音源服务挂掉 = 整体不健康（不再有其它音源兜底）。"""
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "free_only_on_logout", True)
+    _hz_mocks(monkeypatch, musicbox=500)
+
+    with TestClient(app) as client:
+        rj = client.get("/_ext/healthz").json()
+
+    assert rj["ok"] is False
+    assert rj["upstream"] == "ok"
+    assert rj["musicbox"] == "fail"
+    assert rj["daily"] == "disabled"
+
+
+def test_healthz_upstream_down_is_unhealthy(monkeypatch):
+    """官方后端不可达时即便音源健康也判定不健康。"""
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "free_only_on_logout", True)
+    _hz_mocks(monkeypatch, upstream=500)
+
+    with TestClient(app) as client:
+        rj = client.get("/_ext/healthz").json()
+
+    assert rj["ok"] is False
+    assert rj["upstream"] == "fail"
+    assert rj["musicbox"] == "ok"
+
+
+def test_healthz_netease_disabled(monkeypatch):
+    """音源被关闭 → musicbox=disabled，且整体不健康（单源没有替补）。"""
     monkeypatch.setitem(CONF, "netease_enabled", False)
+    monkeypatch.setitem(CONF, "free_only_on_logout", True)
+    calls = _hz_mocks(monkeypatch)
+
+    with TestClient(app) as client:
+        rj = client.get("/_ext/healthz").json()
+
+    assert rj["ok"] is False
+    assert rj["musicbox"] == "disabled"
+    assert rj["daily"] == "disabled"
+    # 关闭开关后不应再去探测音源服务与登录态
+    assert calls["musicbox_health"] == 0
+    assert calls["auth_status"] == 0
+
+
+def test_healthz_reports_pushplus_enabled(monkeypatch):
+    """配了 token 就在 healthz 里如实反映 pushplus=enabled（但不泄露 token）。"""
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "free_only_on_logout", True)
+    monkeypatch.setenv("FNMUSIC_PUSHPLUS_ENABLED", "true")
+    monkeypatch.setenv("FNMUSIC_PUSHPLUS_TOKEN", "super-secret-token-value")
+    _hz_mocks(monkeypatch)
+
     with TestClient(app) as client:
         resp = client.get("/_ext/healthz")
-        assert resp.status_code == 200
         rj = resp.json()
-        assert rj["ok"] is True
-        assert rj["musicbox"] == "disabled"
+
+    assert rj["pushplus"] == "enabled"
+    assert "super-secret-token-value" not in resp.text
+
+
+def test_healthz_daily_disabled_flag(monkeypatch):
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "free_only_on_logout", True)
+    monkeypatch.setitem(CONF, "daily_enabled", False)
+    _hz_mocks(monkeypatch, logged_in=True)
+
+    with TestClient(app) as client:
+        rj = client.get("/_ext/healthz").json()
+
+    assert rj["daily"] == "disabled"
+
+
 
 
 # =========================================================================
@@ -950,7 +1050,7 @@ async def test_resolve_online_lyric_netease(tmp_path, monkeypatch):
 
 
 def test_search_volume_and_default_limits(monkeypatch):
-    """搜索量：断言 fetch_musicbox_search 请求参数 limit=50（netease_search_limit），page=1 在线条目最多 30 条。"""
+    """搜索量：断言 fetch_netease_search 请求参数 limit=50（netease_search_limit），page=1 在线条目最多 30 条。"""
     captured_limits = []
 
     def upstream_handler(request: httpx.Request) -> httpx.Response:
@@ -1008,186 +1108,240 @@ def test_search_volume_and_default_limits(monkeypatch):
         assert data["total"] == 40
 
 
-def test_healthz_musicdl_only(monkeypatch):
-    monkeypatch.setitem(CONF, "musicdl_enabled", True)
-    monkeypatch.setitem(CONF, "netease_enabled", False)
+# =========================================================================
+# 9. 单源门控：未登录 / 关闭音源时的搜索与播放行为
+# =========================================================================
+def _gating_mocks(monkeypatch, *, logged_in=False, search_rows=None):
+    """搜索链路门控测试用的 mock；返回调用计数。"""
+    from proxy import netease_auth
+
+    calls = {"search": 0, "auth_status": 0, "detail": 0}
 
     def upstream_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"code": 0})
-
-    def musicdl_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"ok": True})
-
-    def musicbox_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"ok": True})
-
-    app.state.upstream_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
-    )
-    app.state.musicdl_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
-    )
-    app.state.musicbox_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
-    )
-
-    with TestClient(app) as client:
-        rj = client.get("/_ext/healthz").json()
-        assert rj["ok"] is True
-        assert rj["musicdl"] == "ok"
-        assert rj["musicbox"] == "disabled"
-
-
-def test_healthz_musicbox_only(monkeypatch):
-    monkeypatch.setitem(CONF, "musicdl_enabled", False)
-    monkeypatch.setitem(CONF, "netease_enabled", True)
-
-    def upstream_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"code": 0})
-
-    def musicdl_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500)
-
-    def musicbox_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"ok": True})
-
-    app.state.upstream_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
-    )
-    app.state.musicdl_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
-    )
-    app.state.musicbox_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
-    )
-
-    with TestClient(app) as client:
-        rj = client.get("/_ext/healthz").json()
-        assert rj["ok"] is True
-        assert rj["musicdl"] == "disabled"
-        assert rj["musicbox"] == "ok"
-
-
-def test_healthz_both_sources_down_is_unhealthy(monkeypatch):
-    monkeypatch.setitem(CONF, "musicdl_enabled", True)
-    monkeypatch.setitem(CONF, "netease_enabled", True)
-    monkeypatch.setitem(CONF, "lx_enabled", False)
-
-    def upstream_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"code": 0})
-
-    def fail_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500)
-
-    app.state.upstream_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
-    )
-    app.state.musicdl_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(fail_handler), base_url="http://127.0.0.1:8768"
-    )
-    app.state.musicbox_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(fail_handler), base_url="http://127.0.0.1:8770"
-    )
-
-    with TestClient(app) as client:
-        rj = client.get("/_ext/healthz").json()
-        assert rj["ok"] is False
-        assert rj["upstream"] == "ok"
-        assert rj["musicdl"] == "fail"
-        assert rj["musicbox"] == "fail"
-
-
-def test_search_musicdl_only_skips_musicbox(monkeypatch):
-    monkeypatch.setitem(CONF, "musicdl_enabled", True)
-    monkeypatch.setitem(CONF, "netease_enabled", False)
-    called = {"musicbox": 0}
-
-    def upstream_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}})
-
-    def musicbox_handler(request: httpx.Request) -> httpx.Response:
-        called["musicbox"] += 1
-        return httpx.Response(200, json={"ok": True, "data": []})
-
-    def musicdl_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            200,
-            json={
-                "ok": True,
-                "items": [
-                    {
-                        "id": "migu:1",
-                        "source": "migu",
-                        "title": "晴天",
-                        "artist": "周杰伦",
-                        "duration_s": 269,
-                        "ext": "mp3",
-                    }
-                ],
-            },
+            200, json={"code": 0, "msg": "OK", "data": {"list": [], "total": 0}}
         )
 
-    app.state.upstream_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
-    )
-    app.state.musicdl_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
-    )
-    app.state.musicbox_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
-    )
-
-    with TestClient(app) as client:
-        items = client.get("/music/api/v1/search/track?q=晴天&page=1&size=20").json()["data"]["list"]
-        assert len(items) == 1
-        assert items[0]["guid"] == "online:migu:1"
-        assert called["musicbox"] == 0
-
-
-def test_search_musicbox_only_skips_musicdl(monkeypatch):
-    monkeypatch.setitem(CONF, "musicdl_enabled", False)
-    monkeypatch.setitem(CONF, "netease_enabled", True)
-    called = {"musicdl": 0}
-
-    def upstream_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}})
-
-    def musicdl_handler(request: httpx.Request) -> httpx.Response:
-        called["musicdl"] += 1
-        return httpx.Response(200, json={"ok": True, "items": []})
-
     def musicbox_handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/v1/search":
+        path = request.url.path
+        if path == "/api/v1/search":
+            calls["search"] += 1
             return httpx.Response(
                 200,
-                json={
-                    "ok": True,
-                    "data": [
-                        {
-                            "song_id": "228908",
-                            "song_name": "晴天",
-                            "artist": "周杰伦",
-                            "album_name": "叶惠美",
-                            "duration": 269,
-                            "quality": "SQ",
-                        }
-                    ],
-                },
+                json={"ok": True, "data": search_rows if search_rows is not None else []},
             )
-        return httpx.Response(200, json={"ok": True, "data": []})
+        if path == "/api/v1/auth/status":
+            calls["auth_status"] += 1
+            return httpx.Response(
+                200,
+                json={"ok": True, "data": {"logged_in": logged_in, "nickname": "n"}},
+            )
+        if path == "/api/v1/songs/detail":
+            calls["detail"] += 1
+            return httpx.Response(200, json={"ok": True, "data": []})
+        return httpx.Response(404)
 
     app.state.upstream_client = httpx.AsyncClient(
         transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
     )
-    app.state.musicdl_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
-    )
     app.state.musicbox_client = httpx.AsyncClient(
         transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
     )
+    netease_auth.invalidate_state()
+    return calls
+
+
+_ROWS = [
+    {
+        "song_id": "228908",
+        "song_name": "晴天",
+        "artist": "周杰伦",
+        "album_name": "叶惠美",
+        "duration": 269,
+        "quality": "SQ",
+    }
+]
+
+
+def test_search_allowed_when_logged_out_and_degradation_on(monkeypatch):
+    """默认降级模式：未登录也照常搜索，由服务端过滤成免费曲。"""
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "free_only_on_logout", True)
+    calls = _gating_mocks(monkeypatch, logged_in=False, search_rows=_ROWS)
 
     with TestClient(app) as client:
         items = client.get("/music/api/v1/search/track?q=晴天&page=1&size=20").json()["data"]["list"]
-        assert len(items) == 1
-        assert items[0]["guid"] == "online:netease:228908"
-        assert called["musicdl"] == 0
+
+    assert calls["search"] == 1
+    assert len(items) == 1
+    assert items[0]["guid"] == "online:netease:228908"
+
+
+def test_search_skipped_when_logged_out_and_degradation_off(monkeypatch):
+    """关闭降级后未登录必须完全不打音源服务，返回纯本地结果。"""
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "free_only_on_logout", False)
+    calls = _gating_mocks(monkeypatch, logged_in=False, search_rows=_ROWS)
+
+    with TestClient(app) as client:
+        body = client.get("/music/api/v1/search/track?q=晴天&page=1&size=20").json()
+
+    assert calls["search"] == 0, "未登录 + 关闭降级时绝不应请求网易云"
+    assert body["data"]["list"] == []
+    assert body["data"]["total"] == 0
+
+
+def test_search_allowed_when_logged_in_and_degradation_off(monkeypatch):
+    """关闭降级但已登录 → 正常放行，使用账号自身权益。"""
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "free_only_on_logout", False)
+    calls = _gating_mocks(monkeypatch, logged_in=True, search_rows=_ROWS)
+
+    with TestClient(app) as client:
+        items = client.get("/music/api/v1/search/track?q=晴天&page=1&size=20").json()["data"]["list"]
+
+    assert calls["search"] == 1
+    assert len(items) == 1
+
+
+def test_search_skipped_when_netease_disabled(monkeypatch):
+    monkeypatch.setitem(CONF, "netease_enabled", False)
+    monkeypatch.setitem(CONF, "free_only_on_logout", True)
+    calls = _gating_mocks(monkeypatch, logged_in=True, search_rows=_ROWS)
+
+    with TestClient(app) as client:
+        body = client.get("/music/api/v1/search/track?q=晴天&page=1&size=20").json()
+
+    assert calls["search"] == 0
+    assert body["data"]["list"] == []
+
+
+def test_stream_rejects_legacy_non_netease_guid(monkeypatch):
+    """旧版多音源遗留的 guid（online:migu:... / online:lx:kg:...）必须干净 404，
+    不能因为找不到对应音源而抛异常或返回 500。"""
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "free_only_on_logout", True)
+    _gating_mocks(monkeypatch, logged_in=True)
+
+    with TestClient(app) as client:
+        for guid in ("online:migu:600929", "online:lx:kg:abcdef", "online:kuwo:kw_1"):
+            resp = client.get(f"/music/api/v1/track/stream?guid={guid}")
+            assert resp.status_code == 404, guid
+            assert resp.json()["code"] == 404
+
+
+def test_online_search_allowed_pure_function(monkeypatch):
+    """_online_search_allowed 的三态门控。"""
+    import asyncio
+
+    from proxy import netease_auth
+    from proxy.app import _online_search_allowed
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"ok": True})),
+        base_url="http://127.0.0.1:8770",
+    )
+
+    def run():
+        return asyncio.run(_online_search_allowed(client))
+
+    monkeypatch.setitem(CONF, "netease_enabled", False)
+    assert run() is False
+
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "free_only_on_logout", True)
+    assert run() is True
+
+    monkeypatch.setitem(CONF, "free_only_on_logout", False)
+    netease_auth.invalidate_state()
+    monkeypatch.setattr(
+        netease_auth, "fetch_state",
+        _fake_fetch(netease_auth.LoginState(logged_in=False)),
+    )
+    assert run() is False
+
+    netease_auth.invalidate_state()
+    monkeypatch.setattr(
+        netease_auth, "fetch_state",
+        _fake_fetch(netease_auth.LoginState(logged_in=True, nickname="x")),
+    )
+    assert run() is True
+
+
+def _fake_fetch(state):
+    async def _f(client, *, force=False):
+        return state
+
+    return _f
+
+
+def test_wait_task_reports_budget_hit():
+    """_wait_task：预算内完成返回 True，超时返回 False 且不取消任务。"""
+    import asyncio
+
+    from proxy.app import _wait_task
+
+    async def scenario():
+        async def fast():
+            return "fast"
+
+        async def slow():
+            await asyncio.sleep(1.0)
+            return "slow"
+
+        t_fast = asyncio.create_task(fast())
+        assert await _wait_task(t_fast, 1.0) is True
+        assert t_fast.result() == "fast"
+
+        t_slow = asyncio.create_task(slow())
+        assert await _wait_task(t_slow, 0.05) is False
+        assert not t_slow.cancelled(), "超时不应取消后台任务，翻页还要用它的结果"
+        t_slow.cancel()
+
+        # 预算为 0 时立即返回当前状态，不阻塞
+        t_done = asyncio.create_task(fast())
+        await t_done
+        assert await _wait_task(t_done, 0) is True
+
+    asyncio.run(scenario())
+
+
+def test_collect_search_swallows_task_exception():
+    """后台聚合任务失败时写入空结果而不是抛异常（源故障必须被隔离）。"""
+    import asyncio
+
+    from proxy.app import _collect_search
+
+    async def scenario():
+        async def boom():
+            raise RuntimeError("音源炸了")
+
+        entry: dict = {"items": None}
+        await _collect_search(entry, asyncio.create_task(boom()))
+        assert entry["items"] == []
+
+        async def ok():
+            return [{"id": "netease:1", "source": "netease", "title": "t", "artist": "a"}]
+
+        entry2: dict = {"items": None}
+        await _collect_search(entry2, asyncio.create_task(ok()))
+        assert len(entry2["items"]) == 1
+
+        entry3: dict = {"items": ["sentinel"]}
+        await _collect_search(entry3, None)
+        assert entry3["items"] == []
+
+    asyncio.run(scenario())
+
+
+def test_online_unavailable_response_shape():
+    from proxy.app import _online_unavailable
+
+    resp = _online_unavailable()
+    assert resp.status_code == 404
+
+    import json as _json
+
+    assert _json.loads(resp.body)["code"] == 404
+    assert _json.loads(resp.body)["msg"] == "online source unavailable"
+

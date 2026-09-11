@@ -1,0 +1,116 @@
+#!/bin/bash
+# uninstall_callback —— 卸载清理【之后】执行：按用户选择清理数据
+#
+# 此时 APPDEST 已被移除，只能使用 stage 在 $RUN_DIR 下的副本。
+# 用户数据默认保留；wizard_remove_data / wizard_remove_library_cache 为 true
+# 时才删除。曲库文件删除【只】依据扩展自己写的 .ref 记录逐一精确定位，
+# 绝不使用通配符扫目录，避免误删用户自有音乐。
+#
+# 官方约定：生命周期脚本应尽量幂等；失败前把用户可见错误写入 $TRIM_TEMP_LOGFILE。
+set -uo pipefail
+
+export PATH="/var/apps/python312/target/bin:${PATH}"
+
+APP_NAME="fnmusicext"
+APPDEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
+PKGVAR="${TRIM_PKGVAR:-/vol1/@appvar/${APP_NAME}}"
+RUN_DIR="${PKGVAR}/app"
+
+# 卸载回调阶段 APPDEST 可能已被移除，回落到 stage 过的一份副本
+BIN="${APPDEST}/bin"
+if [ ! -f "${BIN}/fnmusic-lib.sh" ]; then
+    BIN="${RUN_DIR}/bin"
+fi
+
+fail() {
+    local msg="$1"
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "${msg}" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    fi
+    echo "[fnmusic-ext] ${msg}" >&2
+}
+
+need() {
+    local script="$1"
+    if [ ! -f "${BIN}/${script}" ]; then
+        fail "找不到 ${BIN}/${script}，无法完成本步骤。请重新安装本应用。"
+        return 1
+    fi
+    return 0
+}
+
+log_file="${PKGVAR}/logs/uninstall.log"
+mkdir -p "$(dirname "${log_file}")" 2>/dev/null
+log() { echo "$(date '+%F %T') [uninstall_callback] $*" >> "${log_file}" 2>/dev/null; }
+
+REMOVE_DATA="$(echo "${wizard_remove_data:-false}" | tr '[:upper:]' '[:lower:]')"
+REMOVE_LIB="$(echo "${wizard_remove_library_cache:-false}" | tr '[:upper:]' '[:lower:]')"
+is_true() { case "$1" in true|1|yes|on) return 0 ;; *) return 1 ;; esac; }
+
+CACHE_DIR="${RUN_DIR}/cache"
+
+# 1. 精确删除本扩展写入曲库的在线音频（依据 .ref 记录，不做通配匹配）
+if is_true "${REMOVE_LIB}"; then
+    log "按用户选择清理曲库中的在线音频缓存"
+    removed=0
+    missing=0
+    if [ -d "${CACHE_DIR}" ]; then
+        while IFS= read -r ref; do
+            [ -f "${ref}" ] || continue
+            stem="$(cat "${ref}" 2>/dev/null | head -n 1)"
+            # 只接受绝对路径且落在曲库目录内的记录，拒绝相对路径与越权路径
+            case "${stem}" in
+                /*) ;;
+                *) log "跳过非绝对路径记录: ${ref}"; continue ;;
+            esac
+            case "${stem}" in
+                *..*) log "跳过可疑路径记录: ${stem}"; continue ;;
+            esac
+            matched=0
+            for ext in mp3 flac wav ogg opus m4a aac ape wv dsf dff tta lrc; do
+                if [ -f "${stem}.${ext}" ]; then
+                    rm -f "${stem}.${ext}" && removed=$((removed + 1)) && matched=1
+                fi
+            done
+            [ "${matched}" -eq 0 ] && missing=$((missing + 1))
+        done < <(find "${CACHE_DIR}" -maxdepth 1 -name '*.ref' -type f 2>/dev/null)
+    fi
+    log "曲库清理完成：删除 ${removed} 个文件，${missing} 条记录已无对应文件"
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "已从曲库目录移除本扩展写入的 ${removed} 个在线音频/歌词缓存文件。" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    fi
+else
+    log "保留曲库中已落盘的在线音频缓存"
+fi
+
+# 2. 运行目录（含 .env / PushPlus token / 网易云登录凭证 / 缓存 / 收藏）
+if is_true "${REMOVE_DATA}" || is_true "${REMOVE_LIB}" || true; then
+    # RUN_DIR 属于本应用私有运行目录，卸载时一并清理；
+    # 但用户的曲库目录（外部共享目录）绝不动。
+    if [ -n "${RUN_DIR}" ] && [ -d "${RUN_DIR}" ]; then
+        # 安全护栏：确认要删的确实是本应用的 stage 目录
+        case "${RUN_DIR}" in
+            */@appvar/fnmusicext/app|*/fnmusicext/app)
+                log "删除运行目录 ${RUN_DIR}（含 .env / 登录凭证 / 缓存 / 收藏）"
+                rm -rf "${RUN_DIR}" 2>/dev/null || log "删除 ${RUN_DIR} 失败"
+                ;;
+            *)
+                log "护栏拦截：RUN_DIR=${RUN_DIR} 不在预期的 @appvar/fnmusicext 路径下，拒绝删除"
+                ;;
+        esac
+    fi
+    rm -f "${PKGVAR}/.env.upgrade.bak" 2>/dev/null
+fi
+
+# 3. systemd 残留（本应用不注册 unit，但 v1.x 脚本式安装可能留过）
+for unit in fnmusic-ext fnmusic-musicbox fnmusic-musicdl fnmusic-lxmusic; do
+    if [ -f "/etc/systemd/system/${unit}.service" ]; then
+        log "清理 v1.x 遗留 unit: ${unit}.service"
+        systemctl disable --now "${unit}.service" >/dev/null 2>&1
+        rm -f "/etc/systemd/system/${unit}.service" 2>/dev/null
+    fi
+done
+systemctl daemon-reload >/dev/null 2>&1
+
+log "=== uninstall_callback 完成 ==="
+exit 0

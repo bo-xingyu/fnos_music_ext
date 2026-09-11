@@ -1,12 +1,11 @@
+# Python 虚拟环境与运行时数据
 .venv*/
 .venv-proxy/
 .venv-research/
-.venv-musicdl/
 .venv-musicbox/
 musicbox-data/
 cache/
 backup/
-musicdl_outputs/
 recommend_cache/
 play_history/
 online_favorites/
@@ -15,14 +14,27 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 配置与密钥：.env 含 PushPlus token 与网易云相关配置，绝不入库
 .env
 .env.*
 !.env.example
-.pytest_cache/
-.zcode/
-*.part
+
+# 日志与临时分片
 *.log
+*.part
 .DS_Store
+
+# fpk 构建产物与中间目录
+dist/
+fpk/app/
+*.fpk
+
+# 编辑器 / 工具
+.zcode/
 .git.nested/
 **/.git.nested/
 TASK_*.md

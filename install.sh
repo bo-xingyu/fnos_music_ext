@@ -3,39 +3,50 @@ set -euo pipefail
 
 # ==============================================================================
 # fnmusic-ext 一键安装 / 配置
-# - 音源可多选、至少选一个：
+# - v2.0 起只保留网易云一个在线音源（单源，无多选）：
 #     musicbox https://github.com/darknessomi/musicbox   (:8770 网易云)
-#     musicdl  https://github.com/CharlesPikachu/musicdl (:8768 聚合)
-#     lxmusic  洛雪音乐源（LX Music 免登录解析）          (:8772)
-# - 可选开启每日推荐（OpenAI 兼容接口；不填则关闭）
+#   所有在线曲目都来自扫码登录的那个私人网易云账号的权益。
+# - 每日推荐抓取网易云官方「每日推荐」歌单（需登录，不再依赖 LLM）
+# - 可选 PushPlus 推送提醒（登录态失效 / VIP 临期）
 # - 不修改飞牛 nginx / 官方二进制 / 官方数据库写入
 # 用法:
 #   ./install.sh                         # 交互
 #   ./install.sh --mode host
-#   ./install.sh --mode docker --sources=1,2,3
-#   ./install.sh --mode docker --sources musicbox,lxmusic
-#   ./install.sh --non-interactive --mode docker --enable-recommend \
-#       --llm-base-url https://api.example.com/v1 --llm-api-key '***' --llm-model gpt-4o-mini
+#   ./install.sh --mode docker --daily true --free-only-on-logout true
+#   ./install.sh --non-interactive --mode docker --pushplus-token '***' --pushplus-topic '***'
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FNMUSIC_VERSION="$(head -n 1 "${BASE_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
 FNMUSIC_VERSION="${FNMUSIC_VERSION:-0.0.0}"
 MODE=""
-SOURCES_RAW=""
 NON_INTERACTIVE=0
-ENABLE_RECOMMEND=""
-LLM_BASE_URL=""
-LLM_API_KEY=""
-LLM_MODEL=""
-LLM_MODEL_FROM_CLI=0
-DEFAULT_LLM_MODEL="gpt-4o-mini"
 RUN_EXTEND=0
-ENABLE_MUSICDL=0
-ENABLE_MUSICBOX=0
-ENABLE_LX=0
+# PushPlus 推送（token/topic 预取自环境变量；ENABLED 空哨兵=本次未明确选择）
+PUSHPLUS_ENABLED=""
+PUSHPLUS_TOKEN="${FNMUSIC_PUSHPLUS_TOKEN:-}"
+PUSHPLUS_TOPIC="${FNMUSIC_PUSHPLUS_TOPIC:-}"
+# 登录降级 / 每日推荐开关（--free-only-on-logout / --daily 控制，空哨兵=沿用默认值）
+FREE_ONLY_ON_LOGOUT=""
+FREE_ONLY_FROM_CLI=0
+DAILY_ENABLED=""
+DAILY_FROM_CLI=0
+# 网易云音源参数（缺省与 .env.example 一致，可用同名环境变量覆盖）
+MUSICBOX_URL="${FNMUSIC_MUSICBOX_URL:-http://127.0.0.1:8770}"
+NETEASE_QUALITY="${FNMUSIC_NETEASE_QUALITY:-lossless}"
+NETEASE_SEARCH_LIMIT="${FNMUSIC_NETEASE_SEARCH_LIMIT:-50}"
+ONLINE_LIMIT="${FNMUSIC_ONLINE_LIMIT:-30}"
+NETEASE_WAIT_S="${FNMUSIC_NETEASE_WAIT_S:-3.0}"
+LATE_PAGE_WAIT_S="${FNMUSIC_LATE_PAGE_WAIT_S:-5.0}"
+SEARCH_TIMEOUT="${FNMUSIC_SEARCH_TIMEOUT:-15}"
+SEARCH_CACHE_TTL="${FNMUSIC_SEARCH_CACHE_TTL:-604800}"
+LOGIN_STATE_TTL="${FNMUSIC_LOGIN_STATE_TTL:-300}"
+LOGIN_CHECK_INTERVAL="${FNMUSIC_LOGIN_CHECK_INTERVAL:-3600}"
+VIP_WARN_DAYS="${FNMUSIC_VIP_WARN_DAYS:-7}"
+DAILY_LIMIT="${FNMUSIC_DAILY_LIMIT:-20}"
+PUSHPLUS_TEMPLATE="${FNMUSIC_PUSHPLUS_TEMPLATE:-markdown}"
+PUSHPLUS_URL="${FNMUSIC_PUSHPLUS_URL:-https://www.pushplus.plus/send}"
 PIP_INDEX="${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
-MUSICDL_REPO="${MUSICDL_REPO:-https://github.com/CharlesPikachu/musicdl}"
 MUSICBOX_REPO="${MUSICBOX_REPO:-https://github.com/darknessomi/musicbox}"
 BASE_IMAGE="${BASE_IMAGE:-}"
 DOCKER_IMAGE_MIRRORS="${DOCKER_IMAGE_MIRRORS:-docker.1ms.run docker.m.daocloud.io docker.1panel.live hub.rat.dev}"
@@ -48,56 +59,37 @@ usage() {
     cat <<'EOF'
 用法: ./install.sh [选项]
 
-  --mode host|docker     安装模式（host=宿主机 venv；docker=音源容器）
-  --sources LIST         音源，逗号分隔，可多选，至少选一个（支持 --sources=1,2,3 形式）
-                         取值: musicbox, musicdl, lxmusic（或 1, 2, 3）
-                         1 = musicbox 网易云 [8770]
-                         2 = musicdl  聚合    [8768]
-                         3 = lxmusic  洛雪音乐源 [8772]
-                         非交互缺省: musicdl
-  --non-interactive      无交互，缺省值：mode=docker，音源=musicdl，不开启每日推荐
-  --enable-recommend     开启每日推荐（需同时给 base-url 与 api-key）
-  --disable-recommend    明确关闭每日推荐
-  --llm-base-url URL     OpenAI 兼容 Base URL，例如 https://api.openai.com/v1
-  --llm-api-key KEY      API Key（不会回显；请勿提交到 git）
-  --llm-model NAME       模型名；交互模式可自动拉取列表选择；非交互缺省 gpt-4o-mini
-  --extend               安装完成后立即执行 ./extend.sh
-  --qr                   启动终端网易云扫码登录流程
-  -h, --help             显示帮助
+  --mode host|docker            安装模式（host=宿主机 venv；docker=musicbox 容器）
+  --non-interactive             无交互，缺省值：mode=docker，开启每日推荐，未登录只播免费曲目
+  --pushplus-token TOKEN        PushPlus 推送 token（不回显；用于登录失效/VIP 临期提醒）
+  --pushplus-topic TOPIC        PushPlus 群组编码（可选，留空只推送给自己）
+  --free-only-on-logout BOOL    未登录时是否降级为只播免费曲目（true|false，缺省 true）
+  --daily BOOL                  是否开启网易云官方「每日推荐」歌单（true|false，缺省 true）
+  --extend                      安装完成后立即执行 ./extend.sh
+  --qr                          启动终端网易云扫码登录流程
+  -h, --help                    显示帮助
 
-密钥只写入仓库根目录 .env（chmod 600），不会进入 systemd 文件或日志。
+v2.0 起仅保留网易云单一音源（musicbox），所有在线曲目来自扫码登录的私人账号权益。
+PushPlus token 只写入仓库根目录 .env（chmod 600），不会进入 systemd 文件或日志。
 EOF
 }
 
-parse_sources() {
-    local raw="${1:-}"
-    ENABLE_MUSICDL=0
-    ENABLE_MUSICBOX=0
-    ENABLE_LX=0
-    # 支持 --sources=1,2,3 与 --sources 1,2,3 两种形式
-    raw="${raw#*=}"
-    raw="$(printf '%s' "${raw}" | tr '[:upper:]' '[:lower:]' | tr ' ' ',')"
-    local IFS=','
-    local part
-    # shellcheck disable=SC2086
-    for part in ${raw}; do
-        part="${part#"${part%%[![:space:]]*}"}"
-        part="${part%"${part##*[![:space:]]}"}"
-        [ -z "${part}" ] && continue
-        case "${part}" in
-            1|musicbox|netease|netease-musicbox) ENABLE_MUSICBOX=1 ;;
-            2|musicdl|mdl) ENABLE_MUSICDL=1 ;;
-            3|lx|lxmusic) ENABLE_LX=1 ;;
-            *)
-                log_err "未知音源: ${part}（可选 musicbox / musicdl / lxmusic，或 1 / 2 / 3）"
-                exit 1
-                ;;
-        esac
-    done
-    if [ "${ENABLE_MUSICDL}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 0 ] && [ "${ENABLE_LX}" -eq 0 ]; then
-        log_err "至少选择一个音源（musicbox / musicdl / lxmusic）"
-        exit 1
-    fi
+# 归一化布尔入参：接受 true/false/1/0/yes/no/on/off，输出规范 true|false；非法值直接退出
+normalize_bool() {
+    local name="$1" raw="${2:-}"
+    case "$(printf '%s' "${raw}" | tr '[:upper:]' '[:lower:]')" in
+        true|1|yes|on) printf 'true' ;;
+        false|0|no|off) printf 'false' ;;
+        *)
+            log_err "${name} 只接受 true|false（收到: ${raw:-空}）"
+            exit 1
+            ;;
+    esac
+}
+
+# 旧多音源参数（--sources / --llm-* / --enable-recommend 等）已废弃：接受但忽略并告警
+warn_deprecated() {
+    log_warn "参数 $1 自 v2.0 起已废弃：仅保留网易云单一音源，该参数被忽略。"
 }
 
 wait_http() {
@@ -118,29 +110,55 @@ while [ $# -gt 0 ]; do
             [ $# -ge 2 ] || { log_err "--mode 需要参数 host|docker"; exit 1; }
             MODE="${2}"; shift 2 ;;
         --mode=*) MODE="${1#*=}"; shift ;;
-        --sources)
-            [ $# -ge 2 ] || { log_err "--sources 需要音源列表参数"; exit 1; }
-            SOURCES_RAW="${2}"; shift 2 ;;
-        --sources=*) SOURCES_RAW="${1#*=}"; shift ;;
+        # --- v2.0 新增：PushPlus / 登录降级 / 每日推荐 ---
+        --pushplus-token)
+            [ $# -ge 2 ] || { log_err "--pushplus-token 需要 TOKEN 参数"; exit 1; }
+            PUSHPLUS_TOKEN="${2}"; shift 2 ;;
+        --pushplus-token=*) PUSHPLUS_TOKEN="${1#*=}"; shift ;;
+        --pushplus-topic)
+            [ $# -ge 2 ] || { log_err "--pushplus-topic 需要 TOPIC 参数"; exit 1; }
+            PUSHPLUS_TOPIC="${2}"; shift 2 ;;
+        --pushplus-topic=*) PUSHPLUS_TOPIC="${1#*=}"; shift ;;
+        --free-only-on-logout)
+            [ $# -ge 2 ] || { log_err "--free-only-on-logout 需要 true|false 参数"; exit 1; }
+            FREE_ONLY_ON_LOGOUT="$(normalize_bool "--free-only-on-logout" "${2}")"
+            FREE_ONLY_FROM_CLI=1; shift 2 ;;
+        --free-only-on-logout=*)
+            FREE_ONLY_ON_LOGOUT="$(normalize_bool "--free-only-on-logout" "${1#*=}")"
+            FREE_ONLY_FROM_CLI=1; shift ;;
+        --daily)
+            [ $# -ge 2 ] || { log_err "--daily 需要 true|false 参数"; exit 1; }
+            DAILY_ENABLED="$(normalize_bool "--daily" "${2}")"
+            DAILY_FROM_CLI=1; shift 2 ;;
+        --daily=*)
+            DAILY_ENABLED="$(normalize_bool "--daily" "${1#*=}")"
+            DAILY_FROM_CLI=1; shift ;;
         --non-interactive) NON_INTERACTIVE=1; shift ;;
-        --enable-recommend) ENABLE_RECOMMEND="yes"; shift ;;
-        --disable-recommend) ENABLE_RECOMMEND="no"; shift ;;
-        --llm-base-url)
-            [ $# -ge 2 ] || { log_err "--llm-base-url 需要 URL 参数"; exit 1; }
-            LLM_BASE_URL="${2}"; shift 2 ;;
-        --llm-api-key)
-            [ $# -ge 2 ] || { log_err "--llm-api-key 需要 KEY 参数"; exit 1; }
-            LLM_API_KEY="${2}"; shift 2 ;;
-        --llm-model)
-            [ $# -ge 2 ] || { log_err "--llm-model 需要模型名参数"; exit 1; }
-            LLM_MODEL="${2}"
-            LLM_MODEL_FROM_CLI=1
-            shift 2 ;;
         --extend) RUN_EXTEND=1; shift ;;
         --qr)
             bash "${BASE_DIR}/netease_login.sh"
             exit 0
             ;;
+        # --- 以下为 v1.x 旧参数：仍接受但忽略，避免老命令行直接报错退出 ---
+        --sources)
+            # 旧「音源多选」已废弃；v2.0 只有网易云单源（吞掉随后的取值参数）
+            warn_deprecated "--sources"
+            [ $# -ge 2 ] && shift 2 || shift ;;
+        --sources=*) warn_deprecated "--sources"; shift ;;
+        --enable-recommend|--disable-recommend)
+            # 每日推荐已改为抓取网易云官方日推，不再依赖 LLM；此开关映射到 --daily
+            log_warn "参数 $1 语义已变更：每日推荐现抓取网易云官方歌单（等同 --daily true|false），不再使用 LLM。"
+            if [ "$1" = "--disable-recommend" ]; then
+                DAILY_ENABLED="false"; DAILY_FROM_CLI=1
+            else
+                DAILY_ENABLED="true"; DAILY_FROM_CLI=1
+            fi
+            shift ;;
+        --llm-base-url|--llm-api-key|--llm-model)
+            warn_deprecated "$1"
+            [ $# -ge 2 ] && shift 2 || shift ;;
+        --llm-base-url=*|--llm-api-key=*|--llm-model=*)
+            warn_deprecated "${1%%=*}"; shift ;;
         -h|--help) usage; exit 0 ;;
         *) log_err "未知参数: $1"; usage; exit 1 ;;
     esac
@@ -280,137 +298,22 @@ prompt() {
     fi
 }
 
-# 从 OpenAI 兼容接口拉取模型列表（失败返回空；不打印 API Key）
-fetch_llm_models() {
-    local base_url="$1" api_key="$2"
-    local models_url tmp_body http_code
-    base_url="${base_url%/}"
-    models_url="${base_url}/models"
-    tmp_body="$(mktemp)"
-    http_code="$(
-        curl -sS --max-time 15 \
-            -H "Authorization: Bearer ${api_key}" \
-            -H "Content-Type: application/json" \
-            -o "${tmp_body}" -w "%{http_code}" \
-            "${models_url}" 2>/dev/null || echo "000"
-    )"
-    if [ "${http_code}" != "200" ]; then
-        rm -f "${tmp_body}"
-        return 1
-    fi
-    if ! python3 - "${tmp_body}" <<'PY' 2>/dev/null
-import json, sys
-path = sys.argv[1]
-try:
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-except Exception:
-    sys.exit(1)
-rows = []
-if isinstance(data, dict):
-    raw = data.get("data")
-    if isinstance(raw, list):
-        rows = raw
-    elif isinstance(data.get("models"), list):
-        rows = data["models"]
-elif isinstance(data, list):
-    rows = data
-ids = []
-seen = set()
-for it in rows:
-    mid = ""
-    if isinstance(it, dict):
-        mid = str(it.get("id") or it.get("name") or it.get("model") or "").strip()
-    elif isinstance(it, str):
-        mid = it.strip()
-    if mid and mid not in seen:
-        seen.add(mid)
-        ids.append(mid)
-if not ids:
-    sys.exit(1)
-for mid in ids:
-    print(mid)
-PY
-    then
-        rm -f "${tmp_body}"
-        return 1
-    fi
-    rm -f "${tmp_body}"
-    return 0
-}
-
-# 交互选择模型：优先展示拉取到的列表，失败则手写
-prompt_llm_model() {
-    local base_url="$1" api_key="$2"
-    local models=() line i choice custom def_idx=1
-    log_info "正在从接口拉取可用模型列表..."
-    while IFS= read -r line; do
-        [ -n "${line}" ] && models+=("${line}")
-    done < <(fetch_llm_models "${base_url}" "${api_key}" || true)
-
-    if [ "${#models[@]}" -eq 0 ]; then
-        log_warn "未能自动获取模型列表（接口不可达、鉴权失败或返回格式不兼容）。"
-        LLM_MODEL="$(prompt "请手动输入模型名称" "${DEFAULT_LLM_MODEL}")"
-        LLM_MODEL="${LLM_MODEL:-${DEFAULT_LLM_MODEL}}"
-        return 0
-    fi
-
-    local max_show=40 total="${#models[@]}"
-    if [ "${total}" -gt "${max_show}" ]; then
-        log_info "接口返回 ${total} 个模型，列表仅展示前 ${max_show} 个；其余请选 0 自定义输入。"
-    fi
-    echo "可用模型："
-    local show_count="${total}"
-    [ "${show_count}" -gt "${max_show}" ] && show_count="${max_show}"
-    for i in $(seq 0 $((show_count - 1))); do
-        echo "  $((i + 1))) ${models[$i]}"
-    done
-    echo "  0) 自定义输入模型名称"
-    # 默认选第一项；若可见列表含默认模型名则优先
-    for i in $(seq 0 $((show_count - 1))); do
-        if [ "${models[$i]}" = "${DEFAULT_LLM_MODEL}" ]; then
-            def_idx=$((i + 1))
-            break
-        fi
-    done
-    choice="$(prompt "请选择模型编号（0=自定义）" "${def_idx}")"
-    case "${choice}" in
-        0)
-            custom="$(prompt "请输入自定义模型名称" "${DEFAULT_LLM_MODEL}")"
-            LLM_MODEL="${custom:-${DEFAULT_LLM_MODEL}}"
-            ;;
-        ''|*[!0-9]*)
-            log_warn "输入无效，使用默认模型 ${models[$((def_idx - 1))]}。"
-            LLM_MODEL="${models[$((def_idx - 1))]}"
-            ;;
-        *)
-            if [ "${choice}" -ge 1 ] && [ "${choice}" -le "${show_count}" ]; then
-                LLM_MODEL="${models[$((choice - 1))]}"
-            else
-                log_warn "编号超出范围，使用默认模型 ${models[$((def_idx - 1))]}。"
-                LLM_MODEL="${models[$((def_idx - 1))]}"
-            fi
-            ;;
-    esac
-    log_info "已选择模型: ${LLM_MODEL}"
-}
-
 if [ "${NON_INTERACTIVE}" -eq 0 ]; then
     echo "============================================================"
     echo " fnmusic-ext 安装配置向导  v${FNMUSIC_VERSION}"
-    echo " 音源: ${MUSICBOX_REPO}"
-    echo "       ${MUSICDL_REPO}"
-    echo "       lxmusic — 洛雪音乐源（免登录解析：酷狗/网易/咪咕）"
+    echo " 唯一在线音源: 网易云 musicbox — ${MUSICBOX_REPO}"
+    echo " (v2.0 起不再提供多音源选择；所有在线曲目均来自"
+    echo "  扫码登录的私人网易云账号权益)"
     echo "============================================================"
     if [ -z "${MODE}" ]; then
         echo "【安装模式说明】"
         echo "  无论选哪种模式，核心代理（fnmusic-ext）均以宿主机 systemd 运行接管 Socket。"
-        echo "  两种模式区别仅在于音源服务（musicbox/musicdl/lxmusic）的部署运行形态："
+        echo "  两种模式区别仅在于网易云音源服务（musicbox）的部署运行形态："
         if command -v docker >/dev/null 2>&1; then
             echo "  1) docker  — [推荐] Docker 容器模式："
-            echo "               通过 compose 运行轻量容器（端口 8768/8770/8772，无特权，数据隔离在 musicbox-data/）"
+            echo "               通过 compose 运行轻量容器（端口 8770，无特权，数据隔离在 musicbox-data/）"
             echo "  2) host    — Host 宿主机本地服务模式（纯净无 Docker）："
-            echo "               创建独立 Python venv 并注册为 systemd 服务（监听 127.0.0.1，不污染全局环境）"
+            echo "               创建独立 Python venv 并注册为 systemd 服务（监听 8770 端口，不污染全局环境）"
             local_choice="$(prompt "请选择安装模式 (输入 1 或 2)" "1")"
         else
             echo "  1) docker  — Docker 容器模式（未检测到 Docker，若选此项请先在 fnOS「应用中心」安装 Docker）"
@@ -423,41 +326,29 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
             *) MODE="docker" ;;
         esac
     fi
-    if [ -z "${SOURCES_RAW}" ]; then
-        echo "请选择音源（可多选，逗号分隔，至少选一个）:"
-        echo "  1) 网易云音乐源 musicbox  [端口 8770] — 高品质/无损/歌词封面（darknessomi/musicbox）"
-        echo "  2) 聚合音源   musicdl    [端口 8768] — 酷我/咪咕等聚合，覆盖热门流行（CharlesPikachu/musicdl）"
-        echo "  3) 洛雪音乐源 lxmusic     [端口 8772] — 免登录高音质解析：酷狗 kg / 网易 wy / 咪咕 mg 直链"
-        echo "  1,2,3) 全部启用 — 三源并行（推荐）"
-        SOURCES_RAW="$(prompt "输入 1 / 2 / 3 / 1,2 / 1,3 / 1,2,3" "1,2,3")"
-    fi
-    if [ -z "${ENABLE_RECOMMEND}" ]; then
-        echo "大模型每日推荐歌单（可选选填）:"
-        echo "  支持接入兼容 OpenAI 协议的大模型（如 DeepSeek/GPT/Qwen 等），"
-        echo "  根据播放偏好每天自动生成 20 首推荐新歌。"
-        rec_choice="$(prompt "是否开启每日推荐（需 OpenAI 兼容 API Key）? [y/N]" "N")"
-        case "${rec_choice}" in
-            y|Y|yes|YES) ENABLE_RECOMMEND="yes" ;;
-            *) ENABLE_RECOMMEND="no" ;;
+    # PushPlus 推送提醒（替代 v1.x 的 LLM 每日推荐配置环节）
+    if [ -z "${PUSHPLUS_ENABLED}" ]; then
+        echo "PushPlus 推送提醒（可选）:"
+        echo "  网易云登录态失效、VIP 临期等事件将通过 PushPlus（https://www.pushplus.plus）"
+        echo "  推送到微信，免费注册后在个人中心获取 token。"
+        pp_choice="$(prompt "是否启用 PushPlus 推送提醒? [y/N]" "N")"
+        case "${pp_choice}" in
+            y|Y|yes|YES) PUSHPLUS_ENABLED="true" ;;
+            *) PUSHPLUS_ENABLED="false" ;;
         esac
     fi
-    if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
-        [ -z "${LLM_BASE_URL}" ] && LLM_BASE_URL="$(prompt "LLM Base URL（OpenAI 兼容，例如 https://api.openai.com/v1）")"
-        if [ -z "${LLM_API_KEY}" ]; then
-            read -r -s -p "LLM API Key（输入不回显，留空则不开启推荐）: " LLM_API_KEY || true
+    if [ "${PUSHPLUS_ENABLED}" = "true" ]; then
+        if [ -z "${PUSHPLUS_TOKEN}" ]; then
+            read -r -s -p "PushPlus token（输入不回显；留空则暂不实际推送）: " PUSHPLUS_TOKEN || true
             echo
         fi
-        if [ -z "${LLM_BASE_URL}" ] || [ -z "${LLM_API_KEY}" ]; then
-            log_warn "未同时提供 Base URL 与 API Key，每日推荐将关闭。"
-            ENABLE_RECOMMEND="no"
-            LLM_BASE_URL=""
-            LLM_API_KEY=""
-            LLM_MODEL=""
-        elif [ "${LLM_MODEL_FROM_CLI}" -eq 1 ] && [ -n "${LLM_MODEL}" ]; then
-            log_info "使用命令行指定的模型: ${LLM_MODEL}"
+        if [ -z "${PUSHPLUS_TOPIC}" ]; then
+            PUSHPLUS_TOPIC="$(prompt "PushPlus 群组编码（可选，留空只推送给自己）")"
+        fi
+        if [ -n "${PUSHPLUS_TOKEN}" ]; then
+            log_info "PushPlus 已启用（token: ${PUSHPLUS_TOKEN:0:4}****，完整值仅写入 .env，不出现在日志）。"
         else
-            # 仅在开启推荐且已有 URL/Key 时拉取模型列表并让用户选择
-            prompt_llm_model "${LLM_BASE_URL}" "${LLM_API_KEY}"
+            log_warn "PushPlus token 为空，暂不会实际推送；后续可在 .env 填写 FNMUSIC_PUSHPLUS_TOKEN 并重启 fnmusic-ext。"
         fi
     fi
     ext_choice="$(prompt "安装配置完成，是否立即执行 extend.sh 启用扩展? [Y/n]" "Y")"
@@ -467,18 +358,11 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
     esac
 else
     MODE="${MODE:-docker}"
-    SOURCES_RAW="${SOURCES_RAW:-musicdl}"
-    if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
-        if [ -z "${LLM_BASE_URL}" ] || [ -z "${LLM_API_KEY}" ]; then
-            log_err "--enable-recommend 需要同时提供 --llm-base-url 与 --llm-api-key"
-            exit 1
-        fi
-        LLM_MODEL="${LLM_MODEL:-${DEFAULT_LLM_MODEL}}"
-    else
-        ENABLE_RECOMMEND="no"
-        LLM_BASE_URL=""
-        LLM_API_KEY=""
-        LLM_MODEL=""
+    # 非交互：PushPlus 取 --pushplus-token/--pushplus-topic 或 FNMUSIC_PUSHPLUS_* 环境变量；
+    # 缺省则 token 留空（pushplus.enabled() 按 token 门控，即不启用推送）。
+    # 提供了 token 即视为希望启用推送。
+    if [ -n "${PUSHPLUS_TOKEN}" ] && [ -z "${PUSHPLUS_ENABLED}" ]; then
+        PUSHPLUS_ENABLED="true"
     fi
 fi
 
@@ -491,17 +375,17 @@ if [ "${MODE}" = "docker" ]; then
     ensure_docker_ready
 fi
 
-parse_sources "${SOURCES_RAW}"
-
-SELECTED=""
-[ "${ENABLE_MUSICBOX}" -eq 1 ] && SELECTED="${SELECTED} musicbox[8770]"
-[ "${ENABLE_MUSICDL}" -eq 1 ] && SELECTED="${SELECTED} musicdl[8768]"
-[ "${ENABLE_LX}" -eq 1 ] && SELECTED="${SELECTED} lxmusic[8772]"
+# 开关最终值（未在命令行/交互中明确指定时回落到 .env.example 同款默认值）
+FREE_ONLY_VAL="${FREE_ONLY_ON_LOGOUT:-true}"
+DAILY_VAL="${DAILY_ENABLED:-true}"
+PUSHPLUS_ENABLED_VAL="${PUSHPLUS_ENABLED:-true}"
 
 log_info "fnmusic-ext v${FNMUSIC_VERSION}"
 log_info "安装模式: ${MODE}"
-log_info "音源:${SELECTED}"
-log_info "每日推荐: ${ENABLE_RECOMMEND}"
+log_info "音源: musicbox — 网易云 [8770]（v2.0 起唯一在线音源）"
+log_info "每日推荐: ${DAILY_VAL}（抓取网易云官方日推，需扫码登录）"
+log_info "未登录降级只播免费曲目: ${FREE_ONLY_VAL}"
+log_info "PushPlus 推送: $([ "${PUSHPLUS_ENABLED_VAL}" = "true" ] && [ -n "${PUSHPLUS_TOKEN}" ] && echo "已启用 (token: ${PUSHPLUS_TOKEN:0:4}****)" || echo "未启用（不会发送任何推送）")"
 log_info "项目目录: ${BASE_DIR}"
 
 mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache" \
@@ -512,19 +396,12 @@ chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
 
 # 归一化服务源码权限：umask 077 环境检出的文件为 600，会导致镜像内 appuser 读不到 app.py
 chmod 0644 \
-    "${BASE_DIR}/musicdl-service/app.py" "${BASE_DIR}/musicdl-service/hardening.py" \
     "${BASE_DIR}/musicbox-service/app.py" "${BASE_DIR}/musicbox-service/runner.py" \
-    "${BASE_DIR}/musicbox-service/netease_ext.py" "${BASE_DIR}/lxmusic-service/app.py" \
+    "${BASE_DIR}/musicbox-service/netease_ext.py" \
     2>/dev/null || true
 
-MUSICDL_FLAG="false"
-MUSICBOX_FLAG="false"
-LX_FLAG="false"
-[ "${ENABLE_MUSICDL}" -eq 1 ] && MUSICDL_FLAG="true"
-[ "${ENABLE_MUSICBOX}" -eq 1 ] && MUSICBOX_FLAG="true"
-[ "${ENABLE_LX}" -eq 1 ] && LX_FLAG="true"
-
-# --- 写 .env（防覆盖：安全增量合并，脱敏：不打印 key） ---
+# --- 写 .env（防覆盖：安全增量合并，脱敏：不打印 token） ---
+# desired 键集与 .env.example 对齐；敏感值（PushPlus token）沿用 dotenv_escape 单引号转义。
 ENV_PATH="${BASE_DIR}/.env"
 umask 077
 ENV_DESIRED="$(mktemp)"
@@ -534,38 +411,46 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_FAV_DIR='$(dotenv_escape "${BASE_DIR}/online_favorites")'"
     echo "FNMUSIC_PLAY_HISTORY_DIR='$(dotenv_escape "${BASE_DIR}/play_history")'"
     echo "FNMUSIC_RECOMMEND_DIR='$(dotenv_escape "${BASE_DIR}/recommend_cache")'"
-    echo "FNMUSIC_MUSICDL_ENABLED='${MUSICDL_FLAG}'"
-    echo "FNMUSIC_NETEASE_ENABLED='${MUSICBOX_FLAG}'"
-    echo "FNMUSIC_MUSICDL_URL='http://127.0.0.1:8768'"
-    echo "FNMUSIC_MUSICBOX_URL='http://127.0.0.1:8770'"
-    echo "FNMUSIC_ONLINE_SOURCES='MiguMusicClient,KuwoMusicClient'"
-    echo "FNMUSIC_LX_ENABLED='${LX_FLAG}'"
-    echo "FNMUSIC_LX_URL='http://127.0.0.1:8772'"
-    echo "FNMUSIC_DEPLOY_MODE='${MODE}'"
+    # --- 网易云单源（v2.0 唯一在线音源，恒为启用） ---
+    echo "FNMUSIC_NETEASE_ENABLED='true'"
+    echo "FNMUSIC_MUSICBOX_URL='$(dotenv_escape "${MUSICBOX_URL}")'"
+    echo "FNMUSIC_NETEASE_QUALITY='$(dotenv_escape "${NETEASE_QUALITY}")'"
+    echo "FNMUSIC_NETEASE_SEARCH_LIMIT='${NETEASE_SEARCH_LIMIT}'"
+    echo "FNMUSIC_ONLINE_LIMIT='${ONLINE_LIMIT}'"
+    echo "FNMUSIC_NETEASE_WAIT_S='${NETEASE_WAIT_S}'"
+    echo "FNMUSIC_LATE_PAGE_WAIT_S='${LATE_PAGE_WAIT_S}'"
+    echo "FNMUSIC_SEARCH_TIMEOUT='${SEARCH_TIMEOUT}'"
+    echo "FNMUSIC_SEARCH_CACHE_TTL='${SEARCH_CACHE_TTL}'"
+    # --- 登录态与降级 ---
+    echo "FNMUSIC_FREE_ONLY_ON_LOGOUT='${FREE_ONLY_VAL}'"
+    echo "FNMUSIC_LOGIN_STATE_TTL='${LOGIN_STATE_TTL}'"
+    echo "FNMUSIC_LOGIN_CHECK_INTERVAL='${LOGIN_CHECK_INTERVAL}'"
+    echo "FNMUSIC_VIP_WARN_DAYS='${VIP_WARN_DAYS}'"
+    # --- 网易云官方「每日推荐」歌单（需登录） ---
+    echo "FNMUSIC_DAILY_ENABLED='${DAILY_VAL}'"
+    echo "FNMUSIC_DAILY_LIMIT='${DAILY_LIMIT}'"
+    # --- PushPlus 推送提醒（token 单引号转义，绝不打印到日志） ---
+    echo "FNMUSIC_PUSHPLUS_ENABLED='${PUSHPLUS_ENABLED_VAL}'"
+    echo "FNMUSIC_PUSHPLUS_TOKEN='$(dotenv_escape "${PUSHPLUS_TOKEN}")'"
+    echo "FNMUSIC_PUSHPLUS_TOPIC='$(dotenv_escape "${PUSHPLUS_TOPIC}")'"
+    echo "FNMUSIC_PUSHPLUS_TEMPLATE='$(dotenv_escape "${PUSHPLUS_TEMPLATE}")'"
+    echo "FNMUSIC_PUSHPLUS_URL='$(dotenv_escape "${PUSHPLUS_URL}")'"
+    # --- 运行形态（BASE_IMAGE 留空，由 ensure_base_image.sh 探测后写入） ---
+    echo "FNMUSIC_MODE='${MODE}'"
+    echo "FNMUSIC_BASE_IMAGE='$(dotenv_escape "${BASE_IMAGE}")'"
     echo "FNMUSIC_PIP_INDEX='$(dotenv_escape "${PIP_INDEX}")'"
-    if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
-        echo "FNMUSIC_LLM_BASE_URL='$(dotenv_escape "${LLM_BASE_URL}")'"
-        echo "FNMUSIC_LLM_API_KEY='$(dotenv_escape "${LLM_API_KEY}")'"
-        echo "FNMUSIC_LLM_MODEL='$(dotenv_escape "${LLM_MODEL}")'"
-    else
-        echo "FNMUSIC_LLM_BASE_URL=''"
-        echo "FNMUSIC_LLM_API_KEY=''"
-        echo "FNMUSIC_LLM_MODEL=''"
-    fi
+    echo "FNMUSIC_DOCKER_MIRRORS='$(dotenv_escape "${DOCKER_IMAGE_MIRRORS}")'"
     echo "FNMUSIC_VERSION='${FNMUSIC_VERSION}'"
 } > "${ENV_DESIRED}"
 
-# 用户本次明确提供了新值的键（音源开关/版本/部署模式为安装时部署选项，始终采用新值）
-ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE"
-[ "${ENABLE_LX}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LX_URL"
-if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
-    [ -n "${LLM_BASE_URL}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_BASE_URL"
-    [ -n "${LLM_API_KEY}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_API_KEY"
-    [ -n "${LLM_MODEL}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_MODEL"
-else
-    # 关闭推荐时必须显式覆盖，否则 env_merge 会保留旧 Key
-    ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_BASE_URL,FNMUSIC_LLM_API_KEY,FNMUSIC_LLM_MODEL"
-fi
+# 用户本次明确提供了新值的键（版本/单源开关/运行模式为安装部署选项，始终采用新值）
+ENV_EXPLICIT="FNMUSIC_VERSION,FNMUSIC_NETEASE_ENABLED,FNMUSIC_MODE"
+[ "${FREE_ONLY_FROM_CLI}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_FREE_ONLY_ON_LOGOUT"
+[ "${DAILY_FROM_CLI}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_DAILY_ENABLED"
+# PushPlus：仅当本次确实拿到值（交互/命令行/环境变量）才显式写入，避免升级时覆盖/清空既有 token
+[ -n "${PUSHPLUS_ENABLED}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_PUSHPLUS_ENABLED"
+[ -n "${PUSHPLUS_TOKEN}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_PUSHPLUS_TOKEN"
+[ -n "${PUSHPLUS_TOPIC}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_PUSHPLUS_TOPIC"
 
 if [ -f "${ENV_PATH}" ]; then
     PREV_VERSION="$(grep -E "^\s*(export\s+)?FNMUSIC_VERSION=" "${ENV_PATH}" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'[:space:]" || true)"
@@ -574,10 +459,10 @@ if [ -f "${ENV_PATH}" ]; then
     cp -p "${ENV_PATH}" "${ENV_BACKUP}"
     if [ -n "${PREV_VERSION}" ] && [ "${PREV_VERSION}" = "${FNMUSIC_VERSION}" ]; then
         log_warn "检测到同版本 (v${FNMUSIC_VERSION}) 重复安装：现有配置将被保护，"
-        log_warn "仅补齐缺失配置项；密钥/自定义路径/ONLINE_SOURCES 等沿用已有值（备份: ${ENV_BACKUP}）。"
+        log_warn "仅补齐缺失配置项；token/自定义路径/网易云参数等沿用已有值（备份: ${ENV_BACKUP}）。"
     else
         log_info "检测到已有配置（v${PREV_VERSION:-未知} -> v${FNMUSIC_VERSION}）平滑升级："
-        log_info "保留用户自定义配置与密钥，仅安全补齐新增/缺失配置项（备份: ${ENV_BACKUP}）。"
+        log_info "保留用户自定义配置与 token，仅安全补齐新增/缺失配置项（备份: ${ENV_BACKUP}）。"
     fi
     MERGE_SUMMARY="$(python3 "${BASE_DIR}/proxy/env_merge.py" \
         --existing "${ENV_PATH}" --desired "${ENV_DESIRED}" \
@@ -594,7 +479,7 @@ else
     python3 "${BASE_DIR}/proxy/env_merge.py" \
         --existing /dev/null --desired "${ENV_DESIRED}" \
         --output "${ENV_PATH}" --explicit "${ENV_EXPLICIT}" --quiet
-    log_info "已生成初始配置 ${ENV_PATH} (chmod 600)。API Key 不会出现在日志中。"
+    log_info "已生成初始配置 ${ENV_PATH} (chmod 600)。PushPlus token 不会出现在日志中。"
 fi
 rm -f "${ENV_DESIRED}"
 chmod 600 "${ENV_PATH}"
@@ -626,62 +511,7 @@ install_unit() {
     return 0
 }
 
-# --- musicdl ---
-install_musicdl_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
-        log_err "未找到 docker，无法使用 docker 模式。请安装 Docker 或改用 --mode host"
-        return 1
-    fi
-    log_info "构建并启动 musicdl 容器（基于 ${MUSICDL_REPO}）..."
-    reclaim_container fnmusic-musicdl || return 1
-    run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build musicdl
-    if wait_http "http://127.0.0.1:8768/healthz" 60 2; then
-        log_info "musicdl 已就绪 http://127.0.0.1:8768/healthz"
-        return 0
-    fi
-    log_err "等待 musicdl healthz 超时"
-    return 1
-}
-
-install_musicdl_host() {
-    log_info "宿主机安装 musicdl 服务（pip 包来自 ${MUSICDL_REPO}）..."
-    if [ ! -x "${BASE_DIR}/.venv-musicdl/bin/python" ]; then
-        python3 -m venv "${BASE_DIR}/.venv-musicdl"
-    fi
-    "${BASE_DIR}/.venv-musicdl/bin/pip" install -q -U pip -i "${PIP_INDEX}"
-    "${BASE_DIR}/.venv-musicdl/bin/pip" install -q -r "${BASE_DIR}/musicdl-service/requirements.txt" -i "${PIP_INDEX}"
-    local unit
-    unit="$(mktemp)"
-    cat > "${unit}" <<EOF
-[Unit]
-Description=fnmusic-ext musicdl source (${MUSICDL_REPO})
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=${BASE_DIR}/musicdl-service
-Environment=PYTHONUNBUFFERED=1
-Environment=MUSICDL_SOURCES=KuwoMusicClient,MiguMusicClient
-Environment=MUSICDL_WORK_DIR=/tmp/musicdl_outputs
-ExecStart=${BASE_DIR}/.venv-musicdl/bin/uvicorn app:app --host 127.0.0.1 --port 8768
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    if ! install_unit "${unit}" /etc/systemd/system/fnmusic-musicdl.service; then
-        return 0
-    fi
-    if wait_http "http://127.0.0.1:8768/healthz" 30 1; then
-        log_info "宿主机 musicdl 已就绪"
-        return 0
-    fi
-    log_warn "musicdl systemd 已启动，但 healthz 尚未就绪，请检查 journalctl -u fnmusic-musicdl"
-}
-
-# --- musicbox ---
+# --- musicbox（v2.0 唯一在线音源：网易云） ---
 install_musicbox_docker() {
     if ! command -v docker >/dev/null 2>&1; then
         log_err "未找到 docker，无法使用 docker 模式。请安装 Docker 或改用 --mode host"
@@ -728,6 +558,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=XDG_DATA_HOME=${BASE_DIR}/musicbox-data
 Environment=XDG_CACHE_HOME=${BASE_DIR}/musicbox-data/cache
 Environment=XDG_CONFIG_HOME=${BASE_DIR}/musicbox-data/config
+Environment=FNMUSIC_FREE_ONLY_ON_LOGOUT=${FREE_ONLY_VAL:-true}
 ExecStart=${BASE_DIR}/.venv-musicbox/bin/uvicorn app:app --host 0.0.0.0 --port 8770
 Restart=always
 RestartSec=5
@@ -745,86 +576,30 @@ EOF
     log_warn "musicbox systemd 已启动，但 healthz 尚未就绪，请检查 journalctl -u fnmusic-musicbox"
 }
 
-# --- lxmusic（洛雪音乐源） ---
-install_lxmusic_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
-        log_err "未找到 docker，无法使用 docker 模式。请安装 Docker 或改用 --mode host"
-        return 1
-    fi
-    log_info "构建并启动 lxmusic 容器（洛雪音乐源：酷狗 kg / 网易 wy / 咪咕 mg 免登录解析）..."
-    reclaim_container fnmusic-lxmusic || return 1
-    run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build lxmusic
-    if wait_http "http://127.0.0.1:8772/healthz" 60 2; then
-        log_info "lxmusic 已就绪 http://127.0.0.1:8772/healthz"
-        return 0
-    fi
-    log_err "等待 lxmusic healthz 超时"
-    return 1
-}
-
-install_lxmusic_host() {
-    log_info "宿主机安装 lxmusic 服务（洛雪音乐源）..."
-    if [ ! -x "${BASE_DIR}/.venv-lxmusic/bin/python" ]; then
-        python3 -m venv "${BASE_DIR}/.venv-lxmusic"
-    fi
-    "${BASE_DIR}/.venv-lxmusic/bin/pip" install -q -U pip -i "${PIP_INDEX}"
-    "${BASE_DIR}/.venv-lxmusic/bin/pip" install -q -r "${BASE_DIR}/lxmusic-service/requirements.txt" -i "${PIP_INDEX}"
-    local unit
-    unit="$(mktemp)"
-    cat > "${unit}" <<EOF
-[Unit]
-Description=fnmusic-ext lxmusic source (LX Music style: kg/wy/mg)
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=${BASE_DIR}/lxmusic-service
-Environment=PYTHONUNBUFFERED=1
-Environment=LX_SOURCES=kg,wy,mg
-ExecStart=${BASE_DIR}/.venv-lxmusic/bin/uvicorn app:app --host 127.0.0.1 --port 8772
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    if ! install_unit "${unit}" /etc/systemd/system/fnmusic-lxmusic.service; then
-        return 0
-    fi
-    if wait_http "http://127.0.0.1:8772/healthz" 30 1; then
-        log_info "宿主机 lxmusic 已就绪"
-        return 0
-    fi
-    log_warn "lxmusic systemd 已启动，但 healthz 尚未就绪，请检查 journalctl -u fnmusic-lxmusic"
-}
-
 clear_opposite_mode() {
-    # 交叉模式切换时清理对侧，避免端口占用冲突
+    # musicbox 部署形态切换时清理对侧，避免 8770 端口被 docker 与 host 同时占用
     if [ "${MODE}" = "docker" ]; then
-        log_info "Docker 模式：停用宿主机音源 systemd unit（若存在）..."
-        for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
-            sudo systemctl disable --now "${unit}.service" 2>/dev/null || true
-        done
+        log_info "Docker 模式：停用宿主机 musicbox systemd unit（若存在）..."
+        sudo systemctl disable --now fnmusic-musicbox.service 2>/dev/null || true
     else
-        log_info "Host 模式：停止 Docker 音源容器（若存在）..."
-        run_docker rm -f fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic 2>/dev/null || true
+        log_info "Host 模式：停止 Docker musicbox 容器（若存在）..."
+        run_docker rm -f fnmusic-musicbox 2>/dev/null || true
     fi
 }
 
-stop_unselected() {
-    if [ "${ENABLE_MUSICDL}" -eq 0 ]; then
-        run_docker rm -f fnmusic-musicdl 2>/dev/null || true
-        sudo systemctl disable --now fnmusic-musicdl.service 2>/dev/null || true
-    fi
-    if [ "${ENABLE_MUSICBOX}" -eq 0 ]; then
-        run_docker rm -f fnmusic-musicbox 2>/dev/null || true
-        sudo systemctl disable --now fnmusic-musicbox.service 2>/dev/null || true
-    fi
-    if [ "${ENABLE_LX}" -eq 0 ]; then
-        run_docker rm -f fnmusic-lxmusic 2>/dev/null || true
-        sudo systemctl disable --now fnmusic-lxmusic.service 2>/dev/null || true
-    fi
+cleanup_legacy_sources() {
+    # v2.0 单源化：无条件清理 v1.x 多音源（musicdl / lxmusic）遗留的容器与 systemd unit，
+    # 让从旧版升级上来的用户不残留占用 8768/8772 端口的僵尸服务与开机自启项。
+    log_info "清理 v1.x 历史音源残留（musicdl / lxmusic 容器与 systemd unit）..."
+    run_docker rm -f fnmusic-musicdl fnmusic-lxmusic 2>/dev/null || true
+    sudo systemctl disable --now fnmusic-musicdl.service fnmusic-lxmusic.service 2>/dev/null || true
+    local unit
+    for unit in fnmusic-musicdl fnmusic-lxmusic; do
+        if [ -f "/etc/systemd/system/${unit}.service" ]; then
+            sudo rm -f "/etc/systemd/system/${unit}.service" 2>/dev/null || true
+        fi
+    done
+    sudo systemctl daemon-reload 2>/dev/null || true
 }
 
 # Docker 模式：先探测可用基础镜像源（国内镜像优先直连、官方源兜底），
@@ -837,29 +612,23 @@ if [ "${MODE}" = "docker" ]; then
     fi
 fi
 
+cleanup_legacy_sources
 clear_opposite_mode
 if [ "${MODE}" = "docker" ]; then
-    [ "${ENABLE_MUSICDL}" -eq 1 ] && install_musicdl_docker
-    [ "${ENABLE_MUSICBOX}" -eq 1 ] && install_musicbox_docker
-    [ "${ENABLE_LX}" -eq 1 ] && install_lxmusic_docker
+    install_musicbox_docker
 else
-    [ "${ENABLE_MUSICDL}" -eq 1 ] && install_musicdl_host
-    [ "${ENABLE_MUSICBOX}" -eq 1 ] && install_musicbox_host
-    [ "${ENABLE_LX}" -eq 1 ] && install_lxmusic_host
+    install_musicbox_host
 fi
-stop_unselected
 
 python3 -m py_compile "${BASE_DIR}/proxy/app.py" "${BASE_DIR}/proxy/recommend.py"
 bash -n "${BASE_DIR}/extend.sh" "${BASE_DIR}/restore.sh" "${BASE_DIR}/proxy/run_proxy.sh" "${BASE_DIR}/netease_login.sh" "${BASE_DIR}/ensure_base_image.sh"
 
 log_info "============================================================"
 log_info "🎉 fnmusic-ext v${FNMUSIC_VERSION} 安装配置完成！"
-log_info "已启用音源（安装模式: ${MODE}）:${SELECTED}"
+log_info "在线音源（安装模式: ${MODE}）：musicbox — 网易云 [8770]（单一音源）"
 log_info "------------------------------------------------------------"
 log_info "【音源服务状态】"
-[ "${ENABLE_MUSICBOX}" -eq 1 ] && log_info "  • musicbox  [8770] 网易云音源     http://127.0.0.1:8770/healthz"
-[ "${ENABLE_MUSICDL}" -eq 1 ] && log_info "  • musicdl   [8768] 聚合音源      http://127.0.0.1:8768/healthz"
-[ "${ENABLE_LX}" -eq 1 ] && log_info "  • lxmusic   [8772] 洛雪音乐源    http://127.0.0.1:8772/healthz"
+log_info "  • musicbox  [8770] 网易云音源     ${MUSICBOX_URL}/healthz"
 log_info "------------------------------------------------------------"
 log_info "【后续验证与使用指引】"
 if [ "${RUN_EXTEND}" -eq 1 ]; then
@@ -872,26 +641,29 @@ fi
 log_info "2. 验证搜索与试听："
 log_info "   打开飞牛音乐 Web 端或手机 App，在搜索框中搜索歌曲（例如“晴天”或“周杰伦”），"
 log_info "   点击在线源歌曲试听，确认可以流畅播放并显示歌词与封面。"
-if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
-    log_info "3. 网易云扫码登录（可选）："
-    log_info "   部分网易云 VIP/无损歌曲需要账号凭证："
-    log_info "   • 命令行扫码登录（推荐）: ./install.sh --qr 或 ./netease_login.sh"
-    log_info "     （自动展示二维码、轮询登录状态、过期自动刷新，支持随时 Ctrl+C 跳过）"
-    log_info "   • 局域网浏览器图片（备选）: http://<NAS_IP>:8770/api/v1/auth/login/qr.png"
-    log_info "   • 检查登录状态: curl -s http://127.0.0.1:8770/api/v1/auth/status"
+log_info "3. 网易云扫码登录（强烈推荐）："
+log_info "   v2.0 起所有在线曲目都来自扫码登录的私人网易云账号权益；未登录时仅提供免费曲目降级播放。"
+log_info "   • 命令行扫码登录（推荐）: ./install.sh --qr 或 ./netease_login.sh"
+log_info "     （自动展示二维码、轮询登录状态、过期自动刷新，支持随时 Ctrl+C 跳过）"
+log_info "   • 局域网浏览器图片（备选）: http://<NAS_IP>:8770/api/v1/auth/login/qr.png"
+log_info "   • 检查登录与 VIP 状态: curl -s ${MUSICBOX_URL}/api/v1/auth/detail"
+if [ "${DAILY_VAL}" = "true" ]; then
+    log_info "4. 每日推荐（网易云官方日推）："
+    log_info "   登录网易云后，飞牛音乐左侧歌单列表顶部会自动出现官方「每日推荐」（不再依赖 LLM）。"
 fi
-if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
-    log_info "4. 大模型每日推荐："
-    log_info "   已成功配置大模型！登录飞牛音乐后，左侧歌单列表顶部会自动出现「每日推荐」。"
+if [ "${PUSHPLUS_ENABLED_VAL}" = "true" ] && [ -n "${PUSHPLUS_TOKEN}" ]; then
+    log_info "5. PushPlus 推送提醒：已启用 — 网易云登录态失效 / VIP 临期将推送到微信。"
+else
+    log_info "5. PushPlus 推送提醒：未启用。可在 .env 配置 FNMUSIC_PUSHPLUS_TOKEN 获取登录/VIP 临期微信提醒。"
 fi
-log_info "5. 状态探测与一键还原："
+log_info "6. 状态探测与一键还原："
 log_info "   • 探测健康状态: curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz"
 log_info "   • 随时一键还原: ./restore.sh (立即恢复官方出厂直连状态)"
 log_info "============================================================"
 
-if [ "${NON_INTERACTIVE}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
+if [ "${NON_INTERACTIVE}" -eq 0 ]; then
     log_info ""
-    log_info "==> 检测到已启用网易云音源 (musicbox)，即将进入扫码登录流程..."
+    log_info "==> 网易云是唯一在线音源，即将进入扫码登录流程（支持随时 Ctrl+C 跳过）..."
     bash "${BASE_DIR}/netease_login.sh" || true
 fi
 

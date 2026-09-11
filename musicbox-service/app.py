@@ -9,7 +9,12 @@ from fastapi import FastAPI, HTTPException, Path, Query, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from netease_ext import batch_song_details, filter_playable_song_ids, song_lyric_pair
+from netease_ext import (
+    auth_detail as ne_auth_detail,
+    batch_song_details,
+    filter_playable_song_ids,
+    song_lyric_pair,
+)
 import runner
 from runner import MusicboxTimeoutError, ensure_xdg_dirs
 
@@ -17,6 +22,9 @@ ensure_xdg_dirs()
 
 SEARCH_TYPES = {"song", "album", "artist", "playlist"}
 QUALITY_WHITELIST = {"exhigh", "higher", "standard", "lossless", "hires", "jymaster"}
+
+# musicbox CLI 退出码（NEMbox/cli.py）：3 表示未登录
+CLI_EXIT_NOT_LOGGED_IN = 3
 
 
 class UpstreamException(Exception):
@@ -63,6 +71,13 @@ def _extract_payload(payload: Any) -> Any:
     if isinstance(payload, dict) and payload.get("ok") is True and "data" in payload:
         return payload["data"]
     return payload
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _parse_ids(ids_str: str | None) -> list[int]:
@@ -168,6 +183,81 @@ def playlist(playlist_id: int = Path(..., ge=1)):
 @app.get("/api/v1/auth/status")
 def auth_status():
     return exec_musicbox(["auth", "status", "--json"])
+
+
+@app.get("/api/v1/auth/detail")
+def auth_detail_endpoint():
+    """登录态详情（含 VIP 类型与到期时间），供代理层做降级门控与 PushPlus 提醒。
+
+    走 NEMbox 已缓存的账号信息，不额外请求网易云；任何异常都降级为"未登录"，
+    绝不让探测失败拖垮音源服务。
+    """
+    try:
+        detail = ne_auth_detail()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": True, "data": {"logged_in": False, "error": str(exc)[:200]}}
+    return {"ok": True, "data": detail}
+
+
+@app.get("/api/v1/recommend/daily")
+def recommend_daily(limit: int = Query(20, ge=1, le=100)):
+    """网易云官方「每日推荐」歌曲（需登录扫码的私人账号）。
+
+    直接复用 musicbox CLI 的 `recommend songs` 子命令，它内部走
+    /weapi/v3/discovery/recommend/songs 并把结果归一化成与 /api/v1/search
+    完全一致的 song_info 结构（song_id / song_name / artist / album_name /
+    mp3_url / duration / quality），因此代理层无需额外字段映射。
+
+    返回：
+      - 未登录 → HTTP 200 + {"ok": false, "error": "not_logged_in"}
+      - 成功   → HTTP 200 + {"ok": true, "data": [ ...song_info... ]}
+    """
+    try:
+        code, stdout, stderr = runner.run_musicbox(
+            ["recommend", "songs", "--limit", str(limit), "--json"], timeout=40.0
+        )
+    except MusicboxTimeoutError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            content={"ok": False, "error": "timeout", "detail": str(exc)[:200]},
+        )
+
+    # musicbox CLI 退出码约定：3 = 未登录（EXIT_NOT_LOGGED_IN）
+    if code == CLI_EXIT_NOT_LOGGED_IN:
+        return {"ok": False, "error": "not_logged_in", "data": []}
+    if code != 0:
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={"ok": False, "error": "upstream_error", "exit_code": code,
+                     "detail": (stderr or stdout or "")[:500]},
+        )
+    try:
+        payload = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={"ok": False, "error": "bad_upstream_json", "detail": str(exc)[:200]},
+        )
+
+    data = _extract_payload(payload)
+    songs = [s for s in data if isinstance(s, dict)] if isinstance(data, list) else []
+    # 每日推荐里可能混入当前账号无权播放的曲目，按真实直链再过一遍
+    ids: list[int] = []
+    for s in songs:
+        try:
+            sid = int(s.get("song_id") or s.get("id") or 0)
+        except (TypeError, ValueError):
+            sid = 0
+        if sid:
+            ids.append(sid)
+    if ids:
+        playable = filter_playable_song_ids(ids)
+        songs = [
+            s
+            for s in songs
+            if _safe_int(s.get("song_id") or s.get("id")) in playable
+        ]
+    return {"ok": True, "data": songs[:limit]}
 
 
 @app.post("/api/v1/auth/login")

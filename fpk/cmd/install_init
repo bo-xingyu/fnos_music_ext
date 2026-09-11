@@ -1,0 +1,85 @@
+#!/bin/bash
+# install_init —— 安装文件落地【之前】执行：环境预检
+#
+# 只做检查与告警，不产生任何副作用。真正的准备工作放在 install_callback。
+# 这里刻意【不】因为缺依赖就硬失败：把决定权交给 install_callback，
+# 以便应用中心能给出更具体的失败位置，而不是笼统的"安装前脚本失败"。
+#
+# 官方约定：生命周期脚本应尽量幂等；失败前把用户可见错误写入 $TRIM_TEMP_LOGFILE。
+set -uo pipefail
+
+export PATH="/var/apps/python312/target/bin:${PATH}"
+
+APP_NAME="fnmusicext"
+APPDEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
+PKGVAR="${TRIM_PKGVAR:-/vol1/@appvar/${APP_NAME}}"
+RUN_DIR="${PKGVAR}/app"
+
+# 卸载回调阶段 APPDEST 可能已被移除，回落到 stage 过的一份副本
+BIN="${APPDEST}/bin"
+if [ ! -f "${BIN}/fnmusic-lib.sh" ]; then
+    BIN="${RUN_DIR}/bin"
+fi
+
+fail() {
+    local msg="$1"
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "${msg}" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    fi
+    echo "[fnmusic-ext] ${msg}" >&2
+}
+
+need() {
+    local script="$1"
+    if [ ! -f "${BIN}/${script}" ]; then
+        fail "找不到 ${BIN}/${script}，无法完成本步骤。请重新安装本应用。"
+        return 1
+    fi
+    return 0
+}
+
+lib_log_file="${PKGVAR}/logs/install.log"
+mkdir -p "$(dirname "${lib_log_file}")" 2>/dev/null
+log() { echo "$(date '+%F %T') [install_init] $*" >> "${lib_log_file}" 2>/dev/null; }
+
+log "=== install_init 开始 (fnOS ${TRIM_SYS_VERSION:-unknown}, arch ${TRIM_SYS_ARCH:-unknown}) ==="
+
+# 1. 官方音乐应用是否就位（本扩展的全部意义都建立在接管它的 socket 之上）
+TARGET_SOCK="/var/run/trim_music.socket"
+UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
+if [ -S "${TARGET_SOCK}" ] || [ -S "${UPSTREAM_SOCK}" ]; then
+    log "检测到飞牛音乐套接字，可以继续安装"
+elif [ -d "/usr/local/apps/@appdata/trim.music" ]; then
+    log "检测到飞牛音乐已安装但套接字不存在（应用可能未启动）"
+    fail "警告：飞牛音乐似乎未在运行。安装完成后请先在应用中心启动「飞牛音乐」，再启动本应用，否则无法接管在线音源。"
+else
+    fail "未检测到飞牛音乐（trim.music）。本扩展依赖官方飞牛音乐应用：请先在应用中心安装并启动「飞牛音乐」，再回来安装本应用。"
+    log "缺少 trim.music，安装仍可继续但应用无法工作"
+fi
+
+# 2. Python 运行时（manifest 已声明 install_dep_apps=python312，此处复核）
+if [ -x "/var/apps/python312/target/bin/python3" ]; then
+    log "python312 运行时可用: $(/var/apps/python312/target/bin/python3 -V 2>&1)"
+elif command -v python3 >/dev/null 2>&1; then
+    log "未找到 python312 运行时包，但系统存在 python3: $(python3 -V 2>&1)"
+else
+    fail "未找到可用的 Python 3 运行时。请确认应用中心已安装 python312 运行时包后重试。"
+    log "无 Python 运行时"
+fi
+
+# 3. 必备命令
+for c in curl bash; do
+    if ! command -v "${c}" >/dev/null 2>&1; then
+        fail "缺少必备命令 ${c}。"
+    fi
+done
+command -v jq >/dev/null 2>&1 || log "提示：未安装 jq，终端扫码登录脚本(netease_login.sh)与登录状态提示将降级不可用，其余功能不受影响"
+
+# 4. 运行身份确认（socket 接管必须 root）
+log "run-as user: ${TRIM_RUN_USERNAME:-?} (uid=$(id -u))"
+if [ "$(id -u)" != "0" ]; then
+    fail "本应用需要以 root 身份运行生命周期脚本才能接管 /var/run/trim_music.socket。当前非 root，接管将会失败。"
+fi
+
+log "=== install_init 结束（仅预检，未修改系统） ==="
+exit 0
