@@ -231,8 +231,20 @@ def _warm_cli_probe_in_background() -> None:
     进程内**幂等**：只起一个预热线程。否则每次 startup 都拉起一个跑
     ``musicbox --version`` 的后台线程，既浪费 CPU/IO（CLI 稳态也要 1.4s），
     又会在测试里每个 TestClient 都 spawn 一次子进程。
+
+    可用 ``FNMUSIC_CLI_WARMUP=off`` 关闭。这不是只给测试用的后门，而是必要的
+    隔离手段：预热线程会调 ``run_musicbox`` → ``resolve_musicbox_cmd``，而解析过程
+    读的是 ``sys.executable`` / ``sys.prefix`` 这类**全局**状态。测试里
+    ``monkeypatch.setattr(mb_runner.sys, "executable", ...)`` 改的正是同一个全局，
+    两者并发时线程会在被打桩过的状态上解析并把结果写进进程级的 ``_CMD_CACHE``，
+    于是别的用例拿到一个"找不到 CLI"的缓存 —— 表现为偶发失败、单跑又完全正常，
+    是那种最难查的竞态（本次就是靠它把 127 归因清楚的）。
     """
     global _CLI_WARMUP_STARTED
+    if str(os.environ.get("FNMUSIC_CLI_WARMUP", "true")).strip().lower() \
+            in ("0", "false", "no", "off"):
+        logger.info("CLI 预热已按 FNMUSIC_CLI_WARMUP=off 关闭")
+        return
     with _CLI_PROBE_LOCK:
         if _CLI_WARMUP_STARTED:
             return

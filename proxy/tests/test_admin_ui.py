@@ -1,4 +1,5 @@
 """管理页面（proxy/admin_ui.py）测试：鉴权、配置读写与安全边界。"""
+import json
 import os
 import re
 import sys
@@ -1139,3 +1140,87 @@ def test_admin_ui_calls_cache_invalidate_path():
     fn = src[src.index("async def _invalidate_proxy_cache"):]
     fn = fn[:fn.index("\nasync def")] if "\nasync def" in fn else fn
     assert '"/_ext/cache/invalidate"' in fn
+
+
+# ===========================================================================
+# 归档目录校验（真机报的 bug）
+#
+# 用户在管理页填「收藏归档目录」保存，得到：
+#     失败：download_dir: 取值非法（attempted relative import with no known parent package）
+# 原因是 _as_path 里写了**函数级相对导入** `from . import download`。管理页在生产上以
+# `uvicorn --app-dir proxy` 启动，此时 admin_ui 是顶层模块、没有父包，相对导入必抛
+# ImportError；外层 `except Exception` 又把它包成「取值非法」——明明是程序错误，
+# 却显示成用户输入不合法，用户改一万遍路径也过不去。
+# ===========================================================================
+
+
+def test_as_path_accepts_real_writable_dir(tmp_path):
+    d = tmp_path / "归档"
+    d.mkdir()
+    assert admin_ui._as_path(str(d)) == str(d)
+
+
+def test_as_path_empty_means_disabled():
+    assert admin_ui._as_path("") == "", "留空应表示关闭自动归档，而不是校验失败"
+    assert admin_ui._as_path(None) == ""
+    assert admin_ui._as_path("   ") == ""
+
+
+@pytest.mark.parametrize("bad", ["/etc", "/var", "/", "/root", "relative/path"])
+def test_as_path_rejects_system_and_relative(bad):
+    with pytest.raises(ValueError) as ei:
+        admin_ui._as_path(bad)
+    msg = str(ei.value)
+    assert "取值非法" not in msg
+    assert bad.replace("/", "") in msg or "绝对路径" in msg, f"错误信息要说清是哪条规则：{msg}"
+
+
+def test_as_path_missing_dir_is_rejected(tmp_path):
+    with pytest.raises(ValueError) as ei:
+        admin_ui._as_path(str(tmp_path / "not-created"))
+    assert "不存在" in str(ei.value)
+
+
+def test_as_path_internal_error_is_not_blamed_on_user(monkeypatch):
+    """我们自己的程序错误必须如实标注，不能伪装成「取值非法」。
+
+    这正是本次 bug 的本质：ImportError 被外层包成"取值非法"，用户被指向了错误方向。
+    """
+    def boom(path):
+        raise RuntimeError("internal explosion")
+
+    monkeypatch.setattr(admin_ui.download, "validate_dir", boom)
+    with pytest.raises(ValueError) as ei:
+        admin_ui._as_path("/tmp/some-dir")
+    msg = str(ei.value)
+    assert "内部校验出错" in msg and "非路径问题" in msg
+    assert "internal explosion" in msg, "原始异常要带上，便于排查"
+
+
+def test_admin_ui_importable_as_top_level_module(tmp_path):
+    """核心回归：以 `--app-dir proxy` 的方式（顶层模块）导入并执行校验。
+
+    这是生产上的真实启动方式，也是这个 bug 只在真机上出现、在按包导入的测试里
+    完全不暴露的原因。必须用**全新解释器**验证，排除本进程已按包导入过的干扰。
+    """
+    import subprocess
+
+    d = tmp_path / "归档目录"
+    d.mkdir()
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(admin_ui.__file__).resolve().parent)
+    code = (
+        "import admin_ui, json;"
+        "print(json.dumps({"
+        "'pkg': admin_ui.download.__name__,"
+        "'ok': admin_ui._as_path(%r),"
+        "'empty': admin_ui._as_path('')}))" % str(d)
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=90, env=env)
+    assert proc.returncode == 0, (
+        "顶层模块方式导入/校验失败：\n" + proc.stderr.decode("utf-8", "replace")[-600:]
+    )
+    out = json.loads(proc.stdout.decode("utf-8", "replace").strip().splitlines()[-1])
+    assert out["pkg"] == "download", "顶层模式下应拿到平铺导入的 download 模块"
+    assert out["ok"] == str(d)
+    assert out["empty"] == ""

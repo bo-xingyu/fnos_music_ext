@@ -32,6 +32,13 @@ def _reset_singleton_state():
         _reset_online_info_caches()
 
 
+# 关掉 CLI 后台预热。原因见 app._warm_cli_probe_in_background 的 docstring：
+# 预热线程解析 CLI 时读的是 sys.executable / sys.prefix 这类**全局**状态，而测试里
+# monkeypatch 改的正是同一个全局；线程与用例并发会把结果写进进程级 _CMD_CACHE，
+# 让别的用例拿到"找不到 CLI"的缓存 —— 偶发 127、单跑却正常。
+os.environ.setdefault("FNMUSIC_CLI_WARMUP", "off")
+
+
 def _reset_online_info_caches():
     """清空在线元数据/封面缓存。
 

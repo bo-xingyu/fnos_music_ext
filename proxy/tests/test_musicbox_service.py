@@ -929,12 +929,20 @@ def _stub_level_encoder_when_nembox_missing():
 
 @pytest.fixture(autouse=True)
 def _reset_cli_probe_cache():
-    """_CLI_PROBE 是进程级缓存，用例之间必须清空，否则串味且结果不确定。"""
+    """_CLI_PROBE 与 runner._CMD_CACHE 都是进程级缓存，用例之间必须清空。
+
+    ``_CMD_CACHE`` 尤其要紧：``test_run_musicbox_actually_executes_resolved_cli`` 会
+    **真的执行**解析出来的那条命令。若前一个用例留下了缓存（例如把 executable 或
+    前缀打桩成了假路径），这个用例就会去执行错的命令 —— 表现为偶发失败、单跑又正常，
+    是那种最难查的 flake。
+    """
     mb_app.reset_cli_probe_for_test()
+    mb_runner.reset_cmd_cache()
     try:
         yield
     finally:
         mb_app.reset_cli_probe_for_test()
+        mb_runner.reset_cmd_cache()
 
 
 # 下面这些用例要跑真实的 NEMbox 构造流程（cookie_jar.load / Storage / deviceId），
@@ -1525,6 +1533,7 @@ def test_selftest_stays_fast_when_cli_is_cold(monkeypatch):
 
 
 def test_startup_warms_cli_probe_in_background(monkeypatch):
+    monkeypatch.setenv("FNMUSIC_CLI_WARMUP", "true")   # conftest 默认关，这里要验的正是预热本身
     """启动预热必须在后台线程里跑，绝不能阻塞服务就绪。"""
     started = []
     monkeypatch.setattr(mb_app, "runner", mb_runner)
@@ -1545,6 +1554,7 @@ def test_startup_warms_cli_probe_in_background(monkeypatch):
 
 
 def test_warmup_is_idempotent_per_process(monkeypatch):
+    monkeypatch.setenv("FNMUSIC_CLI_WARMUP", "true")   # conftest 默认关，这里要验的正是预热本身
     """重复调用只起一个预热线程。
 
     否则每个 TestClient（生产中是每次 startup 重入）都会拉起一个跑
@@ -1569,6 +1579,30 @@ def test_warmup_is_idempotent_per_process(monkeypatch):
     assert len(calls) <= 1, f"预热应幂等，实际触发了 {len(calls)} 次"
 
 
+def test_warmup_can_be_disabled(monkeypatch):
+    """FNMUSIC_CLI_WARMUP=off 必须彻底不起线程。
+
+    这不只是为了让测试确定：预热线程解析 CLI 时读 sys.executable / sys.prefix 这类
+    **全局**状态，与 monkeypatch 并发就会把错的结果写进进程级 _CMD_CACHE，
+    表现为别的用例偶发 127「CLI not found」、单跑又正常（本次就靠关掉它才归因清楚）。
+    """
+    calls = []
+    monkeypatch.setenv("FNMUSIC_CLI_WARMUP", "off")
+    monkeypatch.setattr(
+        mb_runner, "run_musicbox",
+        lambda args, timeout=30.0: calls.append(1) or (0, "version:0.5.3", ""),
+    )
+    mb_app.reset_cli_probe_for_test()
+    mb_app._warm_cli_probe_in_background()
+    import time as _t
+
+    _t.sleep(0.15)
+    assert calls == [], "关闭后绝不能执行 CLI"
+    assert mb_app._CLI_PROBE is None
+    # 关掉后 selftest 仍能走短超时探测，不会因此拿不到 CLI 状态
+    mb_app.reset_cli_probe_for_test()
+
+
 def test_stale_warmup_write_is_discarded():
     """作废轮次的写入必须被丢弃。
 
@@ -1589,6 +1623,7 @@ def test_stale_warmup_write_is_discarded():
 
 
 def test_lifespan_warms_cli_probe_on_startup(monkeypatch):
+    monkeypatch.setenv("FNMUSIC_CLI_WARMUP", "true")   # conftest 默认关，这里要验的正是预热本身
     """预热必须挂在 lifespan 上：TestClient 进入时才发生。"""
     calls = []
     monkeypatch.setattr(

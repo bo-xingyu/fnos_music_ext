@@ -3,6 +3,90 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.2.1] - 2026-09-11
+
+修一个 2.2.0 上线就带出去的真 bug：**管理页保存「收藏归档目录」必然失败**。
+
+用户实际看到的报错：
+
+```
+失败：download_dir: 取值非法（attempted relative import with no known parent package）
+```
+
+### 根因：函数级相对导入 + 管理页以顶层模块方式运行
+
+2.2.0 的路径校验器写成了这样：
+
+```python
+def _as_path(v):
+    ...
+    from . import download as _dl      # ← 函数级相对导入
+    ok, why = _dl.validate_dir(path)
+```
+
+管理页在生产上以 `uvicorn --app-dir proxy` 启动，此时 `admin_ui` 是**顶层模块**、
+没有父包，`from . import download` 必抛 `ImportError`。`proxy/admin_ui.py` 顶部本来就有
+为这个场景准备的双分支导入（`try: from . import …` / `except ImportError: import …`），
+我在函数体里另写了一份相对导入，等于绕过了那个机制——**而按包导入的测试环境根本触发不到**，
+所以本地全绿、真机必挂。
+
+更糟的是错误被二次误导：外层保存逻辑是
+
+```python
+except ValueError as exc:  errors.append(f"{field}: {exc}")
+except Exception as exc:   errors.append(f"{field}: 取值非法（{exc}）")
+```
+
+`ImportError` 走进第二个分支，被包成「**取值非法**」。于是明明是程序错误，却显示成用户的
+输入不合法——用户改一万遍路径也过不去，而且完全无从判断问题出在哪。
+
+### 修复
+
+1. `download` 改为与其它同级模块一致的**模块顶部双分支导入**，两种运行方式（`proxy.admin_ui`
+   包模块 / `--app-dir proxy` 顶层模块）都成立。
+2. `_as_path` 内部把「我们自己的异常」与「路径不合法」区分开：内部异常一律报
+   `内部校验出错（非路径问题）: <类型>: <原因>`，**不再伪装成"取值非法"**。
+   程序错误就该按程序错误的样子出现，否则会把用户指向错误方向。
+
+### 测试
+
+新增 9 个用例（**591 passed / 5 skipped**，连跑 4 轮均稳定）：
+
+- 真实可写目录通过；留空/None/纯空白 = 关闭归档而非校验失败
+- 系统目录（`/`、`/etc`、`/var`、`/root`）与相对路径被拒，且错误信息说清是哪条规则
+- 目录不存在被拒并给出「不存在」
+- **内部错误必须如实标注**：把 `validate_dir` 打桩成抛异常，断言报错含「内部校验出错」
+  与「非路径问题」并带上原始异常——正是本次 bug 的本质，用户曾被指向错误方向
+- **核心回归：以全新解释器、`PYTHONPATH=proxy` 的方式把 `admin_ui` 当顶层模块导入并执行
+  `_as_path`**。这是生产上真实的启动方式，也是该 bug 只在真机出现的唯一原因；
+  必须用子进程验证，排除本测试进程已按包导入过的干扰。
+
+### 顺带揪出一个真实的测试竞态（不是测试写错，是产线代码的隔离缺陷）
+
+`test_run_musicbox_actually_executes_resolved_cli` 偶发失败：`code=127`、报
+「musicbox CLI not found」，而候选路径里明明列着夹具刚造好的假 venv；**单跑又永远正常**。
+
+第一版归因（"`runner._CMD_CACHE` 没被夹具重置"）是**错的**——补上重置后仍然复现。
+真正的根因是：2.1.6 加的 CLI 后台预热线程会调 `run_musicbox` → `resolve_musicbox_cmd`，
+而解析读的是 `sys.executable` / `sys.prefix` 这类**全局**状态；测试里
+`monkeypatch.setattr(mb_runner.sys, "executable", …)` 改的正是同一个全局对象。
+线程与用例并发时，会在被打桩过的状态上完成解析，并把结果写进**进程级** `_CMD_CACHE`，
+于是别的用例拿到一个错的"找不到 CLI"缓存。夹具在用例边界重置缓存，挡不住
+"用例执行期间"的写入。
+
+修复不是给测试加更多清理（那是绕过去），而是**消除并发本身**：
+
+- 新增 `FNMUSIC_CLI_WARMUP`（默认 on），`off` 时不起任何预热线程。这也是一个有用的
+  产线开关：慢速 NAS 上未必需要那次 120s 上限的后台探测。
+- `conftest.py` 里 `setdefault` 成 `off`，并写明原因。
+- 三个专门验证预热行为的用例显式把它设回 `true` 再测（否则它们测的就是"被关闭"）。
+- 同时把 `reset_cmd_cache()` 并入 autouse 夹具——它不是本 bug 的根因，但确实是另一条
+  真实的跨用例污染通道，一并堵上。
+- 新增用例 `test_warmup_can_be_disabled`：断言关闭后绝不执行 CLI、不写缓存。
+
+修完连跑 4 轮 `591 passed / 5 skipped` 全绿，偶发失败消失。
+
+
 ## [2.2.0] - 2026-09-11
 
 功能版本。四件事：**更多口径的推荐歌单**、**账户歌单显示到飞牛**、**点收藏自动下载最高

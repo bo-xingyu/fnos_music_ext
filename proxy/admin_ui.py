@@ -40,12 +40,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
 try:
+    from . import download
     from . import env_merge
     from . import loghouse
     from . import netease_auth
     from . import pushplus
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
+    import download  # type: ignore
     import env_merge  # type: ignore
     import loghouse  # type: ignore
     import netease_auth  # type: ignore
@@ -163,9 +165,16 @@ def _as_path(v: Any) -> str:
     path = str(v or "").strip()
     if not path:
         return ""          # 空 = 关闭自动归档
-    from . import download as _dl
 
-    ok, why = _dl.validate_dir(path)
+    # ⚠️ 必须用模块顶部导入好的 download，不能在这里写 `from . import download`：
+    # 管理页常以 `uvicorn --app-dir proxy` 启动，此时 admin_ui 是**顶层模块**、
+    # 没有父包，相对导入必抛 ImportError。真机上这会被外层包成
+    # 「取值非法（attempted relative import with no known parent package）」——
+    # 明明是程序错误，却显示成用户的输入不合法，用户改一万遍路径也过不去。
+    try:
+        ok, why = download.validate_dir(path)
+    except Exception as exc:  # noqa: BLE001 - 我们的错要如实标注，不能赖到用户输入上
+        raise ValueError(f"内部校验出错（非路径问题）: {type(exc).__name__}: {exc}"[:200]) from exc
     if not ok:
         raise ValueError(why)
     return path
