@@ -3,6 +3,81 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.1.2] - 2026-09-11
+
+修复一个会让**整个在线音源瘫痪**、但健康检查看起来一切正常的严重缺陷。这是 v1.x 就存在的
+历史问题，只是 Docker 模式下不会暴露（pip 把 console script 装进 `/usr/local/bin`，本来就在
+PATH 上），而 fpk 与 host 模式恒走 venv，100% 命中。
+
+### 修复
+
+- **`musicbox-service/runner.py` 用裸命令名调 CLI，在 venv 形态下必然失败。**
+  `musicbox` 是 pip 装进虚拟环境的 console script，位于 `<venv>/bin/musicbox`。
+  但服务的启动方式是**用绝对路径调 venv 里的 uvicorn**：
+
+  ```
+  .venv-musicbox/bin/uvicorn app:app --host 127.0.0.1 --port 8770
+  ```
+
+  这种方式**不会**把 venv 的 `bin/` 加进 PATH（只有 `source bin/activate` 才会），
+  于是 `subprocess.run(["musicbox", ...])` 抛 `FileNotFoundError` → 退出码 127 →
+  `UpstreamException` → **HTTP 502**。
+
+  受影响的端点共 12 个：`search`、`song url`、`song info`、`artist`、`album`、
+  `playlist`、`auth status`、`auth login`、`auth login check`、三个二维码接口、
+  `recommend daily`。也就是**搜索、播放直链解析、扫码登录全部不可用**。
+
+  而 `/healthz`、`/api/v1/auth/detail`、`/api/v1/songs/detail`、`/api/v1/song/{id}/lyric`
+  这四个走**进程内 NEMbox Python API**，照常返回 200 —— 于是诊断页上看到的是
+  「音源服务运行中」，用户却只看到「生成二维码 失败：HTTP 502」，完全对不上。
+
+  现改为分级解析并缓存结果：
+
+  1. `sys.executable` 同目录下的 `musicbox`（venv 内最可靠，uvicorn 正是从这儿起的）；
+  2. `sys.prefix/bin`、`sys.base_prefix/bin`（含 Windows 的 `Scripts/`）；
+  3. `shutil.which("musicbox")`；
+  4. `[sys.executable, "-m", "NEMbox"]`（入口等价：pyproject 里
+     `musicbox = "NEMbox.__main__:start"`）。
+
+  同时把 venv 的 `bin/` 补进**子进程** PATH（CLI 自身可能再派生子进程）。
+  彻底解析不到时返回明确诊断文本（列出尝试过的路径 + 期望位置），而不是含糊的 127。
+
+  已用真实环境验证：装真实 `NetEase-MusicBox 0.5.3` 的 venv、PATH 刻意不含 `venv/bin`，
+  旧实现复现 `FileNotFoundError → 127 → 502`；新实现解析到 `<venv>/bin/musicbox`，
+  执行 `--version` 返回 `NetEase-MusicBox installed version:0.5.3`。
+  顺带用真包核实了 v2.0 依赖的 CLI 行为：`recommend songs --limit N --json`
+  未登录时退出码 **3** 且返回 `{"ok":false,"error":{"type":"not_logged_in"}}`，
+  `auth status --json` 返回 `{"ok":true,"data":{"logged_in":false,...}}`，与实现一致。
+
+### 新增
+
+- **`GET /api/v1/selftest`**（musicbox 服务）：报告 CLI 是怎么解析到的
+  （`cli_found` / `cli_cmd` / `resolved_by` / `venv_bin_dir` / `interpreter`）、
+  能否真的执行（`cli_exec_ok` + 输出摘要，含超时）、NEMbox 是否可导入、
+  运行身份与 XDG 目录。这类「healthz 200 但 CLI 全线 502」的故障，
+  以后一个请求就能定位，而不是靠猜。
+- **诊断与健康检查主动暴露 CLI 故障**：
+  - `/api/diag` 增探 `auth/status` 与 `selftest`，并新增「CLI 自检」小节
+    （解析方式、执行结果、解释器路径、venv bin、NEMbox 可导入性、运行身份、XDG），
+    `cli_found=false` 或「healthz 200 但 auth/status 502」时直接打出结论与修复指引；
+  - `/api/health` 把上述情况提升为 `problems` 条目，明确写明**影响面**
+    （「这会让搜索/取直链/扫码登录全部不可用，而 healthz 仍显示正常」），
+    并把登录态探测的 `error`（如 `http_502`）一并提升。
+    之前这条 502 只躺在 `netease_error` 字段里，没人会去看。
+  - 对没有 selftest 端点的旧版音源服务保持兼容，不会因此 500。
+
+### 测试
+
+- 新增 `runner` 解析回归测试：构造真实 `<venv>/bin/{python,musicbox}` 布局并把 PATH
+  刻意设为不含它，断言仍能解析并真实执行；另覆盖 `which` 回退、模块回退、
+  结果缓存、子进程 PATH 注入、代理变量剥离、候选路径去重与 `Scripts/` 兼容。
+  **此前的测试全部 mock 掉 `runner.run_musicbox`，恰好绕过了这段解析逻辑**，
+  这是该缺陷能长期存活的直接原因，现已补上真实可执行文件的测试。
+- 新增 admin UI 用例：`healthz 200 + auth/status 502` 必须被提升为 problem 且点明影响面、
+  必须同时探两条链路才看得出分歧、diag 必须带 selftest 明细、
+  旧版音源服务无 selftest 时不能 500、`login_error` 必须进入 problems。
+- `437 passed / 1 skipped`（新增 `test_musicbox_service.py` 13 例、`test_admin_ui.py` 5 例）。
+
 ## [2.1.1] - 2026-09-11
 
 修复一个会让管理页面「打得开但什么都点不动」的路径 bug，并按需求加上异常可见性与日志保留策略。

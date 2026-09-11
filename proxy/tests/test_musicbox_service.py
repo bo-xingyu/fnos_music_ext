@@ -123,10 +123,13 @@ def test_auth_qr_png_endpoint_and_alias(monkeypatch):
 
 
 def test_run_musicbox_missing_binary(monkeypatch):
+    """彻底解析不到时必须退出码 127，并给出「去哪找过」的可读诊断。"""
     monkeypatch.setenv("PATH", "")
     code, stdout, stderr = runner.run_musicbox(["health"])
     assert code == 127
-    assert "musicbox executable not found" in stderr
+    assert "musicbox CLI not found" in stderr
+    assert "tried:" in stderr, "必须列出尝试过的路径，否则无从排查"
+    assert "console script next to the interpreter" in stderr
 
 
 def test_run_musicbox_calls_ensure_xdg_dirs(monkeypatch):
@@ -471,3 +474,173 @@ def test_recommend_daily_default_limit_is_20(monkeypatch):
         resp = client.get("/api/v1/recommend/daily")
         assert resp.status_code == 200
     assert seen["args"] == ["recommend", "songs", "--limit", "20", "--json"]
+
+
+# ===========================================================================
+# runner: musicbox CLI 解析（v1.x 遗留缺陷的回归测试）
+#
+# 事故现场：服务用绝对路径的 venv uvicorn 启动（.venv-musicbox/bin/uvicorn ...），
+# venv 的 bin/ 不在 PATH 上；而 runner 用裸命令名 ["musicbox", ...] 起子进程，
+# 于是 FileNotFoundError -> 退出码 127 -> 12 个走 CLI 的端点全部 502，
+# 但 /healthz 仍返回 200，看起来"服务是好的"。
+# ===========================================================================
+
+import runner as mb_runner
+
+
+@pytest.fixture
+def fake_venv(tmp_path, monkeypatch):
+    """造一个 <venv>/bin/{python,musicbox} 布局，并保证 PATH 里没有它。"""
+    venv = tmp_path / "venv"
+    bindir = venv / "bin"
+    bindir.mkdir(parents=True)
+    fake_python = bindir / "python"
+    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_python.chmod(0o755)
+    cli = bindir / "musicbox"
+    cli.write_text('#!/bin/sh\necho "{\\"ok\\": true, \\"via\\": \\"venv-cli\\"}"\n',
+                   encoding="utf-8")
+    cli.chmod(0o755)
+
+    # 关键：PATH 里刻意不含 venv/bin，复现真实故障条件
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setattr(mb_runner.sys, "executable", str(fake_python))
+    monkeypatch.setattr(mb_runner.sys, "prefix", str(venv))
+    monkeypatch.setattr(mb_runner.sys, "base_prefix", "/usr")
+    mb_runner.reset_cmd_cache()
+    yield venv, cli
+    mb_runner.reset_cmd_cache()
+
+
+def test_run_musicbox_fails_without_cli_on_path(monkeypatch, tmp_path):
+    """先证明故障条件成立：PATH 里没有 musicbox 时裸命令名必然失败。"""
+    monkeypatch.setenv("PATH", str(tmp_path))          # 空目录
+    monkeypatch.setattr(mb_runner.sys, "executable", "/usr/bin/python3")
+    monkeypatch.setattr(mb_runner.sys, "prefix", "/usr")
+    monkeypatch.setattr(mb_runner.sys, "base_prefix", "/usr")
+    mb_runner.reset_cmd_cache()
+    try:
+        cmd, how = mb_runner.resolve_musicbox_cmd()
+        if not cmd:
+            assert how.startswith("not_found:")
+            code, out, err = mb_runner.run_musicbox(["--version"])
+            assert code == 127
+            assert "not found" in err and "tried:" in err, "失败原因必须可读"
+    finally:
+        mb_runner.reset_cmd_cache()
+
+
+def test_resolves_cli_next_to_interpreter_when_not_on_path(fake_venv):
+    """核心回归：venv/bin 不在 PATH 上时，仍必须从解释器同目录解析到 CLI。"""
+    venv, cli = fake_venv
+    cmd, how = mb_runner.resolve_musicbox_cmd()
+    assert cmd == [str(cli)], f"应解析到 venv 内的 CLI，实际 {cmd} ({how})"
+    assert how.startswith("absolute:")
+
+
+def test_run_musicbox_actually_executes_resolved_cli(fake_venv):
+    venv, cli = fake_venv
+    code, out, err = mb_runner.run_musicbox(["--version"])
+    assert code == 0, f"stderr={err}"
+    assert "venv-cli" in out
+
+
+def test_child_path_includes_venv_bin(fake_venv):
+    """子进程 PATH 也要带 venv/bin：CLI 可能自己再派生子进程。"""
+    venv, _cli = fake_venv
+    env = mb_runner.get_clean_env()
+    assert env["PATH"].startswith(str(venv / "bin") + mb_runner.os.pathsep)
+
+
+def test_child_env_strips_proxy_vars(fake_venv, monkeypatch):
+    """网易云需直连，代理变量必须剥离（国内网络下走代理会拿到空结果）。"""
+    for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "ALL_PROXY", "no_proxy"):
+        monkeypatch.setenv(k, "http://proxy.invalid:8080")
+    env = mb_runner.get_clean_env()
+    for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "ALL_PROXY", "no_proxy"):
+        assert k not in env
+
+
+def test_cmd_resolution_is_cached(fake_venv):
+    venv, cli = fake_venv
+    first = mb_runner.musicbox_cmd()
+    assert first[0] == [str(cli)]
+    cli.unlink()                      # 删掉文件
+    assert mb_runner.musicbox_cmd() == first, "解析结果应缓存，不随每次请求重扫文件系统"
+    mb_runner.reset_cmd_cache()
+    after = mb_runner.musicbox_cmd()
+    assert after[0] != [str(cli)], "清缓存后重新解析才会发现该路径已失效"
+
+
+def test_resolve_falls_back_to_which(tmp_path, monkeypatch):
+    bindir = tmp_path / "globalbin"
+    bindir.mkdir()
+    cli = bindir / "musicbox"
+    cli.write_text("#!/bin/sh\necho which-ok\n", encoding="utf-8")
+    cli.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bindir))
+    monkeypatch.setattr(mb_runner.sys, "executable", "/nonexistent/python")
+    monkeypatch.setattr(mb_runner.sys, "prefix", "/nonexistent/prefix")
+    monkeypatch.setattr(mb_runner.sys, "base_prefix", "/nonexistent/base")
+    mb_runner.reset_cmd_cache()
+    try:
+        cmd, how = mb_runner.resolve_musicbox_cmd()
+        assert cmd == [str(cli)] and how.startswith("which:")
+    finally:
+        mb_runner.reset_cmd_cache()
+
+
+def test_candidate_paths_dedupe_and_cover_scripts_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(mb_runner.sys, "executable", str(tmp_path / "py"))
+    monkeypatch.setattr(mb_runner.sys, "prefix", str(tmp_path / "p"))
+    monkeypatch.setattr(mb_runner.sys, "base_prefix", str(tmp_path / "p"))
+    paths = mb_runner.candidate_paths()
+    assert len(paths) == len(set(paths)), "候选路径不该有重复"
+    assert any(p.endswith(os.sep + "musicbox") for p in paths)
+    assert any("Scripts" in p for p in paths), "应兼容 Windows/Scripts 布局"
+
+
+# ---------------------------------------------------------------- selftest ----
+
+def test_selftest_endpoint_reports_resolution(monkeypatch):
+    import netease_ext  # noqa: F401
+
+    monkeypatch.setattr(mb_runner, "musicbox_cmd",
+                        lambda: (["/venv/bin/musicbox"], "absolute:/venv/bin/musicbox"))
+    monkeypatch.setattr(mb_runner, "run_musicbox", lambda a, timeout=30.0: (0, "1.2.3", ""))
+    with TestClient(app) as client:
+        body = client.get("/api/v1/selftest").json()
+    assert body["ok"] is True
+    d = body["data"]
+    assert d["cli_found"] is True
+    assert d["cli_cmd"] == ["/venv/bin/musicbox"]
+    assert d["resolved_by"] == "absolute:/venv/bin/musicbox"
+    assert d["cli_exec_ok"] is True
+    assert d["venv_bin_dir"] and d["interpreter"]
+    assert d["xdg"].get("XDG_DATA_HOME") is not None
+
+
+def test_selftest_reports_missing_cli(monkeypatch):
+    monkeypatch.setattr(mb_runner, "musicbox_cmd",
+                        lambda: ([], "not_found:/a/musicbox,/b/musicbox"))
+    with TestClient(app) as client:
+        body = client.get("/api/v1/selftest").json()
+    d = body["data"]
+    assert d["cli_found"] is False
+    assert d["cli_exec_ok"] is False
+    assert d["cli_cmd"] == []
+    # healthz 与 selftest 的分歧正是当初的迷惑点，必须能被一眼看出
+    assert client.get("/healthz").json()["status"] == "ok"
+
+
+def test_selftest_survives_cli_hanging(monkeypatch):
+    def slow(a, timeout=30.0):
+        raise mb_runner.MusicboxTimeoutError("musicbox timed out after 15s")
+
+    monkeypatch.setattr(mb_runner, "musicbox_cmd", lambda: (["/venv/bin/musicbox"], "absolute:x"))
+    monkeypatch.setattr(mb_runner, "run_musicbox", slow)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/selftest").json()
+    assert body["ok"] is True
+    assert body["data"]["cli_exec_ok"] is False
+    assert "timeout" in body["data"]["cli_exec_detail"]

@@ -660,6 +660,17 @@ async def api_diag(request: Request):
 
     mb = await _probe_musicbox("/healthz")
     mb_auth = await _probe_musicbox("/api/v1/auth/detail")
+    mb_auth_status = await _probe_musicbox("/api/v1/auth/status")
+    mb_selftest = await _probe_musicbox("/api/v1/selftest")
+    selftest_data: dict = {}
+    if mb_selftest.get("reachable") and mb_selftest.get("status") == 200:
+        try:
+            r = await mb_client().get("/api/v1/selftest", timeout=10.0)
+            payload = r.json()
+            if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+                selftest_data = payload["data"]
+        except Exception:  # noqa: BLE001
+            selftest_data = {}
     login = await netease_auth.fetch_state(mb_client(), force=True)
 
     proxy_socket = {
@@ -695,9 +706,12 @@ async def api_diag(request: Request):
             "url": MUSICBOX_URL,
             "healthz": mb,
             "auth_detail": mb_auth,
+            "auth_status": mb_auth_status,
+            "selftest": mb_selftest,
             "login": login.to_public_dict(),
             "login_error": login.error,
         },
+        "selftest": selftest_data,
         "env_file": {**env_stat, "path": env_file,
                      "writable": os.access(os.path.dirname(env_file) or ".", os.W_OK),
                      "keys": len(env),
@@ -761,6 +775,36 @@ async def api_health(request: Request):
         else:
             problems.append("网易云未登录且已关闭免费曲降级：在线播放完全不可用")
     mb_detail = await _probe_musicbox("/api/v1/auth/detail")
+    # /api/v1/auth/status 走的是 musicbox CLI 子进程，与走进程内 NEMbox API 的
+    # auth/detail 是两条不同链路。只有探这一条才能暴露「CLI 解析不到 → 全线 502」，
+    # 而 /healthz 和 auth/detail 都会返回 200，看起来一切正常。
+    mb_status_probe = await _probe_musicbox("/api/v1/auth/status")
+    if mb_status_probe.get("status") == 502:
+        problems.append(
+            "音源服务的 musicbox CLI 子进程调用失败（502）。这会让搜索/取直链/扫码登录全部不可用，"
+            f"而 healthz 仍显示正常。详情：{mb_status_probe.get('detail') or '无'}"
+            "；请在诊断里看 selftest 的 resolved_by 与 venv_bin_dir。"
+        )
+    elif not mb_status_probe.get("reachable"):
+        problems.append(f"音源服务登录态接口不可达：{mb_status_probe.get('detail') or '连接失败'}")
+    if login.error and login.error not in ("", "invalidated"):
+        problems.append(f"网易云登录态探测异常：{login.error}")
+
+    selftest = await _probe_musicbox("/api/v1/selftest")
+    st_data: dict = {}
+    if selftest.get("reachable") and selftest.get("status") == 200:
+        try:
+            body = await mb_client().get("/api/v1/selftest", timeout=8.0)
+            payload = body.json()
+            if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+                st_data = payload["data"]
+        except Exception:  # noqa: BLE001
+            st_data = {}
+    if st_data and st_data.get("cli_found") is False:
+        problems.append(
+            "自检确认：musicbox CLI 未找到（"
+            + str(st_data.get("resolved_by", ""))[:200] + "）"
+        )
 
     return {
         "ok": True,
@@ -768,7 +812,9 @@ async def api_health(request: Request):
         "problems": problems,
         "version": get_version(),
         "proxy": proxy_health,
-        "musicbox_probe": {"healthz": mb_health, "auth_detail": mb_detail},
+        "musicbox_probe": {"healthz": mb_health, "auth_detail": mb_detail,
+                           "auth_status": mb_status_probe, "selftest": selftest},
+        "selftest": st_data,
         "netease": login.to_public_dict(),
         "netease_error": login.error,
         "socket_takeover": bool(os.path.exists(UPSTREAM_SOCK)),
@@ -1578,9 +1624,23 @@ function runDiag(auto){
       out.push("");
       out.push("-- 音源服务 (musicbox) --");
       out.push("  "+d.musicbox.url);
-      out.push("  healthz     : "+JSON.stringify(d.musicbox.healthz));
-      out.push("  auth/detail : "+JSON.stringify(d.musicbox.auth_detail));
-      out.push("  登录态      : "+JSON.stringify(d.musicbox.login)+"  error="+d.musicbox.login_error);
+      out.push("  healthz      : "+JSON.stringify(d.musicbox.healthz));
+      out.push("  auth/status  : "+JSON.stringify(d.musicbox.auth_status));
+      out.push("  auth/detail  : "+JSON.stringify(d.musicbox.auth_detail));
+      out.push("  登录态       : "+JSON.stringify(d.musicbox.login)+"  error="+d.musicbox.login_error);
+      var stt=d.selftest||{};
+      out.push("  -- CLI 自检 --");
+      out.push("  cli_found    : "+stt.cli_found+"   resolved_by="+String(stt.resolved_by||"-"));
+      out.push("  cli_cmd      : "+JSON.stringify(stt.cli_cmd||[]));
+      out.push("  cli_exec_ok  : "+stt.cli_exec_ok+"   detail="+String(stt.cli_exec_detail||"-").slice(0,140));
+      out.push("  venv_bin_dir : "+String(stt.venv_bin_dir||"-"));
+      out.push("  interpreter  : "+String(stt.interpreter||"-")+"  ("+stt.python_version+")");
+      out.push("  NEMbox 可导入: "+stt.nembox_importable+(stt.nembox_error?"  "+stt.nembox_error:""));
+      out.push("  运行身份     : uid="+stt.uid+" user="+stt.running_as);
+      out.push("  XDG          : "+JSON.stringify(stt.xdg||{}));
+      if(stt.cli_found===false) out.push("  ★ CLI 没找到 → 搜索/取直链/扫码登录会全部 502。修复：重装依赖到音源服务的 venv，并确认 venv_bin_dir 下有 musicbox 可执行文件。");
+      if(d.musicbox.auth_status&&d.musicbox.auth_status.status===502&&d.musicbox.healthz.status===200)
+        out.push("  ★ healthz 200 但 auth/status 502：典型的 CLI 子进程不可用，见上面的 CLI 自检。");
       out.push("");
       out.push("-- 配置文件 --");
       out.push("  "+d.env_file.path+"  存在="+d.env_file.exists+" 可写="+d.env_file.writable

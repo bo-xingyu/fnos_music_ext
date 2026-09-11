@@ -867,3 +867,100 @@ def test_health_problems_never_leak_token(env, monkeypatch):
     with TestClient(admin_ui.app) as c:
         r = c.get("/api/health", headers=ADMIN)
     assert FAKE_TOKEN not in r.text, "异常详情回显前必须脱敏"
+
+
+# ============ CLI 子进程故障的可见性（真实事故回归） ============
+#
+# musicbox 用绝对路径的 venv uvicorn 启动时，venv/bin 不在 PATH 上，
+# runner 的裸命令名解析不到 CLI，导致 12 个走 CLI 的端点全部 502，
+# 而 /healthz 与 /api/v1/auth/detail（走进程内 NEMbox API）都返回 200，
+# 于是"服务看起来是好的"，用户只看到扫码失败：HTTP 502。
+
+def _cli_broken_handler(path_status=502):
+    def handler(r: httpx.Request) -> httpx.Response:
+        p = r.url.path
+        if p == "/healthz":
+            return httpx.Response(200, json={"status": "ok"})        # 看起来健康
+        if p == "/api/v1/auth/detail":
+            return httpx.Response(200, json={"ok": True, "data": {   # 也看起来健康
+                "logged_in": False, "nickname": "", "user_id": "",
+                "vip_type": 0, "vip_expires_ms": 0}})
+        if p == "/api/v1/auth/status":
+            return httpx.Response(path_status, json={               # 真相在这里
+                "error": "upstream_error", "exit_code": 127,
+                "stderr": "musicbox CLI not found (tried: /venv/bin/musicbox)"})
+        if p == "/api/v1/selftest":
+            return httpx.Response(200, json={"ok": True, "data": {
+                "cli_found": False, "cli_cmd": [],
+                "resolved_by": "not_found:/venv/bin/musicbox",
+                "venv_bin_dir": "/venv/bin", "interpreter": "/venv/bin/python",
+                "cli_exec_ok": False, "nembox_importable": True}})
+        return httpx.Response(404)
+
+    return handler
+
+
+def test_health_surfaces_cli_502_even_when_healthz_is_ok(monkeypatch):
+    mock_mb(_cli_broken_handler())
+    monkeypatch.setattr(admin_ui, "PROXY_SOCK", "/nonexistent.sock")
+    with TestClient(admin_ui.app) as c:
+        body = c.get("/api/health", headers=ADMIN).json()
+    assert body["ok"] is True, "接口本身可用"
+    assert body["healthy"] is False, "healthz 200 不等于系统健康"
+    joined = "\n".join(body["problems"])
+    assert "502" in joined and "CLI" in joined, joined
+    assert "搜索" in joined, "必须点明影响面，否则用户以为是登录页坏了"
+    assert "not_found:/venv/bin/musicbox" in joined, "要带上 selftest 的解析结论"
+
+
+def test_health_includes_selftest_and_auth_status_probes(monkeypatch):
+    mock_mb(_cli_broken_handler())
+    monkeypatch.setattr(admin_ui, "PROXY_SOCK", "/nonexistent.sock")
+    with TestClient(admin_ui.app) as c:
+        body = c.get("/api/health", headers=ADMIN).json()
+    assert body["musicbox_probe"]["auth_status"]["status"] == 502
+    assert body["musicbox_probe"]["auth_detail"]["status"] == 200, "两条链路都要探，才看得出分歧"
+    assert body["selftest"]["cli_found"] is False
+    assert body["selftest"]["venv_bin_dir"] == "/venv/bin"
+
+
+def test_diag_carries_selftest_detail(monkeypatch):
+    mock_mb(_cli_broken_handler())
+    monkeypatch.setattr(admin_ui, "PROXY_SOCK", "/nonexistent.sock")
+    monkeypatch.setenv("FNMUSIC_ADMIN_LOG_DIR", "")
+    with TestClient(admin_ui.app) as c:
+        d = c.get("/api/diag", headers=ADMIN).json()
+    mb = d["musicbox"]
+    assert mb["healthz"]["status"] == 200
+    assert mb["auth_status"]["status"] == 502
+    assert mb["auth_detail"]["status"] == 200
+    assert d["selftest"]["cli_found"] is False
+    assert d["selftest"]["resolved_by"].startswith("not_found:")
+
+
+def test_diag_selftest_absent_does_not_crash(monkeypatch):
+    """老版本音源服务没有 selftest 端点，诊断也不能因此 500。"""
+    def handler(r: httpx.Request) -> httpx.Response:
+        if r.url.path == "/healthz":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(404)   # selftest / auth/status 都不存在
+
+    mock_mb(handler)
+    monkeypatch.setattr(admin_ui, "PROXY_SOCK", "/nonexistent.sock")
+    monkeypatch.setenv("FNMUSIC_ADMIN_LOG_DIR", "")
+    with TestClient(admin_ui.app) as c:
+        r = c.get("/api/diag", headers=ADMIN)
+        assert r.status_code == 200
+        assert r.json()["selftest"] == {}
+        h = c.get("/api/health", headers=ADMIN).json()
+    assert h["ok"] is True and h["healthy"] is False
+
+
+def test_login_error_promoted_to_problem(monkeypatch):
+    """登录态探测失败（error=http_502）要出现在 problems 里，而不是只藏在字段中。"""
+    mock_mb(_cli_broken_handler())
+    monkeypatch.setattr(admin_ui, "PROXY_SOCK", "/nonexistent.sock")
+    with TestClient(admin_ui.app) as c:
+        body = c.get("/api/health", headers=ADMIN).json()
+    assert body["netease_error"] == "http_502"
+    assert any("登录态探测异常" in p for p in body["problems"]), body["problems"]

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import sys
 from typing import Any
 from urllib.parse import quote
 
@@ -104,6 +106,53 @@ def _parse_ids(ids_str: str | None) -> list[int]:
 @app.get("/healthz")
 def healthz():
     return {"status": "ok", "source": "https://github.com/darknessomi/musicbox"}
+
+
+@app.get("/api/v1/selftest")
+def selftest():
+    """自检：报告 musicbox CLI 是怎么解析到的、能不能真的跑起来。
+
+    这个端点存在的理由是一个真实事故：服务用绝对路径的 venv uvicorn 启动时，
+    venv 的 bin/ 不在 PATH 上，裸命令名 `musicbox` 解析不到，导致 12 个走 CLI
+    的端点全部 502，而 /healthz 依然返回 200 —— 看起来"服务是好的"。
+    """
+    cmd, how = runner.musicbox_cmd()
+    result: dict[str, Any] = {
+        "cli_found": bool(cmd),
+        "cli_cmd": cmd,
+        "resolved_by": how,
+        "interpreter": sys.executable,
+        "venv_bin_dir": runner.bin_dir(),
+        "python_version": sys.version.split()[0],
+        "xdg": {
+            "XDG_DATA_HOME": os.environ.get("XDG_DATA_HOME", ""),
+            "XDG_CONFIG_HOME": os.environ.get("XDG_CONFIG_HOME", ""),
+            "XDG_CACHE_HOME": os.environ.get("XDG_CACHE_HOME", ""),
+        },
+        "running_as": os.environ.get("USER") or "?",
+        "uid": os.getuid() if hasattr(os, "getuid") else None,
+        "nembox_importable": False,
+        "cli_exec_ok": False,
+        "cli_exec_detail": "",
+    }
+    try:
+        import NEMbox  # noqa: F401
+
+        result["nembox_importable"] = True
+    except Exception as exc:  # noqa: BLE001
+        result["nembox_importable"] = False
+        result["nembox_error"] = f"{type(exc).__name__}: {exc}"[:200]
+
+    if cmd:
+        try:
+            code, stdout, stderr = runner.run_musicbox(["--version"], timeout=15.0)
+            result["cli_exec_ok"] = code == 0
+            result["cli_exec_detail"] = ((stdout or stderr or "").strip()[:200]) or f"exit={code}"
+        except MusicboxTimeoutError:
+            result["cli_exec_detail"] = "timeout running `musicbox --version`"
+        except Exception as exc:  # noqa: BLE001
+            result["cli_exec_detail"] = f"{type(exc).__name__}: {exc}"[:200]
+    return {"ok": True, "data": result}
 
 
 @app.get("/api/v1/search")
