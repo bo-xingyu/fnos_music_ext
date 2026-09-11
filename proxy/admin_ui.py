@@ -86,6 +86,10 @@ LOG_SCAN_INTERVAL_S = float(os.environ.get("FNMUSIC_LOG_SCAN_INTERVAL", "3600"))
 # 配置项白名单：field -> (env key, 校验器, 是否敏感)
 # 只有列在这里的键才允许被页面写入，杜绝任意 .env 注入。
 QUALITIES = ("lossless", "exhigh", "higher", "standard")
+# 音质策略可选档位比播放音质多两档：hires / jymaster 在 musicbox 的 QUALITY_WHITELIST
+# 里合法（账号无对应权益时上游会自动降级，不会因此播不出来）。顺序由高到低。
+QUALITY_LEVELS = ("jymaster", "hires", "lossless", "exhigh", "higher", "standard")
+quality_POLICIES = ("follow_fnos", "fixed", "by_network")
 TEMPLATES = ("markdown", "html", "txt", "json")
 
 
@@ -219,6 +223,12 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     "download_dir": ("FNMUSIC_DOWNLOAD_DIR", _as_path, True),
     "download_on_favorite": ("FNMUSIC_DOWNLOAD_ON_FAVORITE", _as_bool, False),
     "fav_sync_like": ("FNMUSIC_FAV_SYNC_LIKE", _as_bool, False),
+    # --- 音质策略：跟随飞牛 / 按网络分别设置 / 固定 ---
+    "quality_policy": ("FNMUSIC_QUALITY_POLICY",
+                       _in_choices(*quality_POLICIES), False),
+    "quality_fixed": ("FNMUSIC_QUALITY_FIXED", _in_choices(*QUALITY_LEVELS), False),
+    "quality_wifi": ("FNMUSIC_QUALITY_WIFI", _in_choices(*QUALITY_LEVELS), False),
+    "quality_cellular": ("FNMUSIC_QUALITY_CELLULAR", _in_choices(*QUALITY_LEVELS), False),
 }
 
 # 页面上以「天/小时」为单位展示，落盘时换算成秒
@@ -251,6 +261,10 @@ DEFAULTS = {
     "download_dir": "",
     "download_on_favorite": "true",
     "fav_sync_like": "true",
+    "quality_policy": "follow_fnos",
+    "quality_fixed": "lossless",
+    "quality_wifi": "lossless",
+    "quality_cellular": "exhigh",
 }
 
 MASK = "••••••••"
@@ -636,6 +650,31 @@ async def _auth_error_middleware(request: Request, call_next):
         return _deny(exc.msg)
 
 
+async def _probe_proxy_quality() -> dict:
+    """向代理进程取「音质策略 + 跟随飞牛的发现证据」。
+
+    观察记录只存在于代理进程内存里（记录客户端请求线索的中间件在那边），管理页面是
+    **另一个进程**，直接 import 读到的永远是空 —— 必须经 unix socket 取。
+    取不到就如实说明，**不要显示成"没有偏好"**，那会让人误以为已经读到了飞牛设置。
+    """
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=PROXY_SOCK),
+            base_url="http://unix",
+            timeout=6.0,
+        ) as client:
+            r = await client.get("/_ext/quality")
+            if r.status_code == 200:
+                body = r.json()
+                if isinstance(body, dict) and body.get("ok") is not False:
+                    data = body.get("data")
+                    if isinstance(data, dict):
+                        return {"reachable": True, **data}
+            return {"reachable": False, "status": r.status_code}
+    except Exception as exc:  # noqa: BLE001
+        return {"reachable": False, "error": f"{type(exc).__name__}: {exc}"[:160]}
+
+
 async def _probe_proxy_health() -> dict:
     """透过被接管的 socket 读扩展自身的 healthz。"""
     try:
@@ -761,6 +800,7 @@ async def api_diag(request: Request):
     mb_selftest = probes["selftest"]
     selftest_data = _selftest_data(mb_selftest)
     login = await netease_auth.fetch_state(mb_client(), force=True)
+    quality_probe = await _probe_proxy_quality()
 
     proxy_socket = {
         "path": PROXY_SOCK,
@@ -791,6 +831,7 @@ async def api_diag(request: Request):
             "x_forwarded_prefix": request.headers.get("x-forwarded-prefix"),
         },
         "proxy_socket": proxy_socket,
+        "quality": quality_probe,
         "musicbox": {
             "url": MUSICBOX_URL,
             "healthz": mb,
@@ -1425,6 +1466,53 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
           <span class="ht">收藏=加红心，取消收藏=撤销红心。这是对你网易云账号的写操作</span>
         </label>
 
+        <label><span class="lb">音质策略</span>
+          <select name="quality_policy">
+            <option value="follow_fnos">跟随飞牛偏好（读不到时回落到下面的手动值）</option>
+            <option value="by_network">按网络分别设置（WiFi / 流量）</option>
+            <option value="fixed">固定音质（不分网络）</option>
+          </select>
+          <span class="ht">飞牛把音质偏好放在哪个接口/库表我们没有可靠证据，因此「跟随」只做被动发现。
+          到底读到没有，请到<b>一键诊断</b>看 <code>quality</code> 段的 <code>current.source</code>：
+          <code>auto:*</code> = 真读到了，<code>fallback:*</code> = 没读到、在用手动脉位</span>
+        </label>
+
+        <label><span class="lb">WiFi / 原始音质档</span>
+          <select name="quality_wifi">
+            <option value="jymaster">臻品母带 jymaster</option>
+            <option value="hires">高清无损 hires</option>
+            <option value="lossless">无损 lossless</option>
+            <option value="exhigh">极高 exhigh (320k)</option>
+            <option value="higher">较高 higher (192k)</option>
+            <option value="standard">标准 standard (128k)</option>
+          </select>
+          <span class="ht">账号无对应权益时上游自动降级，不会因此播放失败</span>
+        </label>
+
+        <label><span class="lb">流量 / 标准音质档</span>
+          <select name="quality_cellular">
+            <option value="exhigh">极高 exhigh (320k)</option>
+            <option value="higher">较高 higher (192k)</option>
+            <option value="standard">标准 standard (128k)</option>
+            <option value="lossless">无损 lossless</option>
+            <option value="hires">高清无损 hires</option>
+            <option value="jymaster">臻品母带 jymaster</option>
+          </select>
+          <span class="ht">省流量场景默认 320k；只在客户端真的报了网络类型时才用得上</span>
+        </label>
+
+        <label><span class="lb">固定音质档</span>
+          <select name="quality_fixed">
+            <option value="jymaster">臻品母带 jymaster</option>
+            <option value="hires">高清无损 hires</option>
+            <option value="lossless">无损 lossless</option>
+            <option value="exhigh">极高 exhigh (320k)</option>
+            <option value="higher">较高 higher (192k)</option>
+            <option value="standard">标准 standard (128k)</option>
+          </select>
+          <span class="ht">仅当策略选「固定音质」时生效</span>
+        </label>
+
         <label><span class="lb">单次搜索请求条数</span>
           <input name="netease_search_limit" inputmode="numeric" placeholder="50">
           <span class="ht">1–100，向网易云请求的候选数量</span>
@@ -1803,6 +1891,39 @@ function runDiag(auto){
       out.push("-- socket 接管 --");
       out.push("  "+d.proxy_socket.path+" 存在="+d.proxy_socket.exists+" 权限="+d.proxy_socket.mode);
       out.push("  upstream("+d.proxy_socket.upstream_exists+")");
+      out.push("");
+      out.push("-- 音质策略与「跟随飞牛」发现情况 --");
+      var qy=d.quality||{};
+      if(!qy.reachable){
+        out.push("  代理进程不可达（"+(qy.error||("status="+qy.status))+
+                 "）→ 看不到已观察到的客户端线索");
+      }else{
+        out.push("  策略            : "+qy.policy);
+        out.push("  档位配置        : "+JSON.stringify(qy.levels||{}));
+        var cur=qy.current||{};
+        out.push("  当前判定        : level="+cur.level+"  network="+cur.network+"  source="+cur.source);
+        out.push("  ★ source 就是「有没有真的跟随上飞牛」的答案：auto:* = 读到了；"
+                +"fallback:* = 没读到，在用手动脉位");
+        var hits=qy.observed_client_hints||{};
+        var hk=Object.keys(hits);
+        out.push("  客户端音质/网络线索 : "+(hk.length?hk.length+" 种":"暂未观察到任何带音质或网络语义的键"));
+        hk.slice(0,8).forEach(function(k){
+          out.push("     "+k+"  x"+hits[k].count+"  样例="+JSON.stringify(hits[k].samples));
+        });
+        var paths=qy.observed_paths_with_hints||{};
+        Object.keys(paths).slice(0,4).forEach(function(k){
+          out.push("     路径 "+k+"  x"+paths[k]);
+        });
+        var dbs=qy.db_scan||{};
+        out.push("  music.db 扫描   : available="+dbs.available+"  命中行="+(dbs.hits||0)
+                +(dbs.error?("  error="+dbs.error):"")+(dbs.note?("  "+dbs.note):""));
+        (dbs.sample_hits||[]).slice(0,3).forEach(function(h){
+          out.push("     "+h.table+": "+JSON.stringify(h.row).slice(0,180));
+        });
+        if(cur.source&&cur.source.indexOf("fallback")===0)
+          out.push("  ★ 目前是回落状态（没读到飞牛偏好）。把上面「客户端线索」与「music.db 命中行」"
+                  +"贴出来，就能确定飞牛把音质偏好放在哪里，进而改成真正的自动跟随。");
+      }
       out.push("");
       out.push("-- 音源服务 (musicbox) --");
       out.push("  "+d.musicbox.url);

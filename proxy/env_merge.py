@@ -44,6 +44,12 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     # 绝不能替他决定写到哪儿，必须他在管理页里显式填。
     ("FNMUSIC_DOWNLOAD_DIR", ""),
     ("FNMUSIC_DOWNLOAD_ON_FAVORITE", "true"),
+    # --- 音质策略（v2.3 新增）---
+    ("FNMUSIC_QUALITY_POLICY", "follow_fnos"),
+    ("FNMUSIC_QUALITY_FIXED", "lossless"),
+    ("FNMUSIC_QUALITY_WIFI", "lossless"),
+    ("FNMUSIC_QUALITY_CELLULAR", "exhigh"),
+    ("FNMUSIC_QUALITY_DB_RESCAN", "300"),
     ("FNMUSIC_FAV_SYNC_LIKE", "true"),
     ("FNMUSIC_LOGIN_STATE_TTL", "300"),
     ("FNMUSIC_LOGIN_CHECK_INTERVAL", "3600"),
@@ -71,7 +77,8 @@ NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOGIN_",
                 # 加前缀只是允许这些键被自动补齐，键本身仍必须在 NEW_DEFAULTS 里列出，
                 # 因此不会凭空给老用户的 .env 塞进没定义的项。
                 "FNMUSIC_NETEASE_CHANNEL", "FNMUSIC_NETEASE_CATEGOR",
-                "FNMUSIC_PLAYLIST_", "FNMUSIC_DOWNLOAD_", "FNMUSIC_FAV_")
+                "FNMUSIC_PLAYLIST_", "FNMUSIC_DOWNLOAD_", "FNMUSIC_FAV_",
+                "FNMUSIC_QUALITY_")
 
 # v2.0 已废弃的配置项：升级合并时从 .env 中清理，避免残留误导。
 # 只删「确定已无代码读取」的键；FNMUSIC_MODE / BASE_IMAGE / PIP_INDEX 等 docker 相关项保留。

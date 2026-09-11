@@ -40,6 +40,7 @@ try:
     from . import netease_items
     from . import playlists
     from . import download as downloader
+    from . import quality
     from . import pushplus
     from . import recommend as dailyrec
     from .version import get_version
@@ -48,6 +49,7 @@ except ImportError:  # uvicorn --app-dir proxy
     import netease_items  # type: ignore
     import playlists  # type: ignore
     import download as downloader  # type: ignore
+    import quality  # type: ignore
     import pushplus  # type: ignore
     import recommend as dailyrec  # type: ignore
     from version import get_version  # type: ignore
@@ -1130,9 +1132,19 @@ async def _enrich_netease_items(client: httpx.AsyncClient, items: list[dict]) ->
 
 
 
-async def resolve_netease_url(client: httpx.AsyncClient, song_id: str) -> str | None:
+async def resolve_netease_url(client: httpx.AsyncClient, song_id: str,
+                              request: Request | None = None) -> str | None:
+    """取播放直链。音质档位**按本次请求动态决定**（见 proxy/quality.py）。
+
+    传入 request 是为了让 quality 看到客户端的网络类型线索；不传（同步场景或测试）时
+    按策略的 WiFi 档处理，行为与旧版一致。选中的档位上游不给直链时仍会继续降到
+    exhigh，不能因为策略选了高档就直接播放失败。
+    """
+    decision = quality.resolve(request, db_path=str(CONF.get("music_db") or ""))
+    _log_quality_decision(song_id, decision)
+    primary = decision.get("level") or str(CONF.get("netease_quality") or "lossless").strip()
+
     qualities = []
-    primary = str(CONF.get("netease_quality") or "lossless").strip()
     if primary:
         qualities.append(primary)
     if "exhigh" not in qualities:
@@ -1154,6 +1166,24 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str) -> str | 
             logger.warning("resolve_netease_url error for %s (quality=%s): %s: %s",
                           song_id, q, type(e).__name__, e)
     return None
+
+
+_LOGGED_QUALITY: set[tuple[str, str]] = set()
+
+
+def _log_quality_decision(song_id: str, decision: dict) -> None:
+    """每种 (档位, 判定来源) 组合只记一次日志。
+
+    必须能把「跟随飞牛到底生效没有」查出来，否则那个策略可能是从未生效过的空话；
+    但每次播放都记会把日志刷满（一首歌至少一次取链），所以按组合去重。
+    """
+    key = (str(decision.get("level")), str(decision.get("source")))
+    if key in _LOGGED_QUALITY:
+        return
+    _LOGGED_QUALITY.add(key)
+    logger.info("音质判定 level=%s source=%s policy=%s network=%s (song=%s)",
+                decision.get("level"), decision.get("source"), decision.get("policy"),
+                decision.get("network"), song_id)
 
 
 def ensure_search_list(upstream_json: dict) -> list:
@@ -1528,6 +1558,39 @@ async def ext_cache_invalidate():
             "login_state": True,
         },
     }
+
+
+@app.middleware("http")
+async def _observe_quality_hints(request: Request, call_next):
+    """被动记录客户端请求里的音质/网络线索，供「跟随飞牛」发现真实契约。
+
+    代理就架在飞牛 socket 上，客户端每个请求都经过这里——这是搞清楚飞牛到底怎么表达
+    音质偏好（哪个接口、哪个参数、哪种网络标识）的**唯一可靠途径**，比猜接口名去读
+    诚实得多：猜错不会报错，只会让"跟随飞牛"从未生效过。
+
+    只做记录，不改请求也不改响应；任何异常都吞掉，绝不允许影响播放。
+    """
+    try:
+        if request.url.path.startswith("/music/api/"):
+            quality.observe_request(request.method, request.url.path,
+                                    request.query_params, request.headers)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("quality hint observation failed: %s: %s", type(exc).__name__, exc)
+    return await call_next(request)
+
+
+@app.get("/_ext/quality")
+async def ext_quality_report():
+    """音质策略与「跟随飞牛」的发现证据。只读，不改策略。
+
+    观察记录只存在于**代理进程**内存里，管理页面是另一个进程，必须经 unix socket 取
+    （与 /_ext/cache/invalidate 同一套做法）；直接 import 读到的永远是空。
+    """
+    try:
+        return {"ok": True, "data": quality.report(db_path=str(CONF.get("music_db") or ""))}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("quality report failed: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
 
 
 @app.get("/music/api/v1/search/track")
@@ -1922,7 +1985,7 @@ async def stream_track(request: Request):
         return _online_unavailable()
 
     play_url_res, info_res = await asyncio.gather(
-        resolve_netease_url(musicbox_client, song_id),
+        resolve_netease_url(musicbox_client, song_id, request),
         _online_info(request, guid),
         return_exceptions=True,
     )

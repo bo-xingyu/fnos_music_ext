@@ -178,6 +178,7 @@ sync_into_app "proxy/pushplus.py"
 sync_into_app "proxy/netease_items.py"
 sync_into_app "proxy/playlists.py"
 sync_into_app "proxy/download.py"
+sync_into_app "proxy/quality.py"
 sync_into_app "proxy/admin_ui.py"
 sync_into_app "proxy/loghouse.py"
 sync_into_app "proxy/env_merge.py"
@@ -328,7 +329,7 @@ mkdir -p "${APPV}"
 tar xzf "${VERIFY}/app.tgz" -C "${APPV}"
 for required in config/privilege config/resource \
                 proxy/app.py proxy/netease_auth.py proxy/pushplus.py \
-                proxy/netease_items.py proxy/playlists.py proxy/download.py \
+                proxy/netease_items.py proxy/playlists.py proxy/download.py proxy/quality.py \
                 proxy/admin_ui.py proxy/loghouse.py \
                 proxy/recommend.py proxy/env_merge.py proxy/run_proxy.sh proxy/requirements.txt \
                 musicbox-service/app.py musicbox-service/requirements.txt \
