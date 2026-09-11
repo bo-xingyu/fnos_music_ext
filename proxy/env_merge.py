@@ -45,9 +45,16 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_LOG_MAX_MB", "10"),
     ("FNMUSIC_LOG_MAX_DAYS", "30"),
     ("FNMUSIC_LOG_SCAN_INTERVAL", "3600"),
+    # 在线搜索空结果的短 TTL（秒）：上游一次抖动导致结果为空时，
+    # 若沿用 7 天的正常 TTL，该关键词会在整个周期内只返回本地结果。
+    ("FNMUSIC_SEARCH_EMPTY_TTL", "60"),
+    # musicbox 侧登录态缓存 TTL（秒）：可播性过滤每轮都要查账号信息，
+    # 缓存掉可省一次跨洋往返，显著缩短搜索首屏。
+    ("FNMUSIC_LOGIN_CACHE_TTL", "300"),
 ]
 NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOGIN_",
-                "FNMUSIC_VIP_", "FNMUSIC_PUSHPLUS_", "FNMUSIC_LOG_")
+                "FNMUSIC_VIP_", "FNMUSIC_PUSHPLUS_", "FNMUSIC_LOG_",
+                "FNMUSIC_SEARCH_")
 
 # v2.0 已废弃的配置项：升级合并时从 .env 中清理，避免残留误导。
 # 只删「确定已无代码读取」的键；FNMUSIC_MODE / BASE_IMAGE / PIP_INDEX 等 docker 相关项保留。

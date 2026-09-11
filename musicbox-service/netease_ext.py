@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import Any
 
 _api_lock = threading.Lock()
@@ -60,14 +61,42 @@ def _map_song_detail(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def check_is_logged_in() -> bool:
+_LOGIN_CACHE: tuple[float, bool] = (0.0, False)
+# 登录态缓存 TTL。check_is_logged_in() 每次都要向网易云发一次
+# /weapi/nuser/account/get，而搜索与日推每轮都会调它，白占一次跨洋往返。
+_LOGIN_CACHE_TTL = float(os.environ.get("FNMUSIC_LOGIN_CACHE_TTL", "300"))
+
+
+def check_is_logged_in(force: bool = False) -> bool:
+    """当前账号是否已登录（带 TTL 缓存）。
+
+    这个函数在每次搜索/日推时可播性过滤里都会被调用，直连网易云一次约几百毫秒，
+    缓存掉能显著缩短首屏耗时。登录态变化由 invalidate_login_cache() 主动清除。
+    """
+    global _LOGIN_CACHE
+    now = time.monotonic()
+    if not force and _LOGIN_CACHE[0] and (now - _LOGIN_CACHE[0]) < _LOGIN_CACHE_TTL:
+        return _LOGIN_CACHE[1]
+    value = False
     try:
         api = _get_api()
         with _api_lock:
             info = api.get_account_info()
-        return bool(info and (info.get("account") or info.get("profile")))
+        value = bool(info and (info.get("account") or info.get("profile")))
     except Exception:
+        # 探测失败不缓存为"未登录太久"，否则一次网络抖动会让账号在 TTL 内
+        # 一直被当成未登录，VIP 曲目全被过滤掉
+        if _LOGIN_CACHE[0]:
+            return _LOGIN_CACHE[1]
         return False
+    _LOGIN_CACHE = (now, value)
+    return value
+
+
+def invalidate_login_cache() -> None:
+    """登录态变化（扫码登录/登出）后调用。"""
+    global _LOGIN_CACHE
+    _LOGIN_CACHE = (0.0, False)
 
 
 def _pick(d: dict[str, Any], *keys: str) -> Any:
@@ -78,12 +107,47 @@ def _pick(d: dict[str, Any], *keys: str) -> Any:
     return None
 
 
+_VIP_EXPIRY_KEYS = (
+    "vipExpiryTime", "vipExpiry", "vipExpires", "vip_expire", "vipExpireTime",
+    "expireTime", "expiredTime", "endTime", "validTime",
+)
+
+
+def _looks_like_future_ms(value: Any) -> bool:
+    """只接受"看起来像未来的毫秒时间戳"的值，绝不把别的字段硬凑成到期时间。"""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return False
+    if n <= 0:
+        return False
+    import time as _t
+
+    now_ms = _t.time() * 1000
+    # 合理区间：当前时间之后、且不超过 50 年
+    return now_ms < n < now_ms + 50 * 365 * 86400 * 1000
+
+
+def _find_vip_expiry(*sources: dict[str, Any]) -> int:
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for key in _VIP_EXPIRY_KEYS:
+            v = src.get(key)
+            if _looks_like_future_ms(v):
+                return int(v)
+    return 0
+
+
 def auth_detail() -> dict[str, Any]:
     """登录态详情：是否登录、昵称、userId、VIP 类型与到期时间。
 
     只读取 NEMbox 已有的 get_account_info()，不额外发请求；任何字段缺失都
-    以 None/0 返回，不编造。VIP 到期时间字段名在各版本网易返回里不完全一致，
-    这里按常见几种命名依次尝试。
+    以 None/0 返回，不编造。
+
+    注意 VIP 到期时间：NEMbox 上游（0.5.3）**没有任何提供到期时间的接口**，
+    get_account_info 只有 vipType。这里对若干候选字段名做尽力探测，探不到就
+    如实返回 0，由调用方显示"上游未提供"——绝不臆造一个天数。
     """
     try:
         api = _get_api()
@@ -101,20 +165,30 @@ def auth_detail() -> dict[str, Any]:
 
     nickname = _pick(src, "nickname", "userName", "nick_name", "name")
     user_id = _pick(src, "userId", "user_id", "id") or _pick(info, "userId", "user_id")
-    vip_type = _pick(src, "vipType", "vip_type") or _pick(account, "vipType")
-    vip_expire = _pick(src, "vipExpiryTime", "vipExpiry", "vip_expire") or _pick(
-        account, "vipExpiryTime", "vip_expire"
-    )
+    vip_type = _pick(src, "vipType", "vip_type") or _pick(account, "vipType", "vip_type")
     logged_in = bool(profile or account or (nickname and user_id))
 
     try:
         vip_type_int = int(vip_type) if vip_type is not None else 0
     except (TypeError, ValueError):
         vip_type_int = 0
-    try:
-        vip_expire_int = int(vip_expire) if vip_expire is not None else 0
-    except (TypeError, ValueError):
-        vip_expire_int = 0
+
+    vip_expire_int = _find_vip_expiry(src, account, profile, info)
+    if not vip_expire_int and vip_type_int > 0:
+        # 尽力再问一次用户详情接口；失败或字段缺失都静默放弃，不编造
+        try:
+            uid = int(user_id) if user_id else 0
+        except (TypeError, ValueError):
+            uid = 0
+        if uid:
+            try:
+                with _api_lock:
+                    detail = api.request("POST", f"/weapi/v1/user/detail/{uid}") or {}
+            except Exception:  # noqa: BLE001
+                detail = {}
+            if isinstance(detail, dict):
+                dp = detail.get("profile") if isinstance(detail.get("profile"), dict) else {}
+                vip_expire_int = _find_vip_expiry(dp, detail)
 
     return {
         "logged_in": logged_in,
@@ -122,32 +196,42 @@ def auth_detail() -> dict[str, Any]:
         "user_id": str(user_id or ""),
         "vip_type": vip_type_int,
         "vip_expires_ms": vip_expire_int,
+        # 上游没提供到期时间时明确标记，让前端显示"未知"而不是"剩余 0 天"
+        "vip_expires_known": vip_expire_int > 0,
     }
 
 
 def filter_playable_song_ids(ids: list[int]) -> set[int]:
-    """根据真实可播放状态过滤歌曲 ID。
+    """根据真实可播放状态过滤歌曲 ID（集合形式，保留给既有调用方）。"""
+    return set(playable_url_map(ids).keys())
 
-    音源只来自当前扫码登录的那个私人网易云账号，因此：
 
-    - **已登录**：账号自身权益内的曲目（含 VIP / 无损 / 已购付费专辑）只要能拿到
-      完整真实直链就放行；无权益的曲目仍然过滤。
-    - **未登录**：降级为只播免费曲目（``FNMUSIC_FREE_ONLY_ON_LOGOUT``，默认开）。
-    - 只能试听片段（带 freeTrialInfo）的曲目，无论是否登录都绝不当作可播返回。
+def playable_url_map(ids: list[int]) -> dict[int, dict[str, Any]]:
+    """返回 {song_id: 直链信息} ——只包含当前账号**真实可播**的曲目。
+
+    与上游 NEMbox 的 ``dig_info`` 有本质区别：dig_info 在**任意一首**歌取不到 url 时
+    会 ``return []``，把整个列表清空（api.py 里注释自承"可能因网络波动"）。
+    那是本项目「搜索/日推返回 200 但结果为空」的根因，因此这里改为**逐首判定**：
+    坏数据只影响它自己那一首。
+
+    过滤规则：
+    - 已登录：账号自身权益内、能拿到完整真实直链的曲目放行（含 VIP / 无损 / 已购）；
+    - 未登录：降级为只播免费曲目（``FNMUSIC_FREE_ONLY_ON_LOGOUT``，默认开）；
+    - 任何情况下，url 为空 / code 404 / 带试听片段标记的曲目都不放行。
     """
     if not ids:
-        return set()
+        return {}
     api = _get_api()
-    with _api_lock:
-        try:
+    try:
+        with _api_lock:
             urls_data = api.songs_url(ids)
-        except Exception:
-            return set()
+    except Exception:
+        return {}
     if not isinstance(urls_data, list):
-        return set()
+        return {}
 
     logged_in = check_is_logged_in()
-    playable_ids: set[int] = set()
+    out: dict[int, dict[str, Any]] = {}
     for item in urls_data:
         if not isinstance(item, dict):
             continue
@@ -164,15 +248,154 @@ def filter_playable_song_ids(ids: list[int]) -> set[int]:
         fee = item.get("fee", 0)
         free_trial = item.get("freeTrialInfo") or item.get("freeTrialPrivilege")
 
-        # 核心铁律：拿不到真实直链（url 为空 / 404）一律过滤，试听片段同样过滤
+        # 核心铁律：拿不到真实直链一律不放行，试听片段同样不放行
         if not url or not str(url).strip() or code == 404 or free_trial:
             continue
-        # 未登录时降级：只保留免费曲目（fee 0=免费，8=VIP 曲但未登录必然无 url，已被上面挡掉）
+        # 未登录时降级：只保留免费曲目（fee 0=免费，8=VIP 但未登录必然无 url，已被上面挡掉）
         if not logged_in and FREE_ONLY_ON_LOGOUT and fee not in (0, 8):
             continue
 
-        playable_ids.add(sid_int)
-    return playable_ids
+        out[sid_int] = item
+    return out
+
+
+def quality_of(url_info: dict[str, Any]) -> str:
+    """按上游 Parse.song_url 的同款逻辑判定音质字符串。
+
+    刻意与 NEMbox 保持一致（LOSSLESS / HIRES / JYMASTER / FLAC / "HD 320k" …），
+    这样代理层的无损判定和 UI 展示都拿的是同一套词汇。
+    """
+    level = str(url_info.get("level") or "").upper()
+    stype = str(url_info.get("type") or "").upper()
+    try:
+        br = int(url_info.get("br") or 0)
+    except (TypeError, ValueError):
+        br = 0
+    if level in ("LOSSLESS", "HIRES", "JYMASTER") and stype:
+        return f"{level} {stype}"
+    if stype == "FLAC" and level:
+        return f"{level} FLAC"
+    if stype == "FLAC":
+        return "LOSSLESS FLAC"
+    if br >= 999000:
+        return "LOSSLESS"
+    if br >= 320000:
+        return f"HD {br // 1000}k"
+    if br >= 192000:
+        return f"MD {br // 1000}k"
+    if br:
+        return f"LD {br // 1000}k"
+    return "LD 128k"
+
+
+def _song_info_from_raw(raw: dict[str, Any], url_info: dict[str, Any] | None) -> dict[str, Any]:
+    """把网易云原始 song dict 映射成与 CLI song_info 兼容的结构。
+
+    额外带上 album_pic_url / has_sq / has_hr，让代理层不必再为补封面
+    多发一次 /api/v1/songs/detail。
+    """
+    mapped = _map_song_detail(raw)
+    info = {
+        "song_id": mapped["song_id"],
+        "song_name": mapped["name"],
+        "artist": mapped["artist"],
+        "album_name": mapped["album_name"],
+        "album_id": (raw.get("al") or {}).get("id", "") if isinstance(raw.get("al"), dict) else "",
+        "album_pic_url": mapped["album_pic_url"],
+        "duration": int(round((mapped["duration_ms"] or 0) / 1000)),
+        "has_sq": mapped["has_sq"],
+        "has_hr": mapped["has_hr"],
+        "quality": quality_of(url_info or {}),
+        "mp3_url": str((url_info or {}).get("url") or ""),
+    }
+    return info
+
+
+def search_songs(keyword: str, limit: int = 50) -> list[dict[str, Any]]:
+    """进程内搜索，逐首过滤可播性。
+
+    不走 ``musicbox search`` CLI —— 它内部调 dig_info，任何一首取不到直链就会
+    让整个结果集变成空列表（HTTP 仍为 200），用户表现为"搜不到任何在线歌曲"。
+    """
+    kw = (keyword or "").strip()
+    if not kw:
+        return []
+    api = _get_api()
+    try:
+        with _api_lock:
+            result = api.search(kw, limit=max(1, min(int(limit or 50), 200)))
+    except Exception:
+        return []
+    if not isinstance(result, dict):
+        return []
+    raw_songs = result.get("songs")
+    if not isinstance(raw_songs, list):
+        return []
+
+    ids = [_safe_sid(s) for s in raw_songs]
+    ids = [i for i in ids if i]
+    if not ids:
+        return []
+
+    playable = playable_url_map(ids)
+    out: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for raw in raw_songs:
+        if not isinstance(raw, dict):
+            continue
+        sid = _safe_sid(raw)
+        if not sid or sid in seen or sid not in playable:
+            continue
+        seen.add(sid)
+        out.append(_song_info_from_raw(raw, playable[sid]))
+    return out[: max(1, int(limit or 50))]
+
+
+def daily_songs(limit: int = 20) -> list[dict[str, Any]]:
+    """网易云官方每日推荐，进程内实现 + 逐首过滤。
+
+    同样不走 ``musicbox recommend songs`` CLI：它经 dig_info，一首坏数据就会
+    把整份日推清空，表现为"每日推荐歌单不出现"。这里逐首判定，
+    只有真正拿不到直链的那几首被剔除。
+    """
+    api = _get_api()
+    try:
+        with _api_lock:
+            raw = api.recommend_playlist(limit=max(1, min(int(limit or 20), 200)))
+    except Exception:
+        return []
+    if not isinstance(raw, list) or not raw:
+        return []
+
+    ids = [_safe_sid(s) for s in raw]
+    ids = [i for i in ids if i]
+    if not ids:
+        return []
+
+    playable = playable_url_map(ids)
+    out: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for song in raw:
+        if not isinstance(song, dict):
+            continue
+        sid = _safe_sid(song)
+        if not sid or sid in seen or sid not in playable:
+            continue
+        seen.add(sid)
+        out.append(_song_info_from_raw(song, playable[sid]))
+        if len(out) >= max(1, int(limit or 20)):
+            break
+    return out
+
+
+def _safe_sid(raw: Any) -> int:
+    if not isinstance(raw, dict):
+        return 0
+    sid = raw.get("id") or raw.get("song_id")
+    try:
+        return int(sid) if sid is not None else 0
+    except (TypeError, ValueError):
+        return 0
 
 
 def batch_song_details(ids: list[int]) -> list[dict[str, Any]]:

@@ -19,12 +19,26 @@ def _reset(monkeypatch):
     netease_auth.reset_for_test()
 
 
-def _status_client(payload=None, *, logged_in=True, status=200, calls=None, raise_exc=None):
+# fetch_state 现在先探 /api/v1/auth/detail（字段全，含 VIP），失败才兜底
+# /api/v1/auth/status（CLI，字段少）。mock 必须两个都应答，否则测的是兜底路径。
+PRIMARY_PATH = "/api/v1/auth/detail"
+
+
+def _status_client(payload=None, *, logged_in=True, status=200, calls=None,
+                   raise_exc=None, primary_status=None, legacy_only=False):
     def handler(request: httpx.Request) -> httpx.Response:
         if calls is not None:
             calls.append(request.url.path)
         if raise_exc is not None:
             raise raise_exc
+        path = request.url.path
+        if path not in ("/api/v1/auth/detail", "/api/v1/auth/status"):
+            return httpx.Response(404)
+        if legacy_only and path == "/api/v1/auth/detail":
+            # 模拟没有 detail 端点的旧版音源服务 -> 必须回落到 auth/status
+            return httpx.Response(404)
+        if path == "/api/v1/auth/detail" and primary_status:
+            return httpx.Response(primary_status)
         if status != 200:
             return httpx.Response(status)
         if payload is not None:
@@ -163,9 +177,10 @@ def test_to_public_dict_exposes_no_credentials():
     st = netease_auth.LoginState(logged_in=True, nickname="张三", user_id="1",
                                  vip_type=11, vip_expires_ms=int(time.time() * 1000) + 86400_000)
     pub = st.to_public_dict()
-    assert set(pub) == {"logged_in", "nickname", "vip", "vip_days_left", "free_only",
-                        "checked_at", "age_s"}
-    for banned in ("cookie", "token", "csrf", "password", "vip_expires_ms", "user_id"):
+    assert set(pub) == {"logged_in", "nickname", "vip", "vip_type", "vip_days_left",
+                        "vip_expires_known", "free_only", "checked_at", "age_s"}
+    for banned in ("cookie", "token", "csrf", "password", "vip_expires_ms",
+                   "user_id", "probed_via", "error"):
         assert banned not in pub
 
 
@@ -191,7 +206,7 @@ async def test_fresh_process_state_is_not_treated_as_fresh_cache():
         assert st.checked_at == 0.0, "哨兵状态必须标记为「从未探测过」"
         calls = []
         await fresh.fetch_state(_status_client(calls=calls))
-        assert calls == ["/api/v1/auth/status"], "首次 fetch_state 必须真的查上游"
+        assert calls == [PRIMARY_PATH], f"首次 fetch_state 必须真的查上游，实际 {calls}"
         assert fresh.current_state().logged_in is True
     finally:
         importlib.reload(netease_auth)
@@ -205,7 +220,7 @@ async def test_fetch_state_caches_within_ttl():
     st1 = await netease_auth.fetch_state(client)
     st2 = await netease_auth.fetch_state(client)
     assert st1.logged_in is True and st2.logged_in is True
-    assert calls.count("/api/v1/auth/status") == 1, "TTL 内只应打一次上游"
+    assert calls.count(PRIMARY_PATH) == 1, "TTL 内只应打一次主探针"
 
 
 @pytest.mark.anyio
@@ -214,7 +229,7 @@ async def test_fetch_state_force_bypasses_cache():
     client = _status_client(calls=calls)
     await netease_auth.fetch_state(client)
     await netease_auth.fetch_state(client, force=True)
-    assert calls.count("/api/v1/auth/status") == 2
+    assert calls.count(PRIMARY_PATH) == 2
 
 
 @pytest.mark.anyio
@@ -225,7 +240,7 @@ async def test_fetch_state_ttl_expiry(monkeypatch):
     await netease_auth.fetch_state(client)
     time.sleep(0.02)
     await netease_auth.fetch_state(client)
-    assert calls.count("/api/v1/auth/status") == 2
+    assert calls.count(PRIMARY_PATH) == 2
 
 
 @pytest.mark.anyio
@@ -265,10 +280,10 @@ async def test_invalidate_forces_refetch_on_next_call():
     calls = []
     client = _status_client(calls=calls)
     await netease_auth.fetch_state(client)
-    assert calls.count("/api/v1/auth/status") == 1
+    assert calls.count(PRIMARY_PATH) == 1
     netease_auth.invalidate_state()
     await netease_auth.fetch_state(client)
-    assert calls.count("/api/v1/auth/status") == 2
+    assert calls.count(PRIMARY_PATH) == 2
 
 
 @pytest.mark.anyio

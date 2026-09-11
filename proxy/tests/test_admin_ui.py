@@ -354,11 +354,11 @@ def test_logs_redact_token_saved_but_not_yet_loaded(tmp_path, monkeypatch):
     env_file.write_text(f"FNMUSIC_PUSHPLUS_TOKEN='{brand_new}'\n", encoding="utf-8")
     monkeypatch.setattr(admin_ui, "ENV_FILE", str(env_file))
     monkeypatch.setenv("FNMUSIC_ADMIN_LOG_DIR", str(logdir))
-    # 进程环境变量里没有这个 token —— 正是真实场景
     monkeypatch.delenv("FNMUSIC_PUSHPLUS_TOKEN", raising=False)
 
     from proxy import pushplus
-    assert pushplus.token() == ""
+    # pushplus 必须能从 .env 读到该 token（否则页面显示"未启用"、页面内推送也发不出）
+    assert pushplus.token() == brand_new, "仅存于 .env 的 token 也必须被识别"
 
     with TestClient(admin_ui.app) as c:
         r = c.get("/api/logs?what=proxy", headers=ADMIN).json()
@@ -366,6 +366,70 @@ def test_logs_redact_token_saved_but_not_yet_loaded(tmp_path, monkeypatch):
     assert brand_new not in joined, "刚落盘、未加载的 token 也必须脱敏"
     assert "***" in joined
     assert "another clean line" in joined
+    pushplus.reset_config_cache()
+
+
+def test_pushplus_reads_config_from_env_file(tmp_path, monkeypatch):
+    """问题2 回归：管理页进程的 os.environ 里没有 token（启动命令只传白名单变量，
+    刻意不把密钥塞进进程环境），只读 os.environ 就会把「已配置」显示成「未启用」。"""
+    from proxy import pushplus
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "FNMUSIC_PUSHPLUS_ENABLED='true'\n"
+        "FNMUSIC_PUSHPLUS_TOKEN='file-only-token-1234567890'\n"
+        "FNMUSIC_PUSHPLUS_TEMPLATE='html'\n"
+        "FNMUSIC_PUSHPLUS_TOPIC='grp1'\n",
+        encoding="utf-8")
+    monkeypatch.setenv("FNMUSIC_ADMIN_ENV_FILE", str(env_file))
+    for k in ("FNMUSIC_PUSHPLUS_TOKEN", "FNMUSIC_PUSHPLUS_ENABLED",
+              "FNMUSIC_PUSHPLUS_TEMPLATE", "FNMUSIC_PUSHPLUS_TOPIC"):
+        monkeypatch.delenv(k, raising=False)
+    pushplus.reset_config_cache()
+    try:
+        assert pushplus.token() == "file-only-token-1234567890"
+        assert pushplus.enabled() is True, "只存在于 .env 也应判定为已启用"
+        assert pushplus.template() == "html"
+        assert pushplus.topic() == "grp1"
+        assert pushplus.push_url() == pushplus.DEFAULT_URL
+    finally:
+        pushplus.reset_config_cache()
+
+
+def test_pushplus_process_env_wins_over_file(tmp_path, monkeypatch):
+    """os.environ 优先：显式设置（哪怕是 false/空）都必须压过文件值。"""
+    from proxy import pushplus
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("FNMUSIC_PUSHPLUS_ENABLED='true'\n"
+                        "FNMUSIC_PUSHPLUS_TOKEN='file-token-1234567890'\n", encoding="utf-8")
+    monkeypatch.setenv("FNMUSIC_ADMIN_ENV_FILE", str(env_file))
+    monkeypatch.setenv("FNMUSIC_PUSHPLUS_ENABLED", "false")
+    pushplus.reset_config_cache()
+    try:
+        assert pushplus.enabled() is False, "进程显式关闭必须压过文件里的 true"
+        assert pushplus.token() == "file-token-1234567890"
+    finally:
+        pushplus.reset_config_cache()
+
+
+def test_pushplus_file_cache_follows_mtime(tmp_path, monkeypatch):
+    """改完 .env 不必重启进程就该生效（按 mtime 缓存）。"""
+    from proxy import pushplus
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("FNMUSIC_PUSHPLUS_TOPIC='old'\n", encoding="utf-8")
+    monkeypatch.setenv("FNMUSIC_ADMIN_ENV_FILE", str(env_file))
+    monkeypatch.delenv("FNMUSIC_PUSHPLUS_TOPIC", raising=False)
+    pushplus.reset_config_cache()
+    try:
+        assert pushplus.topic() == "old"
+        import time as _t
+        env_file.write_text("FNMUSIC_PUSHPLUS_TOPIC='new-value'\n", encoding="utf-8")
+        os.utime(env_file, (_t.time() + 2, _t.time() + 2))
+        assert pushplus.topic() == "new-value"
+    finally:
+        pushplus.reset_config_cache()
 
 
 def test_logs_handles_missing_file(tmp_path, monkeypatch):
@@ -958,9 +1022,33 @@ def test_diag_selftest_absent_does_not_crash(monkeypatch):
 
 def test_login_error_promoted_to_problem(monkeypatch):
     """登录态探测失败（error=http_502）要出现在 problems 里，而不是只藏在字段中。"""
-    mock_mb(_cli_broken_handler())
+    def both_down(r: httpx.Request) -> httpx.Response:
+        if r.url.path == "/healthz":
+            return httpx.Response(200, json={"status": "ok"})
+        # detail 与 status 两条链路都挂，才会产生 login.error
+        return httpx.Response(502, json={"error": "upstream_error", "exit_code": 127})
+
+    mock_mb(both_down)
     monkeypatch.setattr(admin_ui, "PROXY_SOCK", "/nonexistent.sock")
     with TestClient(admin_ui.app) as c:
         body = c.get("/api/health", headers=ADMIN).json()
     assert body["netease_error"] == "http_502"
     assert any("登录态探测异常" in p for p in body["problems"]), body["problems"]
+
+
+def test_login_probe_falls_back_to_status_when_detail_missing(monkeypatch):
+    """只有 auth/status 可用（旧版音源服务）时也不能误报未登录。"""
+    def legacy(r: httpx.Request) -> httpx.Response:
+        if r.url.path == "/healthz":
+            return httpx.Response(200, json={"status": "ok"})
+        if r.url.path == "/api/v1/auth/status":
+            return httpx.Response(200, json={"ok": True, "data": {
+                "logged_in": True, "nickname": "张三", "user_id": "7"}})
+        return httpx.Response(404)          # 没有 auth/detail
+
+    mock_mb(legacy)
+    monkeypatch.setattr(admin_ui, "PROXY_SOCK", "/nonexistent.sock")
+    with TestClient(admin_ui.app) as c:
+        body = c.get("/api/health", headers=ADMIN).json()
+    assert body["netease"]["logged_in"] is True, "detail 缺失时必须回落到 status"
+    assert not any("登录态探测异常" in p for p in body["problems"])

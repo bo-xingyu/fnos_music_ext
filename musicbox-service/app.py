@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import sys
 from typing import Any
@@ -15,13 +16,20 @@ from fastapi.responses import JSONResponse
 from netease_ext import (
     auth_detail as ne_auth_detail,
     batch_song_details,
+    check_is_logged_in as ne_check_is_logged_in,
+    daily_songs as ne_daily_songs,
     filter_playable_song_ids,
+    invalidate_login_cache,
+    search_songs as ne_search_songs,
     song_lyric_pair,
 )
 import runner
 from runner import MusicboxTimeoutError, ensure_xdg_dirs
 
 ensure_xdg_dirs()
+
+logger = logging.getLogger("fnmusic_musicbox")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 SEARCH_TYPES = {"song", "album", "artist", "playlist"}
 QUALITY_WHITELIST = {"exhigh", "higher", "standard", "lossless", "hires", "jymaster"}
@@ -165,25 +173,25 @@ def search(
         raise HTTPException(status_code=400, detail="keyword cannot be empty")
     if type not in SEARCH_TYPES:
         raise HTTPException(status_code=400, detail=f"Invalid type {type!r}")
-    res = exec_musicbox(["search", keyword, "--type", type, "--limit", str(limit), "--json"])
-    if type == "song" and isinstance(res, dict):
-        raw_list = res.get("data")
-        if isinstance(raw_list, list):
 
-            def _song_id(item: dict) -> int:
-                # 畸形数据（非数字 id）一律归零，零不可能命中 playable 集合
-                try:
-                    return int(item.get("song_id") or item.get("id") or 0)
-                except (ValueError, TypeError):
-                    return 0
+    # 歌曲搜索走进程内实现：CLI 的 dig_info 在任意一首取不到直链时会 return []，
+    # 把整个结果集清空（HTTP 仍 200）——用户表现就是"搜不到任何在线歌曲"。
+    # 这里逐首过滤，坏数据只影响它自己那一首。
+    if type == "song":
+        try:
+            rows = ne_search_songs(keyword, limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("in-process search failed, falling back to CLI: %s", exc)
+            rows = None
+        if rows is not None:
+            return {"ok": True, "data": rows, "engine": "in-process"}
+        # 进程内失败才回退 CLI（至少不比原来差）
+        res = exec_musicbox(["search", keyword, "--type", type, "--limit", str(limit), "--json"])
+        if isinstance(res, dict):
+            res["engine"] = "cli-fallback"
+        return res
 
-            song_ids = [sid for it in raw_list if isinstance(it, dict) for sid in [_song_id(it)] if sid]
-            if song_ids:
-                playable = filter_playable_song_ids(song_ids)
-                res["data"] = [it for it in raw_list if isinstance(it, dict) and _song_id(it) in playable]
-            else:
-                res["data"] = []
-    return res
+    return exec_musicbox(["search", keyword, "--type", type, "--limit", str(limit), "--json"])
 
 
 @app.get("/api/v1/song/{song_id}/url")
@@ -253,15 +261,36 @@ def auth_detail_endpoint():
 def recommend_daily(limit: int = Query(20, ge=1, le=100)):
     """网易云官方「每日推荐」歌曲（需登录扫码的私人账号）。
 
-    直接复用 musicbox CLI 的 `recommend songs` 子命令，它内部走
-    /weapi/v3/discovery/recommend/songs 并把结果归一化成与 /api/v1/search
-    完全一致的 song_info 结构（song_id / song_name / artist / album_name /
-    mp3_url / duration / quality），因此代理层无需额外字段映射。
+    **进程内实现，不走 ``musicbox recommend songs`` CLI。**
+    CLI 内部调 ``dig_info``，而 dig_info 在任意一首歌取不到直链时会 ``return []``，
+    把整份日推清空（HTTP 仍 200），用户表现为"飞牛里根本不出现每日推荐歌单"。
+    这里逐首判定：只有真正拿不到直链的那几首被剔除。
 
     返回：
       - 未登录 → HTTP 200 + {"ok": false, "error": "not_logged_in"}
-      - 成功   → HTTP 200 + {"ok": true, "data": [ ...song_info... ]}
+      - 成功   → HTTP 200 + {"ok": true, "data": [...], "engine": "..."}
     """
+    # 先判登录：未登录时上游 v3 接口会返回一份与账号画像无关的热门填充，
+    # 名不副实，宁可不给。
+    try:
+        logged_in = ne_check_is_logged_in()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("login check failed for daily rec: %s", exc)
+        logged_in = False
+    if not logged_in:
+        return {"ok": False, "error": "not_logged_in", "data": []}
+
+    rows: list[dict] | None = None
+    try:
+        rows = ne_daily_songs(limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("in-process daily rec failed, will fall back to CLI: %s", exc)
+        rows = None
+
+    if rows:
+        return {"ok": True, "data": rows[:limit], "engine": "in-process"}
+
+    # 进程内拿到空结果或异常 → 回退 CLI（至少不比原来差），并如实标注来源
     try:
         code, stdout, stderr = runner.run_musicbox(
             ["recommend", "songs", "--limit", str(limit), "--json"], timeout=40.0
@@ -291,23 +320,20 @@ def recommend_daily(limit: int = Query(20, ge=1, le=100)):
 
     data = _extract_payload(payload)
     songs = [s for s in data if isinstance(s, dict)] if isinstance(data, list) else []
-    # 每日推荐里可能混入当前账号无权播放的曲目，按真实直链再过一遍
-    ids: list[int] = []
-    for s in songs:
-        try:
-            sid = int(s.get("song_id") or s.get("id") or 0)
-        except (TypeError, ValueError):
-            sid = 0
-        if sid:
-            ids.append(sid)
+    ids = [i for i in (_safe_int(s.get("song_id") or s.get("id")) for s in songs) if i]
     if ids:
         playable = filter_playable_song_ids(ids)
-        songs = [
-            s
-            for s in songs
-            if _safe_int(s.get("song_id") or s.get("id")) in playable
-        ]
-    return {"ok": True, "data": songs[:limit]}
+        songs = [s for s in songs if _safe_int(s.get("song_id") or s.get("id")) in playable]
+
+    if not songs:
+        logger.info(
+            "daily rec empty: 进程内=%s 条, CLI 回退=%s 条（上游 dig_info 可能已清空结果）",
+            0 if rows is None else len(rows or []), len(songs),
+        )
+        return {"ok": True, "data": [], "engine": "cli-fallback",
+                "note": "上游返回空列表；可能是网络波动或该账号今日无日推"}
+
+    return {"ok": True, "data": songs[:limit], "engine": "cli-fallback"}
 
 
 @app.post("/api/v1/auth/login")
@@ -326,7 +352,15 @@ def auth_login():
 def auth_login_check(unikey: str = Query(...)):
     if not unikey.strip():
         raise HTTPException(status_code=400, detail="unikey cannot be empty")
-    return exec_musicbox(["auth", "login", "--check", unikey, "--json"])
+    data = exec_musicbox(["auth", "login", "--check", unikey, "--json"])
+    # 登录成功（803）后立即作废登录态缓存，否则可播性过滤会在 TTL 内
+    # 继续把该账号当未登录，VIP / 无损曲目全被挡掉
+    payload = _extract_payload(data)
+    code = payload.get("code") if isinstance(payload, dict) else None
+    if code == 803 or code == "803":
+        invalidate_login_cache()
+        logger.info("扫码登录成功，已清空 musicbox 登录态缓存")
+    return data
 
 
 @app.get("/api/v1/auth/login/qr.png")

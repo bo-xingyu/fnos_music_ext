@@ -64,10 +64,15 @@ class LoginState:
     user_id: str = ""
     vip_type: int = 0
     vip_expires_ms: int = 0
+    # 上游是否真的提供了到期时间。NEMbox 0.5.3 没有任何返回 VIP 到期时间的接口
+    # （get_account_info 只给 vipType），因此这个值经常拿不到——
+    # 拿不到时必须如实说"未知"，绝不能显示成"剩余 0 天"或臆造一个日期。
+    vip_expires_known: bool = False
     # 0.0 表示"尚未探测过"：模块级哨兵必须用它，否则初始状态会被当成新鲜缓存，
     # 导致启动后一个 TTL 周期内 fetch_state 根本不查上游、一直误报未登录。
     checked_at: float = field(default_factory=time.time)
     error: str = ""
+    probed_via: str = ""
 
     @property
     def vip_active(self) -> bool:
@@ -91,7 +96,9 @@ class LoginState:
             "logged_in": self.logged_in,
             "nickname": self.nickname,
             "vip": self.vip_active,
+            "vip_type": self.vip_type if self.logged_in else 0,
             "vip_days_left": self.vip_days_left,
+            "vip_expires_known": bool(self.vip_expires_known),
             "free_only": (not self.logged_in) and free_only_on_logout(),
             "checked_at": int(self.checked_at),
             "age_s": int(time.time() - self.checked_at),
@@ -135,8 +142,13 @@ def _first_int(d: dict, keys: tuple[str, ...]) -> int:
     return 0
 
 
-def parse_status_payload(payload: Any) -> LoginState:
-    """解析 musicbox /api/v1/auth/status 的多种可能信封结构。"""
+def parse_status_payload(payload: Any, *, via: str = "auth/status") -> LoginState:
+    """解析登录态载荷，兼容多种信封结构。
+
+    ``/api/v1/auth/detail``（走进程内 NEMbox，字段全）与
+    ``/api/v1/auth/status``（走 musicbox CLI，只有 logged_in/nickname/user_id）
+    都能解析；后者拿不到 VIP 字段时如实留空，不补 0 以外的猜测值。
+    """
     data: dict = {}
     if isinstance(payload, dict):
         inner = payload.get("data")
@@ -145,7 +157,7 @@ def parse_status_payload(payload: Any) -> LoginState:
         else:
             data = payload
     if not isinstance(data, dict):
-        return LoginState()
+        return LoginState(probed_via=via)
 
     profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
     account = data.get("account") if isinstance(data.get("account"), dict) else {}
@@ -157,19 +169,37 @@ def parse_status_payload(payload: Any) -> LoginState:
     else:
         logged_in = bool(logged_in)
 
+    expires_ms = _first_int(src, ("vipExpiryTime", "vipExpires", "vip_expire", "vipExpiry"))
+    if not expires_ms:
+        expires_ms = _first_int(data, ("vip_expires_ms", "vipExpiryTime", "vip_expires_ms"))
+        if not expires_ms:
+            expires_ms = _first_int(account, ("vipExpiryTime", "vip_expire"))
+
+    # 到期时间是否可信：必须是个未来的毫秒时间戳
+    expires_known = bool(expires_ms and expires_ms > time.time() * 1000)
+
     return LoginState(
         logged_in=bool(logged_in),
-        nickname=_first_str(src, ("nickname", "userName", "nick_name", "name")),
+        nickname=_first_str(src, ("nickname", "userName", "nick_name", "name"))
+        or _first_str(data, ("nickname",)),
         user_id=_first_str(src, ("userId", "user_id", "id")) or _first_str(data, ("user_id", "userId")),
-        vip_type=_first_int(src, ("vipType", "vip_type")) or _first_int(account, ("vipType",)),
-        vip_expires_ms=_first_int(src, ("vipExpiryTime", "vip_expire", "vipExpires"))
-        or _first_int(account, ("vipExpiryTime",)),
+        vip_type=_first_int(src, ("vipType", "vip_type"))
+        or _first_int(account, ("vipType", "vip_type"))
+        or _first_int(data, ("vip_type",)),
+        vip_expires_ms=expires_ms if expires_known else 0,
+        vip_expires_known=expires_known,
         checked_at=time.time(),
+        probed_via=via,
     )
 
 
 async def fetch_state(client: httpx.AsyncClient | None, *, force: bool = False) -> LoginState:
-    """带 TTL 缓存地读取登录态。client 为 None 或探测失败时保留旧值并标记 error。"""
+    """带 TTL 缓存地读取登录态。
+
+    探测顺序：``/api/v1/auth/detail``（进程内 NEMbox，含 VIP 字段）
+    → ``/api/v1/auth/status``（CLI，字段少，兜底）。
+    只探后者的话，VIP 状态恒为"非 VIP"——那是 v2.1.2 之前的实际故障。
+    """
     global _STATE
 
     now = time.time()
@@ -183,18 +213,38 @@ async def fetch_state(client: httpx.AsyncClient | None, *, force: bool = False) 
             return _STATE
 
         if client is None:
-            _STATE = LoginState(error="no_client")
+            _STATE = LoginState(checked_at=now, error="no_client")
             return _STATE
 
-        try:
-            r = await client.get("/api/v1/auth/status", timeout=STATUS_TIMEOUT_S)
+        last_error = ""
+        for path, via in (("/api/v1/auth/detail", "auth/detail"),
+                          ("/api/v1/auth/status", "auth/status")):
+            try:
+                r = await client.get(path, timeout=STATUS_TIMEOUT_S)
+            except Exception as exc:
+                last_error = "unreachable"
+                logger.warning("netease %s probe failed: %s", via, exc)
+                continue
             if r.status_code != 200:
-                _STATE = LoginState(error=f"http_{r.status_code}", checked_at=now)
+                last_error = f"http_{r.status_code}"
+                logger.info("netease %s probe returned %s", via, r.status_code)
+                continue
+            try:
+                state = parse_status_payload(r.json(), via=via)
+            except Exception as exc:
+                last_error = "bad_json"
+                logger.warning("netease %s payload unparsable: %s", via, exc)
+                continue
+            if state.logged_in or via == "auth/status":
+                _STATE = state
                 return _STATE
-            _STATE = parse_status_payload(r.json())
-        except Exception as exc:
-            logger.warning("netease auth status probe failed: %s", exc)
-            _STATE = LoginState(error="unreachable", checked_at=now)
+            # detail 说未登录时也接受它（字段更全），但记下来以便兜底端点复核
+            _STATE = state
+            last_error = ""
+            return _STATE
+
+        _STATE = LoginState(checked_at=now, error=last_error or "unreachable",
+                            probed_via="failed")
         return _STATE
 
 

@@ -110,6 +110,8 @@ write_env_file() {
         echo "FNMUSIC_LATE_PAGE_WAIT_S=$(dq "5.0")"
         echo "FNMUSIC_SEARCH_TIMEOUT=$(dq "15")"
         echo "FNMUSIC_SEARCH_CACHE_TTL=$(dq "604800")"
+        echo "FNMUSIC_SEARCH_EMPTY_TTL=$(dq "60")"
+        echo "FNMUSIC_LOGIN_CACHE_TTL=$(dq "300")"
         echo "FNMUSIC_MUSICBOX_BIND=$(dq "${WIZ_BIND}")"
         echo "# --- 登录态与降级 ---"
         echo "FNMUSIC_FREE_ONLY_ON_LOGOUT=$(dq "$(norm_bool "${WIZ_FREE_ONLY}")")"

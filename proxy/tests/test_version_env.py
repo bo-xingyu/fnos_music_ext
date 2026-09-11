@@ -258,6 +258,25 @@ def test_ensure_prefix_defaults_preserves_existing_values():
     assert m["FNMUSIC_DAILY_LIMIT"] == "5"
 
 
+def test_every_new_default_matches_a_prefix():
+    """不变量：NEW_DEFAULTS 里的每个键都必须能被 NEW_PREFIXES 匹配，
+    否则升级时它永远不会被补齐——这个坑已经踩过一次（FNMUSIC_SEARCH_EMPTY_TTL）。"""
+    missing = [
+        k for k, _ in env_merge.NEW_DEFAULTS
+        if not any(k.startswith(pfx) for pfx in env_merge.NEW_PREFIXES)
+    ]
+    assert not missing, f"以下新键没有对应前缀，升级时不会被补齐：{missing}"
+
+
+def test_new_defaults_are_actually_backfilled():
+    """端到端确认：从一个只有 HOME 的 .env 出发，所有新键都会被补齐。"""
+    kv, added = env_merge.ensure_prefix_defaults([("FNMUSIC_HOME", "/x")])
+    got = dict(kv)
+    for key, val in env_merge.NEW_DEFAULTS:
+        assert got.get(key) == val, f"{key} 未被补齐（期望 {val!r}，实际 {got.get(key)!r}）"
+    assert len(added) == len(env_merge.NEW_DEFAULTS)
+
+
 def test_ensure_prefix_defaults_does_not_invent_unrelated_keys():
     """只补 NEW_DEFAULTS 里、且前缀匹配的键。"""
     kv, added = env_merge.ensure_prefix_defaults(

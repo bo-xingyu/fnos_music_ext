@@ -93,6 +93,10 @@ CONF = {
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": _float("FNMUSIC_SEARCH_TIMEOUT", 15),
     "search_cache_ttl": _float("FNMUSIC_SEARCH_CACHE_TTL", 604800),
+    # 空结果只用很短的 TTL。上游一次抖动/过滤全灭就会把 items=[] 写进缓存，
+    # 若沿用 7 天 TTL，该关键词在整个周期内都只会返回本地结果——即使上游早已恢复。
+    # 这条曾让"搜不到任何网易云歌曲"在修好根因后依然持续存在。
+    "search_empty_ttl": _float("FNMUSIC_SEARCH_EMPTY_TTL", 60),
     "late_page_wait_s": _float("FNMUSIC_LATE_PAGE_WAIT_S", 5.0),
     "daily_enabled": _flag("FNMUSIC_DAILY_ENABLED", "true"),
     "daily_limit": _int("FNMUSIC_DAILY_LIMIT", dailyrec.PLAYLIST_SIZE),
@@ -1455,12 +1459,46 @@ async def search_track(request: Request):
         url_path = f"{url_path}?{request.url.query}"
     headers = copy_incoming_headers(request)
 
+    # 在线搜索与上游请求【并发】发起：网易云这一路本身要几秒（服务端要批量校验
+    # 真实直链），串行排在 upstream 之后等于把这段时间白等掉，
+    # 常常因此撞上首屏预算而只返回本地结果。
+    online_allowed = await _online_search_allowed(musicbox_client) if keyword else False
+
+    now = time.time()
+    cached_entry = _SEARCH_CACHE.get(keyword) if keyword else None
+    cache_ttl = CONF["search_cache_ttl"]
+    if cached_entry is not None and not (cached_entry.get("items") or []):
+        # 空结果按短 TTL 处理，让上游恢复后能自动自愈
+        cache_ttl = min(cache_ttl, CONF["search_empty_ttl"])
+    is_valid_cache = cached_entry is not None and (now - cached_entry.get("ts", 0) < cache_ttl)
+
+    entry: dict[str, Any] | None = None
+    search_task: asyncio.Task | None = None
+    agg_task: asyncio.Task | None = None
+    online_all: list[dict] = []
+
+    if keyword and online_allowed and not is_valid_cache:
+        entry = {"items": [], "ts": time.time(), "task": None}
+        search_task = asyncio.create_task(
+            fetch_netease_search(musicbox_client, keyword, CONF["netease_search_limit"])
+        )
+        agg_task = asyncio.create_task(_collect_search(entry, search_task))
+        entry["task"] = agg_task
+        _set_search_cache(keyword, entry)
+
+    def _drop_pending() -> None:
+        """上游失败时别把在线搜索任务留在事件循环里空跑。"""
+        for t in (agg_task, search_task):
+            if t is not None and not t.done():
+                t.cancel()
+
     req = upstream_client.build_request("GET", url_path, headers=headers)
     upstream_resp = await upstream_client.send(req)
 
     resp_headers = filter_headers(upstream_resp.headers, exclude_keys={"content-length", "content-encoding"})
 
     if upstream_resp.status_code != 200:
+        _drop_pending()
         return Response(
             content=upstream_resp.content,
             status_code=upstream_resp.status_code,
@@ -1471,6 +1509,7 @@ async def search_track(request: Request):
     try:
         upstream_json = upstream_resp.json()
     except Exception:
+        _drop_pending()
         return Response(
             content=upstream_resp.content,
             status_code=upstream_resp.status_code,
@@ -1479,16 +1518,12 @@ async def search_track(request: Request):
         )
 
     if not isinstance(upstream_json, dict) or upstream_json.get("code") != 0:
+        _drop_pending()
         return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
     if not keyword:
+        _drop_pending()
         return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
-
-    online_allowed = await _online_search_allowed(musicbox_client)
-
-    now = time.time()
-    cached_entry = _SEARCH_CACHE.get(keyword)
-    is_valid_cache = cached_entry is not None and (now - cached_entry.get("ts", 0) < CONF["search_cache_ttl"])
 
     if is_valid_cache and cached_entry is not None:
         task = cached_entry.get("task")
@@ -1498,18 +1533,7 @@ async def search_track(request: Request):
             except Exception:
                 pass
         online_all = cached_entry.get("items", []) if online_allowed else []
-    else:
-        entry: dict[str, Any] = {"items": [], "ts": time.time(), "task": None}
-        search_task: asyncio.Task | None = None
-        if online_allowed:
-            search_task = asyncio.create_task(
-                fetch_netease_search(musicbox_client, keyword, CONF["netease_search_limit"])
-            )
-
-        agg_task = asyncio.create_task(_collect_search(entry, search_task))
-        entry["task"] = agg_task
-        _set_search_cache(keyword, entry)
-
+    elif entry is not None:
         if search_task is not None:
             if page == 1:
                 # 阶段一：首屏等待预算（默认 3s）
@@ -1571,6 +1595,14 @@ async def _collect_search(entry: dict, task: "asyncio.Task | None") -> None:
         except Exception as exc:
             logger.warning("netease search bg failed: %s", exc)
     entry["items"] = deduplicate_online_items(res if isinstance(res, list) else [])
+    # 以"聚合完成"为缓存起点：空结果的短 TTL 窗口从此刻开始计时，
+    # 而不是从发起请求那一刻（否则慢搜索会吃掉大部分自愈窗口）
+    entry["ts"] = time.time()
+    if not entry["items"]:
+        logger.info(
+            "online search returned no playable tracks; 该关键词按短 TTL(%ss) 缓存以便自愈",
+            CONF.get("search_empty_ttl", 60),
+        )
 
 
 @app.get("/music/api/v1/search/suggest")

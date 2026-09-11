@@ -9,7 +9,16 @@ from __future__ import annotations
 from typing import Any
 
 SOURCE_NAME = "netease"
-LOSSLESS_QUALITY_MARKERS = ("SQ", "HR", "无损")
+
+# 无损判定词汇。必须同时覆盖两套来源：
+#  - NEMbox CLI / Parse.song_url 的真实输出："LOSSLESS FLAC"、"HIRES FLAC"、
+#    "JYMASTER FLAC"、"EXHIGH FLAC"、"HD 320k"、"LD 128k"
+#  - 早期测试与部分上游版本用的缩写："SQ"、"HR"、"无损"
+# 只认 SQ/HR 的话，线上真实数据永远是 mp3，用户拿不到无损格式声明。
+LOSSLESS_QUALITY_MARKERS = (
+    "SQ", "HR", "无损",
+    "LOSSLESS", "HIRES", "JYMASTER", "FLAC",
+)
 
 
 def _to_float(value: Any) -> float:
@@ -24,7 +33,14 @@ def song_id_of(raw: dict) -> str:
 
 
 def has_lossless(raw: dict) -> bool:
+    """判断该曲目是否无损/Hi-Res。
+
+    注意 999000+ 的码率上游会直接标成 "LOSSLESS"（无 FLAC 字样），
+    纯靠子串匹配即可覆盖；"HD 320k"、"LD 128k" 属于有损，不会被误判。
+    """
     quality = str(raw.get("quality") or "").upper()
+    if not quality:
+        return False
     return any(marker in quality for marker in LOSSLESS_QUALITY_MARKERS)
 
 

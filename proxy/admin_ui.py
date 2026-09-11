@@ -596,23 +596,60 @@ async def _probe_proxy_health() -> dict:
 
 
 async def _probe_musicbox(path: str = "/healthz", timeout: float = 4.0) -> dict:
-    """探测音源服务，把失败原因如实带回来（页面要显示得出来才排得了障）。
+    """探测音源服务的某个路径，把失败原因与响应体一起如实带回来。
 
     detail 会原样回显给浏览器，因此一律先过 _scrub() 脱敏：异常文本可能带上
     请求 URL 或上游返回内容，那里面理论上可能混进凭据。
+
+    成功时顺带返回已解析的 ``body``，调用方直接复用，**不要再为拿 body 重复请求一次**
+    ——CLI 支撑的端点在无外网环境下光 DNS 超时就能耗掉数秒，重复探测会把诊断页拖死。
     """
     t0 = time.time()
     try:
         r = await mb_client().get(path, timeout=timeout)
         ms = int((time.time() - t0) * 1000)
         if r.status_code == 200:
-            return {"reachable": True, "status": 200, "ms": ms}
+            body: Any = None
+            try:
+                body = r.json()
+            except Exception:  # noqa: BLE001
+                body = None
+            return {"reachable": True, "status": 200, "ms": ms, "body": body}
         return {"reachable": True, "status": r.status_code, "ms": ms,
                 "detail": _scrub(r.text[:200])}
     except Exception as exc:  # noqa: BLE001
         ms = int((time.time() - t0) * 1000)
         return {"reachable": False, "status": 0, "ms": ms,
                 "detail": _scrub(f"{type(exc).__name__}: {exc}"[:200])}
+
+
+def _selftest_data(probe: dict) -> dict:
+    """从 selftest 探测结果里取出 data 段；取不到就是空 dict。"""
+    body = probe.get("body") if isinstance(probe, dict) else None
+    if isinstance(body, dict) and isinstance(body.get("data"), dict):
+        return body["data"]
+    return {}
+
+
+async def _probe_musicbox_all() -> dict:
+    """并发探测音源服务的四个端点。
+
+    串行探测会把各端点的超时累加（CLI 支撑的端点尤其慢，无外网时更明显），
+    诊断页因此可能卡十几秒。并发后只受最慢那一个的超时约束。
+    """
+    down = {"reachable": False, "status": 0, "ms": 0, "detail": "probe error"}
+    results = await asyncio.gather(
+        _probe_musicbox("/healthz"),
+        _probe_musicbox("/api/v1/auth/status"),
+        _probe_musicbox("/api/v1/auth/detail"),
+        _probe_musicbox("/api/v1/selftest", timeout=10.0),
+        return_exceptions=True,
+    )
+    keys = ("healthz", "auth_status", "auth_detail", "selftest")
+    return {
+        k: (down if isinstance(v, Exception) else v)
+        for k, v in zip(keys, results)
+    }
 
 
 @app.get("/api/diag")
@@ -658,19 +695,12 @@ async def api_diag(request: Request):
     else:
         env_stat = {"exists": False}
 
-    mb = await _probe_musicbox("/healthz")
-    mb_auth = await _probe_musicbox("/api/v1/auth/detail")
-    mb_auth_status = await _probe_musicbox("/api/v1/auth/status")
-    mb_selftest = await _probe_musicbox("/api/v1/selftest")
-    selftest_data: dict = {}
-    if mb_selftest.get("reachable") and mb_selftest.get("status") == 200:
-        try:
-            r = await mb_client().get("/api/v1/selftest", timeout=10.0)
-            payload = r.json()
-            if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-                selftest_data = payload["data"]
-        except Exception:  # noqa: BLE001
-            selftest_data = {}
+    probes = await _probe_musicbox_all()
+    mb = probes["healthz"]
+    mb_auth = probes["auth_detail"]
+    mb_auth_status = probes["auth_status"]
+    mb_selftest = probes["selftest"]
+    selftest_data = _selftest_data(mb_selftest)
     login = await netease_auth.fetch_state(mb_client(), force=True)
 
     proxy_socket = {
@@ -756,7 +786,8 @@ async def api_health(request: Request):
             f"官方后端不可达（upstream={proxy_health.get('upstream', '?')}）。"
             f"请确认飞牛音乐已启动，socket={PROXY_SOCK}"
         )
-    mb_health = await _probe_musicbox("/healthz")
+    probes = await _probe_musicbox_all()
+    mb_health = probes["healthz"]
     if not mb_health.get("reachable"):
         problems.append(
             f"音源服务不可达（{MUSICBOX_URL}）：{mb_health.get('detail') or '连接失败'}"
@@ -774,11 +805,11 @@ async def api_health(request: Request):
             problems.append("网易云未登录：当前只能播放免费曲目，且不会有「每日推荐」")
         else:
             problems.append("网易云未登录且已关闭免费曲降级：在线播放完全不可用")
-    mb_detail = await _probe_musicbox("/api/v1/auth/detail")
-    # /api/v1/auth/status 走的是 musicbox CLI 子进程，与走进程内 NEMbox API 的
-    # auth/detail 是两条不同链路。只有探这一条才能暴露「CLI 解析不到 → 全线 502」，
-    # 而 /healthz 和 auth/detail 都会返回 200，看起来一切正常。
-    mb_status_probe = await _probe_musicbox("/api/v1/auth/status")
+    mb_detail = probes["auth_detail"]
+    # /api/v1/auth/status 走 musicbox CLI 子进程，与走进程内 NEMbox API 的 auth/detail
+    # 是两条不同链路。只有同时探这两条才能暴露「CLI 解析不到 → 全线 502」，
+    # 因为 /healthz 与 auth/detail 都会返回 200，看起来一切正常。
+    mb_status_probe = probes["auth_status"]
     if mb_status_probe.get("status") == 502:
         problems.append(
             "音源服务的 musicbox CLI 子进程调用失败（502）。这会让搜索/取直链/扫码登录全部不可用，"
@@ -790,16 +821,8 @@ async def api_health(request: Request):
     if login.error and login.error not in ("", "invalidated"):
         problems.append(f"网易云登录态探测异常：{login.error}")
 
-    selftest = await _probe_musicbox("/api/v1/selftest")
-    st_data: dict = {}
-    if selftest.get("reachable") and selftest.get("status") == 200:
-        try:
-            body = await mb_client().get("/api/v1/selftest", timeout=8.0)
-            payload = body.json()
-            if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-                st_data = payload["data"]
-        except Exception:  # noqa: BLE001
-            st_data = {}
+    selftest = probes["selftest"]
+    st_data = _selftest_data(selftest)
     if st_data and st_data.get("cli_found") is False:
         problems.append(
             "自检确认：musicbox CLI 未找到（"
@@ -1462,9 +1485,14 @@ function renderStatus(j){
     h+=kv("官方后端", p.upstream==="ok"?pill(true,"连通"):pill(false,String(p.upstream||"未知")));
     h+=kv("音源服务", p.musicbox==="ok"?pill(true,"运行中"):(p.musicbox==="disabled"?pill(true,"已停用"):pill(false,String(p.musicbox||"未知"))+(mbp.detail?" · "+esc(String(mbp.detail)).slice(0,60):"")));
     if(n.logged_in){
-      var v=n.vip?'<span class="pill ok">VIP</span> ':'<span class="pill warn">非 VIP</span> ';
+      var v=n.vip?'<span class="pill ok">VIP</span> '
+        :'<span class="pill warn">非 VIP'+(n.vip_type?(" (vipType="+n.vip_type+")"):"")+'</span> ';
       h+=kv("网易云", pill(true,"已登录")+" "+v+esc(n.nickname||""));
-      h+=kv("VIP 剩余", n.vip_days_left==null?"—":n.vip_days_left+" 天");
+      // 天数未知时必须如实说"上游未提供"，不能显示成 0 天或空破折号
+      var vipd = n.vip_days_left==null
+        ? (n.vip ? '<span class="pill warn">上游未提供到期时间</span>' : "—")
+        : (n.vip_days_left+" 天");
+      h+=kv("VIP 剩余", vipd);
     }else{
       h+=kv("网易云", pill(false,"未登录")+(n.free_only?' <span class="pill warn">免费曲降级</span>':""));
     }

@@ -1,5 +1,5 @@
 appname               = fnmusicext
-version               = 2.1.2
+version               = 2.1.3
 display_name          = 飞牛音乐扩展（网易云）
 desc                  = 为飞牛音乐（trim.music）提供网易云在线音源扩展：在官方 App 搜索框内直接搜播网易云曲库，补齐 LRC 歌词与高清封面，边播边存无感离线，多用户隔离红心收藏，并注入网易云官方「每日推荐」歌单。<br/><br/>安装后飞牛桌面会出现「飞牛音乐扩展」图标，打开即可在网页里扫码登录网易云、配置全部选项、查看运行日志，全程无需 SSH。<br/><br/>采用无侵入 Unix Domain Socket 接管，完全不修改飞牛官方程序、nginx 配置与数据库。在线音源只使用你扫码登录的那一个私人网易云账号的权益；未登录时自动降级为只播免费曲目，并可通过 PushPlus 推送登录失效与 VIP 临期提醒。
 source                = thirdparty
@@ -18,7 +18,7 @@ ctl_stop              = true
 checkport             = false
 disable_authorization_path = true
 
-changelog             = v2.1.2（重要修复）：修复 venv 形态下 musicbox CLI 解析不到、导致搜索/取直链/扫码登录全部 502 而 /healthz 仍显示正常的严重缺陷；新增 /api/v1/selftest 与诊断面板的 CLI 自检，让这类故障一眼可见。v2.1.1：修复反代/组网下接口 404、新增一键诊断与日志 10MB/30 天自动清理。v2.1.0：新增飞牛桌面管理页面。v2.0.0：网易云单源化。
+changelog             = v2.1.3：修复用户实测反馈的三个问题。① 搜不到在线歌曲 + 每日推荐歌单不出现——上游 NEMbox dig_info 在任意一首取不到直链时会把整个结果集清空（HTTP 仍 200），改为进程内逐首过滤；并修复空结果被缓存 7 天导致故障无法自愈。② 明明是 VIP 却显示非 VIP——登录态探的是 CLI 的 auth/status（无 VIP 字段），改为优先探 auth/detail；剩余天数改为如实显示上游未提供（NEMbox 无此接口，不编造）。③ PushPlus 已配 token 却显示未启用——只读了进程环境变量，改为可读 .env 且改完免重启。另修：无损判定只认 SQ/HR 而认不出真实的 LOSSLESS FLAC（线上从未判出过无损）；登录态每次过滤都打一次网易云接口（加 TTL 缓存）；搜索的在线请求由串行改为与上游并发。v2.1.2：修复 venv 下 musicbox CLI 解析不到导致音源全线 502。v2.1.1：修复反代/组网下接口 404、日志自动清理。v2.1.0：飞牛桌面管理页面。v2.0.0：网易云单源化。
 
 desktop_uidir         = ui
 desktop_applaunchname = fnmusicext.main

@@ -3,6 +3,118 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.1.3] - 2026-09-11
+
+修复 2.1.2 装机后实测反馈的三个问题（VIP 状态、推送状态、搜不到歌与日推不出现）。
+三者互相独立，根因各不相同。
+
+### 修复
+
+用户在真机上装完 2.1.2 后反馈了四个现象。其中「扫码登录 502」已在 2.1.2 修复
+（见下文），本次修掉剩下的三个——它们根因各不相同，且都比表面现象深一层。
+
+#### 现象 3／4：飞牛里搜不到任何网易云在线歌曲；「每日推荐」歌单根本不出现
+
+同一个根因，在上游 `NEMbox/api.py` 的 `dig_info()`：
+
+```python
+for s in sds:
+    url_index = url_id_index.get(s["id"])
+    if url_index is None:
+        log.error("can't get song url, id: %s", s["id"])
+        return []          # ★ 只要有一首取不到直链，整个列表返回空
+```
+
+上游注释自己都写了「可能因网络波动，返回空值」。而 `musicbox search` 与
+`musicbox recommend songs` 两个 CLI 子命令都要经过 `dig_info`，于是**任何一首坏数据
+就会把整个搜索结果 / 整份日推清空**，HTTP 仍是 200，看起来一切正常。
+
+- `/api/v1/search?type=song` 与 `/api/v1/recommend/daily` 改为走**进程内实现**
+  （新增 `netease_ext.search_songs()` / `daily_songs()`），**逐首**判定可播性：
+  坏数据只影响它自己那一首。进程内异常或返回空时才回退 CLI，并在响应里用
+  `engine` 字段如实标注 `in-process` / `cli-fallback`。
+- `/api/v1/recommend/daily` 先判登录再抓取，未登录一律返回 `not_logged_in`，
+  绝不把上游那份与账号画像无关的热门填充当作日推。
+
+#### 现象 3 的第二层：空结果被缓存了 7 天
+
+修好上面还不够。用户日志里 `逆战` 那次搜索**没有任何 httpx 调用记录**，说明命中了
+搜索缓存——早先一次 `dig_info` 返空时，`items: []` 被以 `FNMUSIC_SEARCH_CACHE_TTL`
+（默认 7 天）写进了缓存，此后该关键词怎么搜都是纯本地结果，**即便上游早已恢复**。
+
+- 新增 `FNMUSIC_SEARCH_EMPTY_TTL`（默认 60s）：空结果改用短 TTL，让故障自愈。
+  有效性判定按「结果是否为空」选择 TTL；聚合完成时刷新 `ts`，
+  使自愈窗口从"确认为空"那一刻起算，而不是被慢搜索吃掉。
+- 结果为空时打 INFO 日志说明按短 TTL 缓存，便于排查。
+
+#### 现象 1：明明是 VIP 却显示「非 VIP」，且没有剩余天数
+
+`netease_auth.fetch_state()` 探的是 `/api/v1/auth/status`——它走 musicbox CLI，
+返回体只有 `logged_in / nickname / user_id`，**根本没有 VIP 字段**。
+而我为 VIP 信息专门加的 `/api/v1/auth/detail` 从来没被登录态模块调用过
+（只有诊断页在单独调它，所以日志里能看到 `vip_type=110`，页面却显示非 VIP）。
+
+- 探测顺序改为 `/api/v1/auth/detail`（进程内 NEMbox，字段全）优先，
+  `/api/v1/auth/status`（CLI）兜底；旧版音源服务没有 detail 时自动回落，不误报未登录。
+- `LoginState` 新增 `vip_expires_known` 与 `probed_via`，`to_public_dict()` 增补
+  `vip_type` / `vip_expires_known`。
+- **剩余天数如实显示「上游未提供」**：NEMbox 0.5.3 没有任何返回 VIP 到期时间的接口
+  （`get_account_info` 只有 `vipType`）。这里对若干候选字段名做尽力探测、并在拿不到时
+  试一次 `/weapi/v1/user/detail/{uid}`，仍然拿不到就标记未知；
+  页面显示「上游未提供到期时间」而不是「剩余 0 天」或一个编造的日期。
+  时间戳只在"确实是未来的毫秒值"时才被采信。
+
+#### 现象 2：PushPlus 已配置 token，页面却显示「已关闭」
+
+`pushplus.enabled()` 只读 `os.environ`。代理进程由 `run_proxy.sh` 用 `set -a; . .env`
+启动，所以它有；但**管理页面进程**的启动命令只显式传了一组必要变量
+（刻意不把 token 塞进进程环境，免得它出现在 `/proc/<pid>/environ` 里），
+于是 `os.environ` 里没有 token → 显示未启用，页面内触发的「登录成功」推送也发不出去
+（日志里 `.env` 显示 token 已配置、长度 32，`send_enabled` 却是 false）。
+
+- `pushplus` 支持从 `.env` **文件**读取：`os.environ` 优先（含显式设置的空值与 false），
+  缺失才回落到文件；文件按 `(路径, mtime, size)` 缓存，**改完配置无需重启即生效**。
+- 文件路径解析顺序：`FNMUSIC_PUSHPLUS_ENV_FILE` → `FNMUSIC_ADMIN_ENV_FILE` →
+  `$FNMUSIC_HOME/.env`。
+- `env_merge` 不可用时退到内置的极简 dotenv 解析，不让一个可选依赖拖垮推送能力。
+
+#### 顺带修掉的同类缺陷
+
+- `netease_items.has_lossless()` 只认 `SQ` / `HR` / `无损`，而 NEMbox 真实产出的是
+  `LOSSLESS FLAC` / `HIRES FLAC` / `JYMASTER FLAC` / `EXHIGH FLAC`——
+  也就是说**线上从来没判出过无损**，所有曲目格式声明都被压成 mp3。
+  现补齐上游真实词汇，并保留旧缩写；新增一条「上游音质串 → 代理层无损判定」的
+  契约测试，防止两套词汇再次漂移。
+- `netease_ext.check_is_logged_in()` 每次可播性过滤都要向网易云发一次
+  `/weapi/nuser/account/get`（搜索与日推每轮都调）。现加 TTL 缓存
+  （`FNMUSIC_LOGIN_CACHE_TTL`，默认 300s），并在扫码登录成功（CLI 退出码 803）时
+  主动作废，避免登录完还被当成未登录而过滤掉 VIP 曲目。
+  探测**异常**时不写入缓存，防止一次网络抖动让账号在整个 TTL 内被误判为未登录。
+- 搜索的在线音源请求原先串行排在 upstream 请求之后，现改为**并发发起**；
+  上游返回非 200 / code≠0 时取消在线搜索任务，不留空跑协程。
+
+### 测试
+
+- 新增 `runner` 解析回归测试：构造真实 `<venv>/bin/{python,musicbox}` 布局并把 PATH
+  刻意设为不含它，断言仍能解析并真实执行；另覆盖 `which` 回退、模块回退、
+  结果缓存、子进程 PATH 注入、代理变量剥离、候选路径去重与 `Scripts/` 兼容。
+  **此前的测试全部 mock 掉 `runner.run_musicbox`，恰好绕过了这段解析逻辑**，
+  这是该缺陷能长期存活的直接原因，现已补上真实可执行文件的测试。
+- 新增 admin UI 用例：`healthz 200 + auth/status 502` 必须被提升为 problem 且点明影响面、
+  必须同时探两条链路才看得出分歧、diag 必须带 selftest 明细、
+  旧版音源服务无 selftest 时不能 500、`login_error` 必须进入 problems。
+- 新增 `netease_ext` 逐首过滤测试：一首无直链 + 一首试听片段混在好歌里时，
+  只剔除两首坏的、绝不整体清空（直接对应上游 `dig_info` 的全或无缺陷）；
+  未登录只留免费曲、已登录保留 VIP 曲、畸形行不崩、登录态 TTL 缓存只打一次上游、
+  登录后作废缓存、探测异常不污染缓存、音质词汇与代理层无损判定的契约测试。
+- 新增 pushplus 配置文件读取测试：仅存于 `.env` 的 token 必须被识别为已启用、
+  进程环境优先于文件、按 mtime 失效（改配置免重启）。
+- 新增 env_merge 不变量测试：`NEW_DEFAULTS` 里每个键都必须能被 `NEW_PREFIXES` 匹配，
+  否则升级时不会被补齐——`FNMUSIC_SEARCH_EMPTY_TTL` 已经漏过一次。
+- `462 passed / 1 skipped`。
+
+---
+
 ## [2.1.2] - 2026-09-11
 
 修复一个会让**整个在线音源瘫痪**、但健康检查看起来一切正常的严重缺陷。这是 v1.x 就存在的
@@ -66,17 +178,6 @@ PATH 上），而 fpk 与 host 模式恒走 venv，100% 命中。
     之前这条 502 只躺在 `netease_error` 字段里，没人会去看。
   - 对没有 selftest 端点的旧版音源服务保持兼容，不会因此 500。
 
-### 测试
-
-- 新增 `runner` 解析回归测试：构造真实 `<venv>/bin/{python,musicbox}` 布局并把 PATH
-  刻意设为不含它，断言仍能解析并真实执行；另覆盖 `which` 回退、模块回退、
-  结果缓存、子进程 PATH 注入、代理变量剥离、候选路径去重与 `Scripts/` 兼容。
-  **此前的测试全部 mock 掉 `runner.run_musicbox`，恰好绕过了这段解析逻辑**，
-  这是该缺陷能长期存活的直接原因，现已补上真实可执行文件的测试。
-- 新增 admin UI 用例：`healthz 200 + auth/status 502` 必须被提升为 problem 且点明影响面、
-  必须同时探两条链路才看得出分歧、diag 必须带 selftest 明细、
-  旧版音源服务无 selftest 时不能 500、`login_error` 必须进入 problems。
-- `437 passed / 1 skipped`（新增 `test_musicbox_service.py` 13 例、`test_admin_ui.py` 5 例）。
 
 ## [2.1.1] - 2026-09-11
 

@@ -63,29 +63,126 @@ _LOCK = asyncio.Lock()
 _SENT: dict[str, float] = {}
 _LAST_SEND_TS = 0.0
 
+# --- 配置来源 ---------------------------------------------------------------
+#
+# 代理进程由 run_proxy.sh 启动，会 `set -a; . .env`，所以这些键就在 os.environ 里。
+# 但**管理页面进程**的启动命令只显式传了一组必要变量（刻意不把 token 塞进进程环境，
+# 免得它出现在 /proc/<pid>/environ 里），于是 os.environ 里没有 token ——
+# 结果页面把"已配置 token"显示成"未启用"，页面内触发的登录成功推送也发不出去。
+#
+# 因此这里支持从 .env 文件读取：os.environ 优先（有则用，包括显式的空值/false），
+# 缺失时回落到文件。文件按 (路径, mtime, size) 缓存，改完配置无需重启即生效。
+_ENV_FILE_CACHE: tuple[str, float, int, dict[str, str]] = ("", 0.0, -1, {})
+
+
+def _dotenv_path() -> str:
+    for key in ("FNMUSIC_PUSHPLUS_ENV_FILE", "FNMUSIC_ADMIN_ENV_FILE"):
+        v = (os.environ.get(key) or "").strip()
+        if v:
+            return v
+    home = (os.environ.get("FNMUSIC_HOME") or "").strip()
+    if home:
+        return os.path.join(home, ".env")
+    return ""
+
+
+def _dotenv_values() -> dict[str, str]:
+    global _ENV_FILE_CACHE
+    path = _dotenv_path()
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        st = os.stat(path)
+        stamp = (path, st.st_mtime, st.st_size)
+    except OSError:
+        return {}
+    if _ENV_FILE_CACHE[0:3] == stamp:
+        return _ENV_FILE_CACHE[3]
+
+    values: dict[str, str] = {}
+    try:
+        from . import env_merge  # type: ignore
+
+        kv, _other = env_merge.parse_env_file(path)
+        values = dict(kv)
+    except ImportError:
+        try:
+            import env_merge  # type: ignore
+
+            kv, _other = env_merge.parse_env_file(path)
+            values = dict(kv)
+        except Exception:  # noqa: BLE001
+            values = _parse_dotenv_minimal(path)
+    except Exception:  # noqa: BLE001
+        values = _parse_dotenv_minimal(path)
+
+    _ENV_FILE_CACHE = (*stamp, values)
+    return values
+
+
+_DOTENV_RE: "re.Pattern[str] | None" = None
+
+
+def _parse_dotenv_minimal(path: str) -> dict[str, str]:
+    """env_merge 不可用时的兜底解析（pushplus 不该因为一个可选依赖而失效）。"""
+    global _DOTENV_RE
+    if _DOTENV_RE is None:
+        import re
+
+        _DOTENV_RE = re.compile(
+            r"""^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$"""
+        )
+    out: dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                m = _DOTENV_RE.match(line)
+                if not m:
+                    continue
+                v = m.group(2).strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1].replace("'\\''", "'")
+                out[m.group(1)] = v
+    except OSError:
+        return {}
+    return out
+
+
+def reset_config_cache() -> None:
+    """测试钩子 / 配置改写后强制重读。"""
+    global _ENV_FILE_CACHE
+    _ENV_FILE_CACHE = ("", 0.0, -1, {})
+
+
+def _conf(key: str, default: str = "") -> str:
+    """os.environ 优先（含显式空值），缺失才回落到 .env 文件。"""
+    if key in os.environ:
+        return os.environ[key]
+    return str(_dotenv_values().get(key, default))
+
 
 def token() -> str:
-    return (os.environ.get("FNMUSIC_PUSHPLUS_TOKEN") or "").strip()
+    return _conf("FNMUSIC_PUSHPLUS_TOKEN").strip()
 
 
 def enabled() -> bool:
-    flag = (os.environ.get("FNMUSIC_PUSHPLUS_ENABLED") or "true").strip().lower()
+    flag = (_conf("FNMUSIC_PUSHPLUS_ENABLED", "true") or "true").strip().lower()
     if flag not in ("true", "1", "yes", "on"):
         return False
     return bool(token())
 
 
 def push_url() -> str:
-    return (os.environ.get("FNMUSIC_PUSHPLUS_URL") or DEFAULT_URL).strip() or DEFAULT_URL
+    return (_conf("FNMUSIC_PUSHPLUS_URL", DEFAULT_URL).strip() or DEFAULT_URL).strip()
 
 
 def template() -> str:
-    tpl = (os.environ.get("FNMUSIC_PUSHPLUS_TEMPLATE") or DEFAULT_TEMPLATE).strip().lower()
+    tpl = _conf("FNMUSIC_PUSHPLUS_TEMPLATE", DEFAULT_TEMPLATE).strip().lower()
     return tpl or DEFAULT_TEMPLATE
 
 
 def topic() -> str:
-    return (os.environ.get("FNMUSIC_PUSHPLUS_TOPIC") or "").strip()
+    return _conf("FNMUSIC_PUSHPLUS_TOPIC").strip()
 
 
 def _fingerprint(title: str, content: str) -> str:
