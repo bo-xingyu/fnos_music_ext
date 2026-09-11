@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import sys
+import threading
+from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import quote
 
@@ -47,7 +49,19 @@ class UpstreamException(Exception):
         self.stderr = (stderr or "")[:2000]
 
 
-app = FastAPI(title="fnmusic-musicbox", version="1.0.0")
+@asynccontextmanager
+async def _lifespan(_app: "FastAPI"):
+    """服务生命周期：启动时预热 CLI。
+
+    放在 lifespan 而不是模块级调用——否则**导入本模块**（例如跑单元测试）就会
+    spawn ``musicbox --version`` 子进程，既拖慢测试又会污染进程内的探测缓存。
+    预热只付一次冷启动代价（实测 47s），且在后台线程里跑，不阻塞服务就绪。
+    """
+    _warm_cli_probe_in_background()
+    yield
+
+
+app = FastAPI(title="fnmusic-musicbox", version="1.0.0", lifespan=_lifespan)
 
 
 @app.exception_handler(RequestValidationError)
@@ -119,6 +133,118 @@ def healthz():
     return {"status": "ok", "source": "https://github.com/darknessomi/musicbox"}
 
 
+# ---------------------------------------------------------------------------
+# CLI 探测结果缓存 + 启动预热
+#
+# `musicbox` CLI 首次执行要先完成 deviceId 生成等初始化，实测**冷启动 47.37s**、
+# 稳态 1.4s。管理页面探测 /api/v1/selftest 的超时是 10s，selftest 内部又给 CLI
+# 留了 15s —— 冷启动必然双双超时，诊断页整个 CLI 区块显示 undefined / []，
+# 把用户唯一顺手可用的排障工具变成一片空白。
+#
+# 而从 2.1.6 起播放热路径不再 spawn CLI（改进程内直取），CLI 从此没有任何被
+# 顺带预热的机会，上面这个现象会从「偶发」变成「常态」。因此在启动时用后台线程
+# 把这份一次性代价提前付掉，并缓存探测结果供 selftest 立即复用。
+# ---------------------------------------------------------------------------
+
+_CLI_PROBE: dict[str, Any] | None = None
+_CLI_PROBE_LOCK = threading.Lock()
+_CLI_WARMUP_STARTED = False
+# 预热代号：每轮预热带一个自增代号，重置时代号作废。
+# 预热线程可能在很久之后（实测冷启动 47s）才回来写缓存，若期间发生过重置
+# （测试里是 fixture，生产中是重新预热），那次写入必须被丢弃，否则会写进
+# 一个已经不属于它的轮次 —— 表现为测试随机串味、生产里报告过期的探测结果。
+_CLI_PROBE_GEN = 0
+
+
+def _cli_probe_generation() -> int:
+    with _CLI_PROBE_LOCK:
+        return _CLI_PROBE_GEN
+
+
+def _cache_cli_probe(ok: bool, detail: str, gen: int | None = None) -> None:
+    global _CLI_PROBE
+    with _CLI_PROBE_LOCK:
+        if gen is not None and gen != _CLI_PROBE_GEN:
+            return                      # 已被作废的轮次，丢弃
+        if _CLI_PROBE is None:
+            _CLI_PROBE = {"ok": ok, "detail": detail}
+
+
+def reset_cli_probe_for_test() -> None:
+    """测试钩子：清空 CLI 探测缓存与预热标记，并作废在途预热线程的写入。
+
+    必须在**前后**都调用：测试里 ``TestClient(app)`` 的 startup 会拉起预热线程，
+    它可能在下一个用例执行期间才回来写缓存，只靠「用例开始时清一次」挡不住。
+    """
+    global _CLI_PROBE, _CLI_WARMUP_STARTED, _CLI_PROBE_GEN
+    with _CLI_PROBE_LOCK:
+        _CLI_PROBE = None
+        _CLI_WARMUP_STARTED = False
+        _CLI_PROBE_GEN += 1
+
+
+def probe_cli_exec(timeout_s: float = 3.0) -> tuple[bool, str]:
+    """跑一次 ``musicbox --version`` 验证 CLI 真的可执行；结果缓存后复用。
+
+    只缓存**确定性**结果（成功、或非超时类的硬失败）。超时不缓存：它多半意味着
+    CLI 还在冷启动，后台预热线程随后会拿到真实结果，届时不该被一次 3s 的
+    快速探测永久钉死成「超时」。
+    """
+    with _CLI_PROBE_LOCK:
+        if _CLI_PROBE is not None:
+            return bool(_CLI_PROBE["ok"]), str(_CLI_PROBE["detail"])
+    gen = _cli_probe_generation()
+    try:
+        code, stdout, stderr = runner.run_musicbox(["--version"], timeout=timeout_s)
+        ok = code == 0
+        detail = ((stdout or stderr or "").strip()[:200]) or f"exit={code}"
+        _cache_cli_probe(ok, detail, gen)
+        return ok, detail
+    except MusicboxTimeoutError as exc:
+        # 带上异常类型名：超时是这里最可能的故障形态，日志必须可 grep
+        return False, (
+            f"{type(exc).__name__}: CLI 冷启动 timeout，未能在 {timeout_s}s 内完成"
+            f"（首次执行需生成 deviceId，实测可达 ~47s）；后台预热中，稍后重试即可"
+        )
+    except Exception as exc:  # noqa: BLE001
+        ok, detail = False, f"{type(exc).__name__}: {exc}"[:200]
+        _cache_cli_probe(ok, detail, gen)
+        return ok, detail
+
+
+def _warm_cli_probe_in_background() -> None:
+    """启动时预热 CLI，把 47s 级的一次性代价挪到后台，不阻塞服务就绪。
+
+    进程内**幂等**：只起一个预热线程。否则每次 startup 都拉起一个跑
+    ``musicbox --version`` 的后台线程，既浪费 CPU/IO（CLI 稳态也要 1.4s），
+    又会在测试里每个 TestClient 都 spawn 一次子进程。
+    """
+    global _CLI_WARMUP_STARTED
+    with _CLI_PROBE_LOCK:
+        if _CLI_WARMUP_STARTED:
+            return
+        _CLI_WARMUP_STARTED = True
+
+    gen = _cli_probe_generation()
+
+    def _run():
+        try:
+            with _CLI_PROBE_LOCK:
+                if _CLI_PROBE is not None:
+                    return
+            # 给足冷启动余量：实测 47s，留到 120s 覆盖 NAS 上更慢的磁盘/CPU
+            code, stdout, stderr = runner.run_musicbox(["--version"], timeout=120.0)
+            ok = code == 0
+            detail = ((stdout or stderr or "").strip()[:200]) or f"exit={code}"
+            _cache_cli_probe(ok, detail, gen)
+            logger.info("CLI 预热完成 cli_exec_ok=%s detail=%s", ok, detail[:120])
+        except Exception as exc:  # noqa: BLE001 - 预热失败不影响服务本身
+            logger.warning("CLI 预热失败（不影响播放，播放已不走 CLI）: %s: %s",
+                           type(exc).__name__, exc)
+
+    threading.Thread(target=_run, name="cli-warmup", daemon=True).start()
+
+
 @app.get("/api/v1/selftest")
 def selftest():
     """自检：报告 musicbox CLI 是怎么解析到的、能不能真的跑起来。
@@ -155,14 +281,11 @@ def selftest():
         result["nembox_error"] = f"{type(exc).__name__}: {exc}"[:200]
 
     if cmd:
-        try:
-            code, stdout, stderr = runner.run_musicbox(["--version"], timeout=15.0)
-            result["cli_exec_ok"] = code == 0
-            result["cli_exec_detail"] = ((stdout or stderr or "").strip()[:200]) or f"exit={code}"
-        except MusicboxTimeoutError:
-            result["cli_exec_detail"] = "timeout running `musicbox --version`"
-        except Exception as exc:  # noqa: BLE001
-            result["cli_exec_detail"] = f"{type(exc).__name__}: {exc}"[:200]
+        # 用带缓存的短超时探测：命中缓存时立即返回，冷启动时也不会把响应拖到
+        # 管理页面 10s 超时之外（那会导致整个 CLI 区块显示 undefined）。
+        ok, detail = probe_cli_exec(timeout_s=3.0)
+        result["cli_exec_ok"] = ok
+        result["cli_exec_detail"] = detail
     return {"ok": True, "data": result}
 
 

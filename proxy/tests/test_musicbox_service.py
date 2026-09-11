@@ -905,6 +905,16 @@ def test_selftest_survives_cli_hanging(monkeypatch):
 
 import netease_ext as ne2
 
+
+@pytest.fixture(autouse=True)
+def _reset_cli_probe_cache():
+    """_CLI_PROBE 是进程级缓存，用例之间必须清空，否则串味且结果不确定。"""
+    mb_app.reset_cli_probe_for_test()
+    try:
+        yield
+    finally:
+        mb_app.reset_cli_probe_for_test()
+
 # 下面这些用例要跑真实的 NEMbox 构造流程（cookie_jar.load / Storage / deviceId），
 # 因此需要环境里真的装了 NetEase-MusicBox。CI/沙箱没装时自动跳过；
 # 本地 `pip install NetEase-MusicBox` 后即可启用。
@@ -1407,3 +1417,200 @@ def test_song_url_rejects_bad_quality(monkeypatch):
         r = client.get("/api/v1/song/1/url", params={"quality": "bogus"})
     assert r.status_code == 400
     assert "bogus" in r.text
+
+
+# --------- selftest 的 CLI 探测：快、可缓存、不阻塞诊断页 ---------
+# `musicbox` CLI 冷启动实测 47.37s，而管理页面探测 /api/v1/selftest 的超时是 10s。
+# 冷启动时整栏显示 undefined/[]，把用户唯一顺手的排障工具变成一片空白；2.1.6 起
+# 播放热路径不再 spawn CLI，CLI 再没有顺带预热的机会，该现象会变成常态。
+
+
+def test_selftest_cli_probe_is_cached(monkeypatch):
+    """第二次探测必须命中缓存，不能再 spawn CLI（稳态也要 1.4s）。"""
+    calls = []
+
+    def fake_run(args, timeout=30.0):
+        calls.append((args, timeout))
+        return 0, "NetEase-MusicBox installed version:0.5.3", ""
+
+    monkeypatch.setattr(mb_runner, "run_musicbox", fake_run)
+    ok1, d1 = mb_app.probe_cli_exec(timeout_s=3.0)
+    ok2, d2 = mb_app.probe_cli_exec(timeout_s=3.0)
+    assert (ok1, d1) == (ok2, d2) == (True, "NetEase-MusicBox installed version:0.5.3")
+    assert len(calls) == 1, "命中缓存后不得再执行 CLI"
+    assert calls[0][1] == 3.0
+
+
+def test_selftest_cli_probe_timeout_is_not_cached(monkeypatch):
+    """超时不能被永久缓存：那多半只是 CLI 还在冷启动，预热完应能拿到真实结果。"""
+    seq = []
+
+    def fake_run(args, timeout=30.0):
+        seq.append(timeout)
+        if len(seq) == 1:
+            raise mb_runner.MusicboxTimeoutError("musicbox timed out after 3s")
+        return 0, "version:0.5.3", ""
+
+    monkeypatch.setattr(mb_runner, "run_musicbox", fake_run)
+    ok, detail = mb_app.probe_cli_exec(timeout_s=3.0)
+    assert ok is False
+    assert "timeout" in detail.lower() or "timeout" in detail
+    assert "MusicboxTimeoutError" in detail, "必须带异常类型名，日志才可 grep"
+    assert "deviceId" in detail, "应解释冷启动成因，而不是一句无信息的 timeout"
+
+    ok2, detail2 = mb_app.probe_cli_exec(timeout_s=3.0)
+    assert (ok2, detail2) == (True, "version:0.5.3"), "超时未被缓存，重试应拿到真实结果"
+    assert len(seq) == 2
+
+
+def test_selftest_cli_probe_hard_failure_is_cached(monkeypatch):
+    """非超时类硬失败（比如 CLI 根本不存在）是确定性结果，应当缓存。"""
+    calls = []
+    monkeypatch.setattr(
+        mb_runner, "run_musicbox",
+        lambda args, timeout=30.0: calls.append(1) or (127, "", "musicbox CLI not found"),
+    )
+    ok, detail = mb_app.probe_cli_exec(timeout_s=3.0)
+    ok2, _ = mb_app.probe_cli_exec(timeout_s=3.0)
+    assert ok is False and ok2 is False
+    assert "not found" in detail
+    assert len(calls) == 1, "硬失败应缓存，不必每次重复探测"
+
+
+def test_selftest_stays_fast_when_cli_is_cold(monkeypatch):
+    """端到端：CLI 卡住时 selftest 也必须快速返回完整结构（含其余字段）。
+
+    这正是真机上「诊断页 CLI 区块整栏 undefined」的成因回归。
+    """
+    def hanging(args, timeout=30.0):
+        assert timeout <= 3.0, "selftest 里的探测超时必须远小于管理页面的 10s"
+        raise mb_runner.MusicboxTimeoutError("musicbox timed out")
+
+    monkeypatch.setattr(mb_runner, "musicbox_cmd",
+                        lambda: (["/venv/bin/musicbox"], "absolute:/venv/bin/musicbox"))
+    monkeypatch.setattr(mb_runner, "run_musicbox", hanging)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/selftest").json()
+    assert body["ok"] is True
+    d = body["data"]
+    assert d["cli_exec_ok"] is False
+    assert "timeout" in d["cli_exec_detail"].lower()
+    # 关键：CLI 卡住时其余诊断字段仍必须给出，不能整栏空白
+    assert d["cli_found"] is True
+    assert d["cli_cmd"] == ["/venv/bin/musicbox"]
+    assert d["interpreter"]
+    assert isinstance(d["xdg"], dict)
+
+
+def test_startup_warms_cli_probe_in_background(monkeypatch):
+    """启动预热必须在后台线程里跑，绝不能阻塞服务就绪。"""
+    started = []
+    monkeypatch.setattr(mb_app, "runner", mb_runner)
+    monkeypatch.setattr(
+        mb_runner, "run_musicbox",
+        lambda args, timeout=30.0: started.append(timeout) or (0, "version:0.5.3", ""),
+    )
+    mb_app.reset_cli_probe_for_test()
+    mb_app._warm_cli_probe_in_background()
+    import time as _t
+    for _ in range(100):
+        if mb_app._CLI_PROBE is not None:
+            break
+        _t.sleep(0.02)
+    assert started, "预热应真的执行一次 CLI"
+    assert started[0] >= 60, "冷启动实测 47s，预热超时余量必须足够大"
+    assert mb_app._CLI_PROBE == {"ok": True, "detail": "version:0.5.3"}
+
+
+def test_warmup_is_idempotent_per_process(monkeypatch):
+    """重复调用只起一个预热线程。
+
+    否则每个 TestClient（生产中是每次 startup 重入）都会拉起一个跑
+    `musicbox --version` 的后台线程 —— CLI 稳态也要 1.4s，纯属浪费，
+    且在真机上会把 CPU/IO 拖慢，反过来拖慢播放。
+    """
+    calls = []
+    monkeypatch.setattr(
+        mb_runner, "run_musicbox",
+        lambda args, timeout=30.0: calls.append(1) or (0, "version:0.5.3", ""),
+    )
+    mb_app.reset_cli_probe_for_test()
+    mb_app._warm_cli_probe_in_background()
+    mb_app._warm_cli_probe_in_background()
+    mb_app._warm_cli_probe_in_background()
+    import time as _t
+    for _ in range(100):
+        if mb_app._CLI_PROBE is not None:
+            break
+        _t.sleep(0.02)
+    _t.sleep(0.1)
+    assert len(calls) <= 1, f"预热应幂等，实际触发了 {len(calls)} 次"
+
+
+def test_stale_warmup_write_is_discarded():
+    """作废轮次的写入必须被丢弃。
+
+    预热线程可能在很久之后（实测冷启动 47s）才回来写缓存；若期间发生过重置，
+    那次写入属于已经不存在的轮次。真实后果是测试随机串味；生产中则是
+    诊断页报告一份过期的探测结果。
+    """
+    gen = mb_app._cli_probe_generation()
+    mb_app._cache_cli_probe(True, "fresh", gen)
+    assert mb_app._CLI_PROBE == {"ok": True, "detail": "fresh"}
+
+    mb_app.reset_cli_probe_for_test()
+    assert mb_app._CLI_PROBE is None
+    assert mb_app._cli_probe_generation() != gen, "重置必须推进代号"
+
+    mb_app._cache_cli_probe(True, "stale", gen)
+    assert mb_app._CLI_PROBE is None, "旧代号的写入不得落到新一轮缓存里"
+
+
+def test_lifespan_warms_cli_probe_on_startup(monkeypatch):
+    """预热必须挂在 lifespan 上：TestClient 进入时才发生。"""
+    calls = []
+    monkeypatch.setattr(
+        mb_runner, "run_musicbox",
+        lambda args, timeout=30.0: calls.append(1) or (0, "version:0.5.3", ""),
+    )
+    mb_app.reset_cli_probe_for_test()
+    assert mb_app._CLI_WARMUP_STARTED is False
+    with TestClient(app) as client:
+        client.get("/healthz")
+    import time as _t
+    for _ in range(100):
+        if mb_app._CLI_PROBE is not None:
+            break
+        _t.sleep(0.02)
+    assert mb_app._CLI_WARMUP_STARTED is True, "startup 应触发预热"
+    assert calls and mb_app._CLI_PROBE and mb_app._CLI_PROBE["ok"] is True
+
+
+def test_importing_app_module_does_not_spawn_cli(tmp_path):
+    """导入 app 模块不得预热 CLI —— 否则光跑单元测试就会 spawn musicbox 子进程。
+
+    预热挂在 lifespan 而非模块级调用，正是为了这一点。用全新解释器验证，
+    排除本测试进程里已经 import 过的干扰。
+    """
+    import subprocess
+
+    env = dict(os.environ)
+    env.update({
+        "XDG_DATA_HOME": str(tmp_path / "data"),
+        "XDG_CONFIG_HOME": str(tmp_path / "config"),
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        "PYTHONPATH": MUSICBOX_SERVICE_DIR + os.pathsep + env.get("PYTHONPATH", ""),
+    })
+    for d in ("data", "config", "cache"):
+        (tmp_path / d).mkdir(parents=True, exist_ok=True)
+    code = (
+        "import json, app;"
+        "print(json.dumps({'started': bool(app._CLI_WARMUP_STARTED),"
+        " 'probe': app._CLI_PROBE}))"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                          timeout=90, env=env)
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")[-500:]
+    out = json.loads(proc.stdout.decode("utf-8", "replace").strip().splitlines()[-1])
+    assert out["started"] is False, "导入即预热会让测试 spawn 真实 CLI 子进程"
+    assert out["probe"] is None

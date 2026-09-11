@@ -74,10 +74,50 @@ resolve_netease_url error for 94344 (quality=exhigh):
 `exhigh`）；进程内参数化取链则两种音质都返回 `code=200` 且带真实直链。因此改用进程内后，
 代理原本「lossless 失败再试 exhigh」的降级链两级通常都能直接命中。
 
+### 连带修掉：诊断页 CLI 区块整栏 `undefined`
+
+2.1.5 的真机诊断里，「CLI 自检」整栏是空的：
+
+```
+cli_found    : undefined   resolved_by=-
+cli_cmd      : []
+interpreter  : -  (undefined)
+XDG          : {}
+```
+
+同一根因的另一处表现：`/api/v1/selftest` 内部会 exec `musicbox --version`（原先给了
+15s 超时），冷启动 47s 必然超时；而管理页面探测 selftest 的超时只有 **10s**，
+于是整个响应被放弃，连 `cli_found`、`interpreter`、XDG 这些**根本不依赖 CLI** 的
+字段也一起显示不出来。用户唯一顺手的排障工具变成一片空白。
+
+更要紧的是：2.1.6 把播放热路径改成进程内之后，CLI 再没有任何被顺带预热的机会
+（原先是播放失败的尝试把它"焐热"的），这一栏会从偶发空白**变成常态空白**。
+
+处理：
+
+1. **启动时后台预热**（挂在 lifespan 上）：把 47s 级的一次性代价挪到后台线程，
+   不阻塞服务就绪。预热在进程内幂等，只起一个线程。
+   刻意**不放在模块级**——那样光导入模块（例如跑单元测试）就会 spawn 真实
+   `musicbox` 子进程，有专门的测试守住这一点。
+2. **探测结果缓存 + 短超时**：`selftest` 改用 `probe_cli_exec(timeout_s=3.0)`，
+   命中缓存立即返回；只缓存**确定性**结果（成功、非超时类硬失败），
+   超时**不缓存**——它多半只是 CLI 还在冷启动，不该被一次 3s 快速探测永久钉死。
+3. **作废在途写入**：预热线程可能在很久之后才回来写缓存，用一个自增「代号」标记轮次，
+   重置后旧轮次的写入直接丢弃。否则测试会随机串味，生产里则会报告过期的探测结果。
+4. **超时消息可 grep**：从 `timeout running musicbox --version` 改为带
+   `MusicboxTimeoutError:` 前缀，并解释冷启动成因（首次执行需生成 deviceId，
+   实测 ~47s）与「后台预热中，稍后重试」。
+5. 顺带把已废弃的 `@app.on_event("startup")` 换成 FastAPI 推荐的 lifespan 处理器。
+
+真机复验（真实 NEMbox 0.5.3）：启动后 `/healthz` 0.03s 即就绪；
+连续三次 `/api/v1/selftest` 均 **0.00s** 返回且 `cli_exec_ok=true`、
+`interpreter`/XDG 等字段完整；日志出现 `CLI 预热完成 cli_exec_ok=True`。
+全部远低于管理页面 10s 的探测超时。
+
 ### 测试
 
-新增 14 个用例（**509 passed / 1 skipped**，真实 NEMbox 环境；
-**505 passed / 5 skipped**，系统 python）：
+新增 20 个用例（**518 passed / 1 skipped**，真实 NEMbox 环境；
+**514 passed / 5 skipped**，系统 python；连跑两轮均稳定无 flake）：
 
 - `_urls_for_level` 与上游参数构造的等价性（紧凑 JSON `ids`、`level`、`encodeType`），
   eapi 有结果时**不得**再走 weapi 降级
@@ -92,6 +132,14 @@ resolve_netease_url error for 94344 (quality=exhigh):
 - 音质白名单照旧生效（非法音质 400），未被本次改动放宽
 - 代理日志盲区回归：用真实 `httpx.ReadTimeout('')` 复现，断言日志含 `ReadTimeout`
   且两级降级（lossless/exhigh）各留一条痕迹
+- selftest 探测：命中缓存后不得再执行 CLI；超时不被缓存（重试能拿到真实结果）且
+  消息含异常类型名与冷启动成因；非超时硬失败应当缓存
+- CLI 卡住时 `selftest` 仍须**快速返回完整结构**，其余诊断字段不得整栏空白
+  （即真机「CLI 区块 undefined」的直接回归）；探测超时必须远小于管理页面的 10s
+- 预热幂等：重复调用只起一个线程；lifespan 进入时才触发预热
+- 作废代号的写入必须被丢弃
+- **导入 `app` 模块不得预热 CLI**：用全新解释器子进程验证（排除本测试进程已 import
+  的干扰），否则光跑单元测试就会 spawn 真实 `musicbox` 子进程
 
 > 为便于测试打桩，把 `_level_to_encode_type` / `_quality_to_level` 抽成模块级薄封装
 > ——否则 `from NEMbox.api import ...` 写在函数体里，未安装真实 NetEase-MusicBox
