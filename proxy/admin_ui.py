@@ -949,11 +949,38 @@ async def api_login_check(request: Request, unikey: str = ""):
         state = await netease_auth.fetch_state(mb_client(), force=True)
         result["logged_in"] = state.logged_in
         result["nickname"] = state.nickname
+        result["vip"] = state.vip_active
+        # 代理是另一个进程，它自己的搜索缓存（可能全是登录前的空结果）和登录态
+        # 不会因为这里扫码成功而失效，必须显式通知它清一次，否则用户登录后
+        # 几分钟内搜到的仍然只有本地歌曲。
+        result["proxy_cache_cleared"] = await _invalidate_proxy_cache()
         try:
-            await pushplus.send(None, "网页端扫码登录成功", f"账号：{state.nickname or state.user_id}")
+            await pushplus.send(
+                None, "网页端扫码登录成功",
+                f"账号：{state.nickname or state.user_id}"
+                + (f"，VIP 剩余 {state.vip_days_left} 天" if state.vip_days_left is not None else ""),
+            )
         except Exception:  # noqa: BLE001
             pass
     return result
+
+
+async def _invalidate_proxy_cache() -> bool:
+    """通知代理进程清缓存（搜索 + 每日推荐 + 登录态）。失败只记日志。"""
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=PROXY_SOCK),
+            base_url="http://unix",
+            timeout=6.0,
+        ) as client:
+            r = await client.post("/_ext/cache/invalidate")
+            if r.status_code == 200:
+                logger.info("已通知代理清空缓存：%s", str(r.json())[:200])
+                return True
+            logger.warning("代理清缓存返回 %s", r.status_code)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("通知代理清缓存失败（登录后可能有几分钟延迟）: %s", exc)
+    return False
 
 
 @app.get("/api/config")

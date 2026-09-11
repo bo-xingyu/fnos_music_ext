@@ -20,6 +20,7 @@ from netease_ext import (
     daily_songs as ne_daily_songs,
     filter_playable_song_ids,
     invalidate_login_cache,
+    reset_api_instance,
     search_songs as ne_search_songs,
     song_lyric_pair,
 )
@@ -353,13 +354,16 @@ def auth_login_check(unikey: str = Query(...)):
     if not unikey.strip():
         raise HTTPException(status_code=400, detail="unikey cannot be empty")
     data = exec_musicbox(["auth", "login", "--check", unikey, "--json"])
-    # 登录成功（803）后立即作废登录态缓存，否则可播性过滤会在 TTL 内
-    # 继续把该账号当未登录，VIP / 无损曲目全被挡掉
+    # 登录成功（803）后必须重建进程内的 NetEase 实例：NEMbox 只在 __init__ 里
+    # 读一次 cookie 文件，而登录是由 CLI 子进程写盘的，父进程那个长命单例仍握着
+    # 登录前的旧 cookie。只清登录态缓存不够——可播性过滤用的 songs_url 仍会
+    # 带着旧 cookie 发请求，VIP/付费曲目全部拿不到直链而被剔除，
+    # 表现为"扫码登录成功了，但搜索和每日推荐还是空的"。
     payload = _extract_payload(data)
     code = payload.get("code") if isinstance(payload, dict) else None
     if code == 803 or code == "803":
-        invalidate_login_cache()
-        logger.info("扫码登录成功，已清空 musicbox 登录态缓存")
+        reset_api_instance()
+        logger.info("扫码登录成功，已重建 NEMbox 实例并清空登录态缓存")
     return data
 
 

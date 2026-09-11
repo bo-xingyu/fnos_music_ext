@@ -49,6 +49,13 @@ CLI_NAME = "musicbox"
 MODULE_FALLBACK = "NEMbox"
 
 
+def module_fallback() -> str:
+    """回退目标模块名。抽成函数是为了让测试能把它指向一个不存在的模块，
+    从而验证「彻底找不到 CLI」这条分支——否则装了真实 NEMbox 的机器上
+    模块回退总会命中，那条分支根本测不到。"""
+    return MODULE_FALLBACK
+
+
 class MusicboxTimeoutError(Exception):
     pass
 
@@ -140,11 +147,11 @@ def resolve_musicbox_cmd() -> tuple[list[str], str]:
         proc = subprocess.run(
             [sys.executable, "-c",
              f"import importlib.util,sys;"
-             f"sys.exit(0 if importlib.util.find_spec('{MODULE_FALLBACK}') else 1)"],
+             f"sys.exit(0 if importlib.util.find_spec('{module_fallback()}') else 1)"],
             capture_output=True, timeout=15,
         )
         if proc.returncode == 0:
-            return [sys.executable, "-m", MODULE_FALLBACK], "module:NEMbox"
+            return [sys.executable, "-m", MODULE_FALLBACK], f"module:{module_fallback()}"
     except Exception:  # noqa: BLE001
         pass
 

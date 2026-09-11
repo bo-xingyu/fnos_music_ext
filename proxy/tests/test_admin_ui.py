@@ -1,6 +1,8 @@
 """管理页面（proxy/admin_ui.py）测试：鉴权、配置读写与安全边界。"""
 import os
+import re
 import sys
+from pathlib import Path
 
 import httpx
 import pytest
@@ -1052,3 +1054,88 @@ def test_login_probe_falls_back_to_status_when_detail_missing(monkeypatch):
         body = c.get("/api/health", headers=ADMIN).json()
     assert body["netease"]["logged_in"] is True, "detail 缺失时必须回落到 status"
     assert not any("登录态探测异常" in p for p in body["problems"])
+
+
+# ----------------------------------------------- 登录成功后通知代理清缓存 ----
+# 代理与管理页面是两个独立进程：页面里扫码成功只重置了页面自己的登录态，
+# 代理那边仍拿旧的搜索缓存（可能全是登录前的空结果）和旧登录态继续服务，
+# 表现为"明明登录了，搜索还是只有本地歌曲"。所以必须显式打一次代理的失效端点。
+
+
+def _stub_invalidate(monkeypatch):
+    calls = []
+
+    async def fake():
+        calls.append(1)
+        return True
+
+    monkeypatch.setattr(admin_ui, "_invalidate_proxy_cache", fake)
+    return calls
+
+
+def test_login_check_803_notifies_proxy_cache(monkeypatch):
+    from proxy import netease_auth
+
+    calls = _stub_invalidate(monkeypatch)
+    monkeypatch.setenv("FNMUSIC_PUSHPLUS_ENABLED", "false")
+    netease_auth.reset_for_test()
+
+    def handler(r: httpx.Request) -> httpx.Response:
+        if r.url.path == "/api/v1/auth/login/check":
+            return httpx.Response(200, json={"ok": True, "data": {"code": 803}})
+        if r.url.path == "/api/v1/auth/status":
+            return httpx.Response(200, json={"ok": True, "data": {
+                "logged_in": True, "nickname": "张三"}})
+        return httpx.Response(404)
+
+    mock_mb(handler)
+    with TestClient(admin_ui.app) as c:
+        body = c.get("/api/login/check", params={"unikey": "ABC123def456"},
+                     headers=ADMIN).json()
+    assert calls == [1], "803 必须通知代理清空缓存，否则登录后几分钟内仍搜不到歌"
+    assert body["proxy_cache_cleared"] is True
+    netease_auth.reset_for_test()
+
+
+@pytest.mark.parametrize("code", [800, 801, 802])
+def test_login_check_non803_does_not_notify_proxy(monkeypatch, code):
+    """没登录成功就不该打扰代理（清缓存会让下一次搜索重新回源）。"""
+    calls = _stub_invalidate(monkeypatch)
+    monkeypatch.setenv("FNMUSIC_PUSHPLUS_ENABLED", "false")
+    mock_mb(lambda r: httpx.Response(200, json={"ok": True, "data": {"code": code}}))
+    with TestClient(admin_ui.app) as c:
+        c.get("/api/login/check", params={"unikey": "ABC123def456"}, headers=ADMIN)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_invalidate_proxy_cache_failure_is_swallowed(monkeypatch):
+    """代理不可达时只能记日志返回 False —— 登录回调绝不能因此失败。"""
+    monkeypatch.setattr(admin_ui, "PROXY_SOCK", "/nonexistent/trim_music.sock")
+    assert await admin_ui._invalidate_proxy_cache() is False
+
+
+def test_proxy_exposes_the_endpoint_admin_ui_calls():
+    """契约测试：管理页面写死的路径必须真的存在于代理路由表。
+
+    两个进程各自维护一份路径字符串，改一边忘另一边不会有任何报错，
+    只会让"登录后立刻生效"静默退化成"等 TTL 过期"——非常难查。
+    """
+    from proxy.app import app as proxy_app_
+
+    src = Path(admin_ui.__file__).read_text(encoding="utf-8")
+    called = re.findall(r'client\.post\("([^"]+)"\)', src)
+    assert called, "应能在 _invalidate_proxy_cache 里找到 client.post(...)"
+
+    routes = {r.path for r in proxy_app_.routes}
+    for path in called:
+        if path.startswith("/_ext/"):
+            assert path in routes, f"{path} 在代理路由表中不存在（两进程契约已断）"
+
+
+def test_admin_ui_calls_cache_invalidate_path():
+    """明确钉住这一次通知用的就是缓存失效端点，别被顺手改成别的路径。"""
+    src = Path(admin_ui.__file__).read_text(encoding="utf-8")
+    fn = src[src.index("async def _invalidate_proxy_cache"):]
+    fn = fn[:fn.index("\nasync def")] if "\nasync def" in fn else fn
+    assert '"/_ext/cache/invalidate"' in fn

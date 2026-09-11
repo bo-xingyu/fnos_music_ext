@@ -1345,3 +1345,120 @@ def test_online_unavailable_response_shape():
     assert _json.loads(resp.body)["code"] == 404
     assert _json.loads(resp.body)["msg"] == "online source unavailable"
 
+
+
+# ===========================================================================
+# /_ext/cache/invalidate —— 代理侧缓存失效
+#
+# 代理与管理页面是两个独立进程。页面里扫码登录成功只重置了页面进程自己的登录态，
+# 代理这边仍会拿旧的 _SEARCH_CACHE（可能全是登录前的空结果，TTL 最长 60s）和旧的
+# netease_auth 登录态（TTL 默认 300s）继续服务，表现为"明明登录了，搜索还是只有
+# 本地歌曲"。这个端点让登录成功后立刻生效。
+# ===========================================================================
+
+from proxy import netease_auth
+from proxy.app import _DAILY_TASKS
+import proxy.app as proxy_app
+
+
+@pytest.fixture(autouse=True)
+def _isolate_auth_state(monkeypatch):
+    """别把测试里的登录态写进真实缓存，也别触发真实网络探测。"""
+    netease_auth.reset_for_test()
+    calls = []
+    monkeypatch.setattr(netease_auth, "invalidate_state", lambda: calls.append(1))
+    yield calls
+    netease_auth.reset_for_test()
+
+
+def test_cache_invalidate_clears_search_cache(_isolate_auth_state):
+    with TestClient(app) as client:
+        _set_search_cache("周杰伦", [])
+        assert "周杰伦" in _SEARCH_CACHE
+        r = client.post("/_ext/cache/invalidate")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["cleared"]["search_entries"] == 1
+    assert body["cleared"]["login_state"] is True
+    assert _SEARCH_CACHE == {}, "登录/登出后必须丢掉旧搜索结果（可能全是空结果）"
+    assert _isolate_auth_state == [1], "必须同时重置登录态探测缓存"
+
+
+def test_cache_invalidate_purges_daily_cache_files(tmp_path, monkeypatch, _isolate_auth_state):
+    """每日推荐歌单是按"未登录/旧账号"生成的，必须一并作废。"""
+    root = tmp_path / "daily"
+    u1 = root / "user-a"
+    u1.mkdir(parents=True)
+    (u1 / "2026-09-11.json").write_text("{}", encoding="utf-8")
+    (root / "user-b").mkdir()
+    (root / "user-b" / "2026-09-10.json").write_text("{}", encoding="utf-8")
+    (root / "stray.txt").write_text("keep", encoding="utf-8")   # 非 json，不该动
+    monkeypatch.setattr(proxy_app.dailyrec, "recommend_cache_dir", lambda: str(root))
+
+    with TestClient(app) as client:
+        body = client.post("/_ext/cache/invalidate").json()
+
+    assert body["cleared"]["daily_cache_files"] == 2
+    assert not (u1 / "2026-09-11.json").exists()
+    assert not (root / "user-b" / "2026-09-10.json").exists()
+    assert (root / "stray.txt").exists(), "只清 .json，别误删别的文件"
+
+
+class _FakeTask:
+    """替身 asyncio.Task：done()==False 表示还在跑，cancel() 应被调用。"""
+
+    def __init__(self):
+        self.cancelled = False
+
+    def done(self):
+        return False
+
+    def cancel(self):
+        self.cancelled = True
+        _CANCELLED.append(self)
+
+
+_CANCELLED: list = []
+
+
+def test_cache_invalidate_cancels_pending_daily_tasks(_isolate_auth_state):
+    """未完成的每日推荐后台任务要取消，不能让旧账号的任务把结果又写回缓存。"""
+    with TestClient(app) as client:
+        _DAILY_TASKS.clear()
+        _DAILY_TASKS["user-a"] = _FakeTask()
+        _DAILY_TASKS["user-b"] = _FakeTask()
+        body = client.post("/_ext/cache/invalidate").json()
+
+    assert body["cleared"]["daily_tasks"] == 2
+    assert _DAILY_TASKS == {}
+    assert all(t.cancelled for t in _CANCELLED), "pending 任务必须被 cancel"
+
+
+def test_cache_invalidate_idempotent_and_survives_missing_dir(
+    monkeypatch, _isolate_auth_state
+):
+    """缓存目录不存在 / 连打两次都不能炸——登录回调里失败不该影响主流程。"""
+    monkeypatch.setattr(
+        proxy_app.dailyrec, "recommend_cache_dir",
+        lambda: "/nonexistent/path/that/does/not/exist",
+    )
+    with TestClient(app) as client:
+        first = client.post("/_ext/cache/invalidate")
+        second = client.post("/_ext/cache/invalidate")
+    assert first.status_code == 200 and second.status_code == 200
+    assert first.json()["ok"] is True
+    assert second.json()["cleared"]["search_entries"] == 0
+
+
+def test_search_cache_empty_result_not_served_after_login(monkeypatch, _isolate_auth_state):
+    """端到端回归：登录前缓存的空结果，登录后不能再被拿来当答案。"""
+    with TestClient(app) as client:
+        _set_search_cache("林俊杰", [])   # 未登录时的空结果
+
+        async def _fake_fetch(*a, **kw):
+            return [{"name": "JJ-新结果", "guid": "online:1"}]
+
+        monkeypatch.setattr(proxy_app, "fetch_netease_search", _fake_fetch)
+        client.post("/_ext/cache/invalidate")
+        assert "林俊杰" not in _SEARCH_CACHE

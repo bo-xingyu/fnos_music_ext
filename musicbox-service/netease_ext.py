@@ -6,8 +6,10 @@ import threading
 import time
 from typing import Any
 
-_api_lock = threading.Lock()
+_api_lock = threading.Lock()          # 保护单次 API 调用（NEMbox 非线程安全）
+_api_init_lock = threading.Lock()     # 单独一把锁管理实例生命周期，避免与上面嵌套死锁
 _api_instance = None
+_api_cookie_stamp: tuple | None = None
 
 # 未登录时是否降级为只播免费曲目（默认开；关掉则未登录直接不放行任何在线曲目）
 FREE_ONLY_ON_LOGOUT = (
@@ -16,18 +18,72 @@ FREE_ONLY_ON_LOGOUT = (
 )
 
 
+def _cookie_stamp(api) -> tuple:
+    """cookie 文件的 (mtime_ns, size) 指纹。取不到就用空指纹（视为"无 cookie"）。"""
+    try:
+        path = getattr(getattr(api, "storage", None), "cookie_path", "") or ""
+        if path and os.path.exists(path):
+            st = os.stat(path)
+            return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        pass
+    return ()
+
+
+def _build_api():
+    from runner import ensure_xdg_dirs
+
+    ensure_xdg_dirs()
+    from NEMbox.api import NetEase
+
+    return NetEase()
+
+
+def reset_api_instance() -> None:
+    """丢弃进程内的 NetEase 实例与登录态缓存，强制下次重建。
+
+    NEMbox 的 cookie 只在 ``NetEase.__init__`` 里 ``cookie_jar.load()`` 一次，之后**永不重读**。
+    而扫码登录是由 **musicbox CLI 子进程**完成并写盘的（`netease_login.sh`、
+    页面的扫码流程都是），子进程写完 cookie 后，父进程里那个长命单例仍握着登录前的
+    旧 cookie —— 于是"CLI 说已登录、进程内说未登录"，可播性过滤按未登录处理，
+    VIP/付费曲目被全部剔除，表现为**登录后搜索与每日推荐依然为空**。
+
+    登录/登出后必须调用本函数；此外 _get_api() 也会按 cookie 文件指纹自动重建，
+    以覆盖登录发生在别的进程、或 cookie 被外部改写/过期的情况。
+    """
+    global _api_instance, _api_cookie_stamp
+    with _api_init_lock:
+        _api_instance = None
+        _api_cookie_stamp = None
+    invalidate_login_cache()
+
+
 def _get_api():
-    global _api_instance
-    if _api_instance is None:
-        with _api_lock:
-            if _api_instance is None:
-                from runner import ensure_xdg_dirs
+    """取 NetEase 实例；cookie 文件发生变化时自动重建，避免长期持有过期登录态。"""
+    global _api_instance, _api_cookie_stamp
 
-                ensure_xdg_dirs()
-                from NEMbox.api import NetEase
+    # 快路径：已有实例且 cookie 指纹未变
+    if _api_instance is not None and _cookie_stamp(_api_instance) == _api_cookie_stamp:
+        return _api_instance
 
-                _api_instance = NetEase()
-    return _api_instance
+    with _api_init_lock:
+        # 双检：等锁期间可能已被重建
+        if _api_instance is not None:
+            stamp = _cookie_stamp(_api_instance)
+            if stamp == _api_cookie_stamp:
+                return _api_instance
+            # cookie 变了：旧实例的 cookie_jar 不会再重读，必须整个重建
+            try:
+                _api_instance = _build_api()
+                _api_cookie_stamp = _cookie_stamp(_api_instance)
+                invalidate_login_cache()
+            except Exception:  # noqa: BLE001 - 重建失败时继续用旧实例，总比直接崩好
+                pass
+            return _api_instance
+
+        _api_instance = _build_api()
+        _api_cookie_stamp = _cookie_stamp(_api_instance)
+        return _api_instance
 
 
 def _map_song_detail(item: dict[str, Any]) -> dict[str, Any]:

@@ -1431,6 +1431,58 @@ async def ext_healthz(request: Request):
     }
 
 
+@app.post("/_ext/cache/invalidate")
+async def ext_cache_invalidate():
+    """清空代理侧缓存（搜索结果 + 登录态），供登录/登出后立即生效。
+
+    代理与管理页面是两个独立进程：页面里扫码登录成功，只重置了页面进程自己的
+    登录态。代理这边仍会拿旧的 `_SEARCH_CACHE`（可能全是空结果）和旧的
+    `netease_auth` 登录态（TTL 默认 300s）继续服务几分钟，表现为
+    "明明登录了，搜索还是只有本地歌曲"。所以登录成功后必须显式打这个端点。
+
+    只做丢弃缓存这一件事：不改配置、不影响播放、可重复调用。
+    """
+    dropped_search = len(_SEARCH_CACHE)
+    _SEARCH_CACHE.clear()
+    daily_tasks = len(_DAILY_TASKS)
+    for task in list(_DAILY_TASKS.values()):
+        if task is not None and not task.done():
+            task.cancel()
+    _DAILY_TASKS.clear()
+    # 已缓存的每日推荐歌单是按"未登录"或旧账号生成的，必须一并作废
+    purged_daily = 0
+    try:
+        root = dailyrec.recommend_cache_dir()
+        if os.path.isdir(root):
+            for user_dir in os.listdir(root):
+                sub = os.path.join(root, user_dir)
+                if os.path.isdir(sub):
+                    for name in os.listdir(sub):
+                        if name.endswith(".json"):
+                            try:
+                                os.remove(os.path.join(sub, name))
+                                purged_daily += 1
+                            except OSError:
+                                pass
+    except OSError as exc:
+        logger.warning("purge daily cache failed: %s", exc)
+
+    netease_auth.invalidate_state()
+    logger.info(
+        "cache invalidated: search=%d daily_tasks=%d daily_files=%d login_state=reset",
+        dropped_search, daily_tasks, purged_daily,
+    )
+    return {
+        "ok": True,
+        "cleared": {
+            "search_entries": dropped_search,
+            "daily_tasks": daily_tasks,
+            "daily_cache_files": purged_daily,
+            "login_state": True,
+        },
+    }
+
+
 @app.get("/music/api/v1/search/track")
 @app.get("/music/api/v1/search/track/{subpath:path}")
 async def search_track(request: Request):

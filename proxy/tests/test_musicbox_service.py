@@ -1,3 +1,4 @@
+import importlib.util
 import io
 import json
 import os
@@ -123,14 +124,28 @@ def test_auth_qr_png_endpoint_and_alias(monkeypatch):
         assert resp2.content[:8] == b"\x89PNG\r\n\x1a\n"
 
 
-def test_run_musicbox_missing_binary(monkeypatch):
+def test_run_musicbox_missing_binary(monkeypatch, tmp_path):
     """彻底解析不到时必须退出码 127，并给出「去哪找过」的可读诊断。"""
     monkeypatch.setenv("PATH", "")
-    code, stdout, stderr = runner.run_musicbox(["health"])
-    assert code == 127
-    assert "musicbox CLI not found" in stderr
-    assert "tried:" in stderr, "必须列出尝试过的路径，否则无从排查"
-    assert "console script next to the interpreter" in stderr
+    # 本用例要验证的是「解析器什么都找不到」这条分支。装了真实 NEMbox 的环境里
+    # 另外两级都会命中（那是正确行为，不是这里要测的）：
+    #   1) candidate_paths() 是解释器相对路径，PATH="" 拦不住，venv/bin/musicbox 会被找到
+    #   2) 模块回退 python -m NEMbox 也能跑起来
+    # 两者都会让 CLI 真的执行并返回 2，因此必须一并封掉。
+    empty = tmp_path / "no-cli-here"
+    empty.mkdir()
+    monkeypatch.setattr(runner, "candidate_paths",
+                        lambda: [str(empty / "musicbox")])
+    monkeypatch.setattr(runner, "module_fallback", lambda: "NoSuchModule_xyz_123")
+    runner.reset_cmd_cache()          # run_musicbox 走 musicbox_cmd()，会读缓存
+    try:
+        code, stdout, stderr = runner.run_musicbox(["health"])
+        assert code == 127
+        assert "musicbox CLI not found" in stderr
+        assert "tried:" in stderr, "必须列出尝试过的路径，否则无从排查"
+        assert "console script next to the interpreter" in stderr
+    finally:
+        runner.reset_cmd_cache()
 
 
 def test_run_musicbox_calls_ensure_xdg_dirs(monkeypatch):
@@ -747,6 +762,9 @@ def test_run_musicbox_fails_without_cli_on_path(monkeypatch, tmp_path):
     monkeypatch.setattr(mb_runner.sys, "executable", "/usr/bin/python3")
     monkeypatch.setattr(mb_runner.sys, "prefix", "/usr")
     monkeypatch.setattr(mb_runner.sys, "base_prefix", "/usr")
+    # 若本机恰好装了真实 NEMbox，模块回退会命中（那是解析器的正确行为）；
+    # 本用例要验证的是"什么都找不到"的分支，因此把回退目标也指成不存在的模块。
+    monkeypatch.setattr(mb_runner, "module_fallback", lambda: "NoSuchModule_xyz_123")
     mb_runner.reset_cmd_cache()
     try:
         cmd, how = mb_runner.resolve_musicbox_cmd()
@@ -873,3 +891,178 @@ def test_selftest_survives_cli_hanging(monkeypatch):
     assert body["ok"] is True
     assert body["data"]["cli_exec_ok"] is False
     assert "timeout" in body["data"]["cli_exec_detail"]
+
+
+# ===========================================================================
+# NEMbox 实例与 cookie 的生命周期（登录后仍搜不到歌的真正根因）
+#
+# NEMbox 的 NetEase.__init__ 里 cookie_jar.load() 只执行一次，之后永不重读。
+# 扫码登录是由 musicbox CLI 子进程写 cookie 的，父进程里被 netease_ext 缓存的
+# 长命单例仍握着登录前的旧 cookie —— 于是"CLI 说已登录、进程内说未登录"，
+# 可播性过滤按未登录处理，VIP/付费曲目全部拿不到直链被剔除，
+# 表现为登录成功后搜索与每日推荐依然为空。
+# ===========================================================================
+
+import netease_ext as ne2
+
+# 下面这些用例要跑真实的 NEMbox 构造流程（cookie_jar.load / Storage / deviceId），
+# 因此需要环境里真的装了 NetEase-MusicBox。CI/沙箱没装时自动跳过；
+# 本地 `pip install NetEase-MusicBox` 后即可启用。
+requires_nembox = pytest.mark.skipif(
+    importlib.util.find_spec("NEMbox") is None,
+    reason="需要真实 NetEase-MusicBox 包（pip install NetEase-MusicBox）",
+)
+
+
+@pytest.fixture
+def real_cookie_dir(tmp_path, monkeypatch):
+    """指向一个真实可写的 XDG 目录，让 NEMbox 自己创建 cookie 文件。"""
+    data = tmp_path / "data"
+    cache = tmp_path / "cache"
+    conf = tmp_path / "config"
+    for d in (data, cache, conf):
+        d.mkdir()
+    monkeypatch.setenv("XDG_DATA_HOME", str(data))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(conf))
+    ne2.reset_api_instance()
+    ne2._api_instance = None
+    yield data
+    ne2.reset_api_instance()
+    ne2._api_instance = None
+
+
+def _cookie_file_for(api):
+    """从真实实例上取 cookie 路径。
+
+    不能按 XDG_DATA_HOME 自己拼：NEMbox 的 Constant.cookie_path 在【模块导入时】
+    就已经根据当时的环境变量固化了，测试里再 monkeypatch XDG_* 搬不动它。
+    """
+    from pathlib import Path as _P
+
+    return _P(getattr(api.storage, "cookie_path", ""))
+
+
+@requires_nembox
+def test_get_api_returns_same_instance_when_cookie_unchanged(real_cookie_dir):
+    """cookie 没变时必须复用同一个实例，不能每个请求都重建（重建会重算 deviceId 等）。"""
+    a = ne2._get_api()
+    b = ne2._get_api()
+    assert a is b
+    assert ne2._cookie_stamp(a) == ne2._api_cookie_stamp
+
+
+@requires_nembox
+def test_get_api_rebuilds_when_cookie_file_changes(real_cookie_dir):
+    """核心回归：cookie 文件一变（= 有人扫码登录了），必须重建实例重读 cookie。"""
+    before = ne2._get_api()
+    cf = _cookie_file_for(before)
+    assert str(cf), "应从真实实例拿到 cookie 路径"
+    cf.parent.mkdir(parents=True, exist_ok=True)
+    original = cf.read_text(encoding="utf-8", errors="replace") if cf.exists() else None
+
+    try:
+        # 模拟 CLI 子进程登录成功后写回 cookie（父进程的单例不会自己重读）
+        import time as _t
+        cf.write_text(
+            "# Netscape HTTP Cookie File\n"
+            ".music.163.com\tTRUE\t/\tTRUE\t9999999999\tMUSIC_U\tFAKE_LOGGED_IN_TOKEN\n",
+            encoding="utf-8",
+        )
+        os.utime(cf, (_t.time() + 5, _t.time() + 5))
+
+        after = ne2._get_api()
+        assert after is not before, "cookie 变化后必须重建 NetEase 实例，否则永远用旧登录态"
+        assert ne2._api_cookie_stamp == ne2._cookie_stamp(after)
+    finally:
+        if original is not None:
+            try:
+                cf.write_text(original, encoding="utf-8")
+            except OSError:
+                pass
+        ne2.reset_api_instance()
+
+
+@requires_nembox
+def test_cookie_stamp_tolerates_missing_file(real_cookie_dir):
+    """cookie 文件不存在时指纹为空，且不能抛异常。"""
+    api = ne2._get_api()
+    cf = _cookie_file_for(api)
+    if not cf.exists():
+        assert ne2._cookie_stamp(api) == ()
+        return
+    backup = cf.read_bytes()
+    try:
+        cf.unlink()
+        assert ne2._cookie_stamp(api) == (), "cookie 文件消失时应视为空指纹"
+    finally:
+        cf.write_bytes(backup)
+
+
+@requires_nembox
+def test_reset_api_instance_drops_instance_and_login_cache(real_cookie_dir):
+    first = ne2._get_api()
+    ne2._LOGIN_CACHE = (12345.0, True)          # 伪造一份已缓存的登录态
+    ne2.reset_api_instance()
+    assert ne2._api_instance is None
+    assert ne2._api_cookie_stamp is None
+    assert ne2._LOGIN_CACHE == (0.0, False), "重置实例必须同时作废登录态缓存"
+    second = ne2._get_api()
+    assert second is not first
+
+
+def test_login_check_803_rebuilds_instance(monkeypatch):
+    """扫码成功那一刻就必须重建实例 —— 只清登录态缓存是不够的。"""
+    reset_calls = []
+    monkeypatch.setattr(mb_app, "reset_api_instance",
+                        lambda: reset_calls.append(1))
+    monkeypatch.setattr(runner, "run_musicbox",
+                        lambda args, timeout=30.0: (0, json.dumps(
+                            {"ok": True, "data": {"code": 803, "nickname": "张三"}}), ""))
+    with TestClient(app) as client:
+        body = client.get("/api/v1/auth/login/check",
+                          params={"unikey": "ABC123def456"}).json()
+    assert body["data"]["code"] == 803
+    assert reset_calls == [1], "803 必须触发 NEMbox 实例重建"
+
+
+@pytest.mark.parametrize("code", [800, 801, 802])
+def test_login_check_other_codes_do_not_rebuild(monkeypatch, code):
+    """未扫码/待确认/已过期都不该重建实例（会白丢一次 deviceId 计算与磁盘 IO）。"""
+    reset_calls = []
+    monkeypatch.setattr(mb_app, "reset_api_instance", lambda: reset_calls.append(1))
+    monkeypatch.setattr(runner, "run_musicbox",
+                        lambda args, timeout=30.0: (0, json.dumps(
+                            {"ok": True, "data": {"code": code}}), ""))
+    with TestClient(app) as client:
+        client.get("/api/v1/auth/login/check", params={"unikey": "ABC123def456"})
+    assert reset_calls == []
+
+
+def test_playable_filter_uses_current_login_state(real_cookie_dir, monkeypatch):
+    """可播性过滤必须基于【当前】登录态，而不是实例创建时那一刻的。"""
+    calls = {"n": 0}
+
+    class _Api:
+        storage = None
+
+        def songs_url(self, ids):
+            calls["ids"] = list(ids)
+            # fee=1 是 VIP 曲
+            return [{"id": 1, "url": "http://cdn/vip.flac", "fee": 1},
+                    {"id": 2, "url": "http://cdn/free.mp3", "fee": 0}]
+
+        def get_account_info(self):
+            calls["n"] += 1
+            return {"account": {"id": 9}, "profile": {"nickname": "n"}} if calls["n"] > 1 \
+                else {"account": None, "profile": None}
+
+    api = _Api()
+    monkeypatch.setattr(ne2, "_get_api", lambda: api)
+    ne2.invalidate_login_cache()
+
+    # 第一次：未登录 -> VIP 曲被剔除
+    assert ne2.filter_playable_song_ids([1, 2]) == {2}
+    ne2.invalidate_login_cache()
+    # 第二次：账号已登录 -> VIP 曲放行
+    assert ne2.filter_playable_song_ids([1, 2]) == {1, 2}
