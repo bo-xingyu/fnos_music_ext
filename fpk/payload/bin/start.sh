@@ -121,13 +121,84 @@ log_login_hint() {
     local logged_in
     logged_in="$(printf '%s' "${detail}" | jq -r '.data.logged_in // false' 2>/dev/null || echo false)"
     if [ "${logged_in}" = "true" ]; then
-        local nick vip days
+        local nick vip
         nick="$(printf '%s' "${detail}" | jq -r '.data.nickname // "已登录用户"' 2>/dev/null || echo '已登录用户')"
         vip="$(printf '%s' "${detail}" | jq -r '.data.vip_type // 0' 2>/dev/null || echo 0)"
         lib_log "网易云登录态: 已登录 (${nick}), vip_type=${vip}"
     else
-        lib_warn "网易云尚未扫码登录 → 当前只能播放免费曲目，「每日推荐」不可用。请在 SSH 终端执行: bash ${RUN_DIR}/netease_login.sh"
+        lib_warn "网易云尚未扫码登录 → 当前只能播放免费曲目，「每日推荐」不可用。请在飞牛桌面打开「${APP_NAME}」图标扫码登录（或 SSH 执行 bash ${RUN_DIR}/netease_login.sh）"
     fi
+}
+
+start_ui() {
+    # 管理页面：扫码登录 + 全部配置，经飞牛统一网关暴露在 /app/${APP_NAME}
+    # 网关会先校验 NAS 登录态再转发，并注入 X-Trim-Userid / X-Trim-Isadmin。
+    # 必须以 root 运行：它要写入 root 代理读取的 .env，并调用需要 root 的重启脚本。
+    if lib_pid_alive "${UI_PID}" && [ -S "${UI_SOCK}" ]; then
+        lib_log "管理页面已在运行 (pid=$(head -n 1 "${UI_PID}"))"
+        return 0
+    fi
+    # 先清掉可能残留的孤儿：只 rm 掉 socket 文件是不够的——旧进程仍持有那个
+    # 已删除的 inode，新进程会绑到一个新 inode 上，两者并存且旧进程再也无法回收。
+    lib_kill_stale_by_sock "${UI_SOCK}"
+    rm -f "${UI_SOCK}" 2>/dev/null
+    if [ ! -f "${RUN_DIR}/.venv-proxy/bin/uvicorn" ] || [ ! -f "${RUN_DIR}/proxy/admin_ui.py" ]; then
+        lib_warn "管理页面组件缺失（uvicorn 或 proxy/admin_ui.py），跳过启动。扩展主功能不受影响。"
+        return 0
+    fi
+    if [ ! -d "$(dirname "${UI_SOCK}")" ]; then
+        lib_warn "网关 socket 目录 $(dirname "${UI_SOCK}") 不存在，跳过管理页面启动"
+        return 0
+    fi
+
+    lib_log "启动管理页面 unix socket ${UI_SOCK}"
+    lib_spawn "${UI_PID}" "${UI_LOG}" --as-root env \
+        PATH="${PYTHON_BIN}:${PATH}" \
+        PYTHONUNBUFFERED=1 \
+        FNMUSIC_HOME="${RUN_DIR}" \
+        FNMUSIC_MUSICBOX_URL="$(lib_read_env_value FNMUSIC_MUSICBOX_URL "${MUSICBOX_URL}")" \
+        FNMUSIC_UPSTREAM_SOCK="${UPSTREAM_SOCK}" \
+        FNMUSIC_ADMIN_ENV_FILE="${RUN_DIR}/.env" \
+        FNMUSIC_ADMIN_RESTART_SCRIPT="${RUN_DIR}/bin/restart_services.sh" \
+        FNMUSIC_ADMIN_LOG_DIR="${LOG_DIR}" \
+        FNMUSIC_ADMIN_VAR_DIR="${PKGVAR}" \
+        FNMUSIC_ADMIN_PREFIX="/app/${APP_NAME}" \
+        "${RUN_DIR}/.venv-proxy/bin/uvicorn" admin_ui:app \
+            --app-dir "${RUN_DIR}/proxy" \
+            --uds "${UI_SOCK}"
+
+    # pidfile 由子进程自己写入，存在竞态窗口；先给宽限再判活，
+    # 否则会在 uvicorn 还没落 pidfile 时就误判"进程已退出"而 break。
+    if ! lib_wait_pidfile "${UI_PID}"; then
+        lib_warn "管理页面未能启动（进程退出或未写入 PID）。扫码登录请改用 SSH: bash ${RUN_DIR}/netease_login.sh。日志: ${UI_LOG}"
+        tail -n 15 "${UI_LOG}" 2>/dev/null | sed 's/^/  ui: /' >&2 || true
+        rm -f "${UI_PID}" 2>/dev/null
+        # 进程可能其实起来了、只是 pidfile 没及时落盘；按 socket 路径收尾，
+        # 否则就会留下一个占着 ui.sock 的永久孤儿
+        lib_kill_stale_by_sock "${UI_SOCK}"
+        return 0
+    fi
+
+    local i=0
+    while [ "${i}" -lt 30 ]; do
+        if [ -S "${UI_SOCK}" ]; then
+            # 网关进程需要能 connect：unix socket 的连接权限取决于文件写位
+            chmod 666 "${UI_SOCK}" 2>/dev/null || true
+            lib_log "管理页面就绪 socket=${UI_SOCK} (pid=$(head -n 1 "${UI_PID}" 2>/dev/null))"
+            lib_log "访问入口：飞牛桌面「飞牛音乐扩展」图标，或 https://<NAS>/app/${APP_NAME}"
+            return 0
+        fi
+        if ! lib_pid_alive "${UI_PID}"; then
+            break
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    # 管理页面起不来不影响在线播放，只降级为「需 SSH 扫码」
+    lib_warn "管理页面未能启动（30s 超时或进程退出）。扫码登录请改用 SSH: bash ${RUN_DIR}/netease_login.sh。日志: ${UI_LOG}"
+    tail -n 15 "${UI_LOG}" 2>/dev/null | sed 's/^/  ui: /' >&2 || true
+    rm -f "${UI_PID}" 2>/dev/null
+    return 0
 }
 
 main() {
@@ -140,6 +211,8 @@ main() {
         lib_stop_pid "musicbox" "${MUSICBOX_PID}" 10
         return 1
     }
+    # 管理页面失败不致命：主功能（在线播放）不依赖它
+    start_ui
     lib_log "=== start 完成 ==="
     return 0
 }

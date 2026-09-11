@@ -22,16 +22,25 @@ PYTHON_APP="python312"
 PYTHON_BIN="/var/apps/${PYTHON_APP}/target/bin"
 
 APPDEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
-PKGVAR="${TRIM_PKGVAR:-/vol1/@appvar/${APP_NAME}}"
+# 官方框架：var -> /vol{n}/@appdata/{appname}，对应 TRIM_PKGVAR
+# （仅在环境变量缺失时兜底；正常由飞牛注入，不要依赖这个默认值）
+PKGVAR="${TRIM_PKGVAR:-$(ls -d /vol*/@appdata/${APP_NAME} 2>/dev/null | head -n 1)}"
+PKGVAR="${PKGVAR:-/vol1/@appdata/${APP_NAME}}"
 RUN_DIR="${PKGVAR}/app"
 LOG_DIR="${PKGVAR}/logs"
 ENV_FILE="${RUN_DIR}/.env"
 
 PROXY_PID="${PKGVAR}/proxy.pid"
 MUSICBOX_PID="${PKGVAR}/musicbox.pid"
+UI_PID="${PKGVAR}/ui.pid"
 PROXY_LOG="${LOG_DIR}/proxy.log"
 MUSICBOX_LOG="${LOG_DIR}/musicbox.log"
+UI_LOG="${LOG_DIR}/ui.log"
 INFO_LOG="${LOG_DIR}/info.log"
+
+# 管理页面的 unix socket。官方要求 gatewaySocket 放在已安装应用的 target 目录下，
+# 因此这里用 APPDEST 而不是 PKGVAR；网关按 ui/config 里的 gatewaySocket 文件名找它。
+UI_SOCK="${APPDEST}/ui.sock"
 
 TARGET_SOCK="/var/run/trim_music.socket"
 UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
@@ -266,6 +275,54 @@ lib_wait_pidfile() {
         i=$((i + 1))
     done
     [ -s "${file}" ] && lib_pid_alive "${file}"
+}
+
+lib_kill_stale_by_sock() {
+    # 兜底清理：pidfile 丢失（例如启动竞态下被误删）但进程仍在监听我们的 socket 时，
+    # 按【本应用自己的 socket 绝对路径】精确匹配并终止，绝不波及任何其它 uvicorn。
+    #
+    # 没有这道网，一次启动竞态就会留下一个永久孤儿进程：它占着 ui.sock，
+    # 下次启动又因 socket 已存在而行为诡异，用户只能重启整机。
+    local sock="$1"
+    [ -n "${sock}" ] || return 0
+    [ -S "${sock}" ] || return 0
+
+    local needles=("uds ${sock}" "uds=${sock}")
+    local pids="" line pid args needle hit
+    while IFS= read -r line; do
+        pid="${line%% *}"
+        args="${line#* }"
+        hit=0
+        for needle in "${needles[@]}"; do
+            case "${args}" in *"${needle}"*) hit=1; break ;; esac
+        done
+        [ "${hit}" -eq 1 ] || continue
+        case "${pid}" in ''|*[!0-9]*) continue ;; esac
+        pids="${pids} ${pid}"
+    done < <(ps -eo pid=,args= 2>/dev/null)
+
+    pids="$(echo "${pids}" | tr -s ' ')"
+    [ -n "${pids// /}" ] || return 0
+
+    lib_log "发现绑定 ${sock} 的孤儿进程:${pids}，执行清理"
+    # 先 TERM 再 KILL，并跳过自己与父进程，避免自杀
+    local self=$$ parent=${PPID:-0}
+    for pid in ${pids}; do
+        [ "${pid}" = "${self}" ] && continue
+        [ "${pid}" = "${parent}" ] && continue
+        kill -TERM "${pid}" 2>/dev/null || true
+    done
+    sleep 2
+    for pid in ${pids}; do
+        [ "${pid}" = "${self}" ] && continue
+        [ "${pid}" = "${parent}" ] && continue
+        kill -0 "${pid}" 2>/dev/null && {
+            lib_log "孤儿进程 ${pid} 未响应 TERM，发送 KILL"
+            kill -KILL "${pid}" 2>/dev/null || true
+        }
+    done
+    rm -f "${sock}" 2>/dev/null
+    return 0
 }
 
 lib_probe_proxy() {

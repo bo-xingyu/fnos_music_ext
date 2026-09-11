@@ -107,6 +107,12 @@ verify_official() {
 
 main() {
     lib_log "=== stop 开始 ==="
+    # 0. 先停管理页面：它可能会调用 restart_services.sh，先断掉这条路径，
+    #    避免停机过程中页面又发起一次重启造成竞争
+    lib_stop_pid "ui" "${UI_PID}" 10
+    # pidfile 可能因启动竞态丢失，按 socket 路径精确兜底清理，杜绝孤儿进程
+    lib_kill_stale_by_sock "${UI_SOCK}"
+    rm -f "${UI_SOCK}" 2>/dev/null
     # 1. 停代理
     lib_stop_pid "proxy" "${PROXY_PID}" 15
     # 2. 复位 socket（关键步骤，失败也要继续清理音源服务）

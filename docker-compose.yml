@@ -7,9 +7,12 @@
 # 其中基础镜像由 ensure_base_image.sh 自动探测维护：国内镜像优先直连（绕开 daemon
 # 加速器），官方源兜底（不修改系统 Docker 配置，仅本应用构建生效）。
 #
-# musicbox 端口对外绑定 0.0.0.0，是为了让局域网内能用浏览器打开二维码图片扫码登录：
-#   http://<NAS_IP>:8770/api/v1/auth/login/qr.png
-# 若不需要该方式，可改成 127.0.0.1:8770:8000，改用 ./netease_login.sh 终端扫码。
+# 默认只监听 127.0.0.1：音源服务的接口全部无鉴权（含发起扫码登录），对外暴露意味着
+# 同网段任何人都能扫自己的号顶掉你的登录。扫码统一走 ./netease_login.sh。
+# 如果你确实需要在别的设备上用浏览器打开二维码图片：
+#   1. 在 .env 里设 FNMUSIC_MUSICBOX_BIND=0.0.0.0
+#   2. 访问 http://<NAS_IP>:8770/api/v1/auth/login/qr.png
+# 并自行做好防火墙/内网隔离。
 services:
   musicbox:
     build:
@@ -20,7 +23,7 @@ services:
         PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: fnmusic-musicbox
     ports:
-      - "0.0.0.0:8770:8000"
+      - "${FNMUSIC_MUSICBOX_BIND:-127.0.0.1}:8770:8000"
     volumes:
       # 网易云登录 cookie 与缓存的唯一持久化位置，重扫登录/升级都不丢
       - ./musicbox-data:/data

@@ -3,6 +3,54 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.1.0] - 2026-09-11
+
+### 新增
+
+- **飞牛桌面内管理页面**（`proxy/admin_ui.py`）：装 `.fpk` 后飞牛桌面会出现「飞牛音乐扩展」
+  图标，点开即可在网页里完成**扫码登录、全部配置、日志查看**，全程不需要 SSH。
+  - 通过**统一网关** `/app/fnmusicext` 暴露（`fpk/payload/ui/config` 注册），服务监听
+    `${TRIM_APPDEST}/ui.sock`；飞牛在转发前校验 NAS 登录态并注入
+    `X-Trim-Userid` / `X-Trim-Isadmin` / `X-Trim-Username`。
+  - 鉴权只信任这三个 Header，缺失即拒绝（视为未经网关的裸 socket 访问）；
+    登录与改配置一律要求 `X-Trim-Isadmin: true`。桌面入口 `allUsers=false`，
+    非管理员看不到图标。
+  - 页面单文件、零外部依赖（不引任何 CDN），内网/离线环境可直接使用，自适应深浅色。
+  - 扫码流程：页面内出图 → 每 2.5s 轮询 → 802 提示手机确认 → 803 成功并刷新状态 →
+    800 过期自动换码（170s 兜底刷新）。
+  - 配置保存前弹确认，明确告知「重启期间飞牛音乐会短暂回到官方直连、正在播放的在线曲目
+    可能中断一次」。
+  - 内置日志查看（生命周期/代理/音源/socket 还原/安装依赖/本页），带路径穿越防护与
+    token 脱敏。
+- **musicbox 二维码接口支持指定 unikey**：`GET /api/v1/auth/login/qr.png?unikey=`。
+  此前每次取 PNG 都会新发起一次登录，"展示的码"与"轮询的 unikey"会错位，扫了也登不上。
+- **`fpk/payload/bin/restart_services.sh`**：只重启代理与音源服务，**刻意不动 ui 进程**——
+  否则页面发起重启会杀掉自己，响应永远回不来、用户只看到页面卡死。
+- 管理页面写配置复用 `proxy/env_merge.py`，顺带清理废弃键，`.env` 写入前自动备份为
+  `.env.bak`，保持 0600 与原子替换。
+
+### 变更
+
+- **音源服务默认只监听 `127.0.0.1`**（原为 `0.0.0.0:8770`）。
+  musicbox 的接口全部无鉴权，其中就包含"发起扫码登录"，对外暴露意味着同网段任何人都能扫
+  自己的号顶掉你的网易云登录。扫码改由桌面页面或 `netease_login.sh` 完成，不再需要对外开端口。
+  - fpk：向导「音源服务监听地址」默认值改为 `127.0.0.1`，仍可改回 `0.0.0.0`；
+  - git 安装：`docker-compose.yml` 改为 `${FNMUSIC_MUSICBOX_BIND:-127.0.0.1}:8770:8000`，
+    `install.sh` host 模式的 systemd unit 改用 `${MUSICBOX_BIND}`（默认回环）；
+  - 新增 `.env` 键 `FNMUSIC_MUSICBOX_BIND`。
+
+### 修复
+
+- **管理页面保存任意配置会冲掉 PushPlus token**：合并逻辑误用了"对客户端打码后的视图"，
+  导致 `pushplus_token` / `pushplus_topic` 被写成 `••••••••`。改为内部合并一律走
+  **真实值**视图 `_to_editable()`，脱敏只发生在返回客户端那一步；「未提交该项」与
+  「提交了打码串/空串」都判定为不修改并保留原值。
+- `fnmusic-lib.sh` 里 `PKGVAR` 的兜底默认值写成了 `@appvar`，官方框架实际是
+  `/vol{n}/@appdata/{appname}`。改为按真实布局探测后回退。
+- `build_fpk.sh` 新增自检：声明 `desktop_uidir` 时校验 `app/{uidir}/config` 存在且为合法
+  JSON，并核对 `gatewaySocket` 与生命周期脚本创建的 socket 文件名**完全一致**
+  （不一致会导致桌面图标点开 502，且很难排查）。
+
 ## [2.0.0] - 2026-09-11
 
 大版本重构：**在线音源收敛为网易云单一渠道，且只使用扫码登录的那个私人账号的权益。**

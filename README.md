@@ -15,9 +15,55 @@
 - **网易云官方「每日推荐」**：直接抓取 `/weapi/v3/discovery/recommend/songs`，在飞牛歌单列表注入一份与网易云 App 同源的「每日推荐」，推荐逻辑交给网易云自己；
 - **全平台原生无感适配**：飞牛网页端、官方手机 App、车载端开箱即用，无需安装任何客户端第三方插件；
 - **多用户隔离收藏**：家庭多成员在 App 里点「红心」收藏在线歌曲，彼此数据独立隔离，与本地曲库完美融合；
-- **PushPlus 掉线提醒**：登录态失效、首次检测到未登录、登录成功、VIP 临期时推送提醒，不必盯着 NAS 才发现会员已过期。
+- **PushPlus 掉线提醒**：登录态失效、首次检测到未登录、登录成功、VIP 临期时推送提醒，不必盯着 NAS 才发现会员已过期；
+- **桌面网页管理**：装 `.fpk` 后飞牛桌面会出现「飞牛音乐扩展」图标，扫码登录、改配置、看日志全在一个页面里完成，**不用 SSH**。
 
 在线音源实现基于 [darknessomi/musicbox](https://github.com/darknessomi/musicbox)（PyPI 包名 `NetEase-MusicBox`），本仓库的 `musicbox-service/` 是它的 HTTP 包装层。
+
+---
+
+## 两种安装方式
+
+| | **A. 飞牛应用包 .fpk（推荐）** | **B. git 克隆 + 脚本** |
+| :--- | :--- | :--- |
+| 适合谁 | 想少碰命令行的普通用户 | 想读代码/改造/参与开发的用户 |
+| 安装入口 | 应用中心 →「手动安装」→ 选 `.fpk` | `git clone` 后跑 `./install.sh` |
+| 扫码登录 | **飞牛桌面图标里的网页**（也保留 `netease_login.sh`） | 终端 `./netease_login.sh` |
+| 改配置 | **网页里改**（也保留应用设置的向导表单） | `./install.sh` 重新走向导，或改 `.env` |
+| 看日志 | **网页里看** | `journalctl -u fnmusic-ext -f` |
+| 启停 | 应用中心的启动/停止按钮 | `./extend.sh` / `./restore.sh` |
+| 部署形态 | 飞牛原生进程管理（`cmd/main` + PID 文件，非 systemd、非 Docker） | systemd + Docker 容器，或 systemd + venv |
+
+两种方式的音源与代理逻辑完全相同，只是宿主方式不同。下面**先讲 fpk**，再讲 git 方式。
+
+### A. 飞牛应用包（.fpk）
+
+```bash
+# 在自己的构建机上打包（产物在 dist/）
+./build_fpk.sh
+```
+
+或直接用 Release 里的成品，然后：
+
+1. 打开飞牛**应用中心** → 左下角**「手动安装」** → 选择 `fnmusicext-<版本>.fpk`
+2. 安装向导里按需勾选：音质、未登录是否降级、是否启用每日推荐、PushPlus token
+3. 安装完成后在应用中心**启动**本应用
+4. 回到飞牛**桌面**，点开「飞牛音乐扩展」图标 → 点「生成二维码」→ 用网易云 App 扫码
+
+页面能力：
+
+- **运行状态**：接管状态、官方后端连通性、音源服务、登录态与 VIP 剩余天数、日推与推送状态
+- **扫码登录**：页面内出图，每 2.5s 轮询，已扫码会提示去手机确认，二维码过期自动换新的
+- **配置**：音质 / 降级策略 / 每日推荐 / PushPlus / 搜索与缓存各项，保存后弹确认再重启
+- **日志**：生命周期、代理、音源、socket 还原、安装依赖、本页，各看最近 120 行
+
+该页面走飞牛**统一网关** `/app/fnmusicext`，由飞牛校验 NAS 登录态后才转发，
+且**只认 `X-Trim-Isadmin: true`**——非管理员既看不到桌面图标，也调不动任何接口。
+详见 [`fpk/README.md`](fpk/README.md)。
+
+### B. git 克隆安装
+
+见下方「快速开始」。
 
 ---
 
@@ -83,11 +129,15 @@ chmod +x install.sh extend.sh restore.sh netease_login.sh ensure_base_image.sh p
 
 终端会展示 ASCII 二维码，用网易云音乐 App 扫码；二维码约 3 分钟有效，过期自动刷新，登录状态轮询到成功为止。不想现在登录可按 `Ctrl+C` 跳过——扩展会以「只播免费曲」的降级模式继续运行。
 
-局域网内也可以用浏览器扫码：
+**fpk 安装用户**：装 `.fpk` 的话飞牛桌面上会有「飞牛音乐扩展」图标，点开就能在网页里扫码登录、
+改全部配置、看日志，**不用 SSH**。该页面走飞牛统一网关 `/app/fnmusicext`，
+由飞牛校验 NAS 登录态后转发，且限管理员访问。
 
-```
-http://<NAS_IP>:8770/api/v1/auth/login/qr.png
-```
+**git 安装用户**：如需在别的设备上用浏览器直接取二维码图片，可把 `.env` 里的
+`FNMUSIC_MUSICBOX_BIND` 改为 `0.0.0.0` 后重装，再访问
+`http://<NAS_IP>:8770/api/v1/auth/login/qr.png`。
+注意音源服务接口无鉴权，对外暴露等于同网段任何人都能扫自己的号顶掉你的登录，
+因此**默认只绑 `127.0.0.1`**。
 
 查看当前登录状态：
 
@@ -266,8 +316,11 @@ curl -s http://127.0.0.1:8770/api/v1/auth/detail
 ├── netease_login.sh        # 终端扫码登录（ASCII 二维码 + 过期刷新 + 状态轮询）
 ├── ensure_base_image.sh    # Docker 基础镜像源国内优先探测（docker 模式）
 ├── docker-compose.yml      # 单 service：musicbox
+├── build_fpk.sh            # 打包飞牛应用包 → dist/<app>-<version>.fpk
+├── fpk/                    # 应用包源：manifest / cmd / wizard / config / ui 入口 / 图标生成
 ├── proxy/                  # 拦截代理本体
 │   ├── app.py              # FastAPI 代理，所有拦截端点
+│   ├── admin_ui.py         # 桌面网页：扫码登录 + 配置 + 日志（统一网关鉴权）
 │   ├── netease_auth.py     # 登录态探测/缓存 + 降级门控 + 推送触发
 │   ├── netease_items.py    # 网易云 song_info → 统一条目映射
 │   ├── pushplus.py         # PushPlus 推送客户端（含节流与脱敏）
@@ -287,8 +340,11 @@ curl -s http://127.0.0.1:8770/api/v1/auth/detail
 ## 开发与测试
 
 ```bash
-python3 -m pip install -r proxy/requirements.txt pytest pytest-asyncio
-python3 -m pytest proxy/tests -q          # 288 passed, 1 skipped(需 ffmpeg)
+python3 -m pip install -r proxy/requirements.txt pytest pytest-asyncio pillow
+python3 -m pytest proxy/tests -q          # 355 passed, 1 skipped(需 ffmpeg)
+
+./build_fpk.sh                            # 打包 + 10 项自动自检
+./build_fpk.sh --fnpack                   # 有官方 fnpack 时额外做结构交叉验证
 ```
 
 参与贡献请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)；安全问题请遵循 [SECURITY.md](SECURITY.md)。

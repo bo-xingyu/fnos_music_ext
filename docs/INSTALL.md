@@ -47,8 +47,11 @@ chmod +x install.sh extend.sh restore.sh netease_login.sh ensure_base_image.sh p
   * 必须先在 fnOS「应用中心」安装好 Docker。**脚本不会擅自安装 Docker 引擎**；若未安装，向导会友好提醒并引导切换至 Host 模式。
 - **会部署什么**：
   * 通过 `docker-compose.yml` 在本地构建并启动唯一的音源容器：
-    1. **`fnmusic-musicbox`**：监听 **`0.0.0.0:8770`**（网易云；对外绑定是为了让局域网浏览器能打开二维码图片扫码登录）；
-  * 若不需要浏览器扫码方式，可把 compose 里的端口改为 `127.0.0.1:8770:8000`，改用 `./netease_login.sh` 在终端扫码；
+    1. **`fnmusic-musicbox`**：监听 **`127.0.0.1:8770`**（网易云音源）；
+  * 该端口**默认只绑回环**：音源服务接口全部无鉴权（含发起扫码登录），对外暴露意味着同网段
+    任何人都能扫自己的号顶掉你的网易云登录。扫码统一走 `./netease_login.sh`；
+  * 确实需要在别的设备浏览器扫码时，在 `.env` 里设 `FNMUSIC_MUSICBOX_BIND=0.0.0.0`
+    再重装，并自行做好防火墙/内网隔离；
 - **容器网络与权限**：
   * 容器内运行无特权（以非 root 的普通用户运行）；
   * 数据卷严格挂载并隔离在当前项目目录下的 `musicbox-data/` 目录中，不与系统其他目录发生交叉。
@@ -64,7 +67,7 @@ chmod +x install.sh extend.sh restore.sh netease_login.sh ensure_base_image.sh p
 - **会部署什么**：
   * **独立的 Python 虚拟环境**：在当前项目目录下分别创建 `.venv-musicbox` 与 `.venv-proxy`。依赖严格限制在各自虚拟环境内，**绝不污染系统全局 Python 环境**；
   * **注册轻量 systemd 服务**：
-    1. `fnmusic-musicbox.service`：`0.0.0.0:8770`（局域网扫码）；
+    1. `fnmusic-musicbox.service`：`127.0.0.1:8770`（默认只绑回环，理由同上）；
 - **数据与缓存管理**：
   * 所有运行时数据（音频缓存 `cache/`、用户收藏 `online_favorites/`、历史记录 `play_history/`、网易云配置与缓存 `musicbox-data/`）严格保存在当前项目根目录下，**绝对不会散落到系统其他地方**。
 
@@ -79,7 +82,7 @@ chmod +x install.sh extend.sh restore.sh netease_login.sh ensure_base_image.sh p
 | **前置要求** | fnOS 应用中心安装 Docker（**脚本不擅自安装**） | 仅需宿主机具备 `python3` 及 `python3-venv` |
 | **核心代理部署** | 宿主机 systemd 服务（`.venv-proxy` 独立虚拟环境） | 宿主机 systemd 服务（`.venv-proxy` 独立虚拟环境） |
 | **音源运行形态** | Docker 容器（通过 `docker-compose` 编排管理） | 宿主机 systemd 服务（通过独立 Python venv 隔离） |
-| **部署组件与端口** | • `fnmusic-musicbox`：`0.0.0.0:8770`（局域网可扫码） | • `fnmusic-musicbox.service`：`0.0.0.0:8770` |
+| **部署组件与端口** | • `fnmusic-musicbox`：`127.0.0.1:8770` | • `fnmusic-musicbox.service`：`127.0.0.1:8770` |
 | **Python 环境隔离** | 依赖封装在容器镜像内，宿主机零依赖污染 | 项目目录下 `.venv-musicbox`，不污染全局 |
 | **权限与安全性** | 容器内无特权用户运行，隔离网络端口 | 独立 systemd 进程，仅监听本地回环网络 |
 | **数据落盘路径** | 项目根目录 `cache/`、`online_favorites/`、`musicbox-data/` | 项目根目录 `cache/`、`online_favorites/`、`musicbox-data/` |
@@ -184,14 +187,22 @@ v2.0 起**在线音源完全来自你扫码登录的那一个私人网易云账�
 - 已登录时直接跳过，不重复出码；
 - 不想现在登录可按 `Ctrl+C` 跳过——扩展会以免费曲降级模式继续运行。
 
-**方式二：局域网浏览器扫码（备选）**
+**方式二：fpk 安装用户 —— 飞牛桌面网页扫码（推荐）**
+
+如果你装的是 `.fpk` 应用包，飞牛桌面上会有一个「飞牛音乐扩展」图标，点开即可在网页里
+扫码登录、改全部配置、看日志，**完全不需要 SSH**。该页面走飞牛统一网关
+`/app/fnmusicext`，由飞牛校验 NAS 登录态后才转发，且限管理员访问。
+
+**方式三：局域网浏览器直接打开二维码图片（默认关闭）**
 
 ```text
 http://<飞牛NAS的IP地址>:8770/api/v1/auth/login/qr.png
 ```
 
-> 该方式要求音源服务对外绑定 `0.0.0.0:8770`（默认如此）。若你已把 compose 端口收紧为
-> `127.0.0.1:8770:8000`，则只能用方式一。
+> 该方式需要音源服务对外绑定，**v2.1.0 起默认已收紧为 `127.0.0.1`**，开箱不可用。
+> 要启用需在 `.env` 里设 `FNMUSIC_MUSICBOX_BIND=0.0.0.0` 后重装（git 安装路径）
+> 或在应用设置里把「音源服务监听地址」改成 `0.0.0.0`（fpk 安装路径）。
+> 启用后同网段任何人都能无鉴权访问音源接口，请自行评估并加防火墙限制。
 
 **查看登录状态**
 

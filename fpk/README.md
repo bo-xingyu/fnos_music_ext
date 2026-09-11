@@ -31,11 +31,12 @@ fnmusicext-2.0.0.fpk  (tar.gz)
 `app.tgz` 解开后是应用的实际内容，安装到 `/var/apps/fnmusicext/target/`：
 
 ```
-proxy/                 拦截代理源码（app.py / netease_auth.py / pushplus.py /
+proxy/                 拦截代理源码（app.py / admin_ui.py / netease_auth.py / pushplus.py /
                        netease_items.py / recommend.py / env_merge.py / version.py /
                        run_proxy.sh / requirements.txt）
 musicbox-service/      网易云音源 HTTP 包装（app.py / runner.py / netease_ext.py）
 bin/                   fpk 专属胶水层（见下）
+ui/                    桌面入口声明 config + images/icon_{64,256}.png
 restore.sh             从仓库根同步，socket 还原逻辑原样复用
 netease_login.sh       从仓库根同步，终端扫码登录
 VERSION
@@ -55,8 +56,9 @@ fpk 走 `cmd/*` 生命周期，打包进去只会增加体积与审核困惑。
 | `fnmusic-lib.sh` | 共享函数：路径常量、日志、`TRIM_TEMP_LOGFILE` 错误上报、PID 管理、HTTP 探活、降权执行、后台守护启动 |
 | `setup.sh` | 把载荷 stage 到 `$TRIM_PKGVAR/app`、建 venv 装依赖、按向导值生成 `.env`（0600）。幂等 |
 | `start.sh` | 先起音源服务（降权），再接管 socket 起代理（root） |
-| `stop.sh` | 停代理 → 还原 socket → 停音源服务 |
+| `stop.sh` | 停管理页面 → 停代理 → 还原 socket → 停音源服务 |
 | `status.sh` | 运行中 exit 0，未运行 exit 3 |
+| `restart_services.sh` | 只重启代理与音源服务，**不动管理页面进程**（见下） |
 
 ### 为什么 stage 到 `$TRIM_PKGVAR/app` 而不是就地运行 `$TRIM_APPDEST`
 
@@ -87,7 +89,12 @@ fpk 走 `cmd/*` 生命周期，打包进去只会增加体积与审核困惑。
 | :--- | :--- | :--- |
 | 生命周期脚本 `cmd/*` | root | 官方文档允许：「只有生命周期脚本确实需要执行特权准备任务时才使用 Root 模式」 |
 | 代理 `proxy/app.py` | root | 必须在 `/var/run` 下创建 bind socket，无法降权 |
-| 音源服务 `musicbox-service` | **`$TRIM_USERNAME`（专用包用户）** | 仅监听 TCP 端口、读写自有数据目录，完全满足官方「长期运行且对外提供访问的进程应尽量非 root」 |
+| 管理页面 `proxy/admin_ui.py` | root | 要写入 root 代理读取的 `.env`，并调用需要 root 的重启脚本 |
+| 音源服务 `musicbox-service` | **`$TRIM_USERNAME`（专用包用户）** | 仅监听 unix/TCP 私有端点、读写自有数据目录，完全满足官方「长期运行且对外提供访问的进程应尽量非 root」 |
+
+管理页面虽然以 root 跑，但**对外不开放任何端口**：它只监听 `${TRIM_APPDEST}/ui.sock`，
+唯一入口是飞牛统一网关 `/app/fnmusicext`，网关会先校验 NAS 登录态、再注入身份 Header。
+换句话说 root 权限只暴露给「已通过飞牛登录的管理员」。
 
 降权通过 `fnmusic-lib.sh` 的 `lib_spawn` 实现：优先 `runuser`，退化到 `su`，
 两者都不可用时（受限容器、包用户未创建）**如实告警后以当前身份继续**，
@@ -133,6 +140,77 @@ PID，服务进程永久泄漏。降权场景更糟——`runuser`/`su` 是中�
 中间层是否存活都不影响停机准确性。
 
 ---
+
+## 桌面入口与管理页面
+
+`manifest` 声明 `desktop_uidir = ui` + `desktop_applaunchname = fnmusicext.main`，
+`app/ui/config` 按官方统一网关模型注册入口：
+
+```json
+{
+  ".url": {
+    "fnmusicext.main": {
+      "title": "飞牛音乐扩展",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/fnmusicext",
+      "gatewaySocket": "ui.sock",
+      "url": "/app/fnmusicext",
+      "allUsers": false
+    }
+  }
+}
+```
+
+于是飞牛桌面出现一个图标，点开即在 iframe 内加载 `/app/fnmusicext`；
+飞牛**先校验 NAS 登录态**，再把请求转发到 `/var/apps/fnmusicext/target/ui.sock`，
+并注入 `X-Trim-Userid` / `X-Trim-Isadmin` / `X-Trim-Username`。
+
+`allUsers=false`：非管理员连图标都看不到，与后端的管理员限制一致。
+
+### `proxy/admin_ui.py` 的设计要点
+
+- **只信网关 Header**。缺少 `X-Trim-Userid`/`X-Trim-Username` 即判定「未经网关的裸 socket 访问」，
+  页面返回 403 说明页、接口返回 403 JSON。官方明确要求「不要信任客户端传入的用户 ID」。
+  `X-Trim-Userid` 还要过形状校验（`^[\w.\-@]{1,64}$`），可疑值直接拒绝并记日志。
+- **登录与改配置一律要求 `X-Trim-Isadmin: true`**。扫码会决定整台 NAS 用哪个网易云账号做音源，
+  token 属于凭据，都不该让家庭成员随手改。
+- **前缀兼容**。网关可能带 `/app/fnmusicext` 前缀转发，也可能已剥离，中间件统一剥掉；
+  页面内一律用相对路径请求，两种情况都能工作。
+- **token 三处防泄漏**：`type=password` 输入不回显；`GET /api/config` 返回打码串；
+  `/api/logs` 回显前用 `.env` 与进程环境变量**两处**真实值做脱敏（只读环境变量的话，
+  用户刚保存、尚未被任何进程加载的新 token 就会原样出现在日志里）。
+- **写入走白名单**。页面能改的键由 `CONFIG_FIELDS` 固定映射到 `FNMUSIC_*`，
+  提交任何未知字段（含 `FNMUSIC_HOME`、`PATH` 这类 env 原名）直接 400，杜绝任意 `.env` 键注入。
+  所有值按枚举/范围/URL/控制字符规则校验；写入复用 `env_merge`，先备份 `.env.bak`，
+  再原子替换并保持 0600。
+- **`留空 = 不改`**。password 字段不回显真实值，照原样写回就会把用户的 token 冲掉，
+  因此「未提交该项」「提交空串」「提交打码串 `••••••••`」三种情况都判定为不修改。
+- **日志接口防穿越**。`what` 走固定枚举白名单，解析后再用 `realpath` 前缀复核，
+  `../../etc/passwd` 之类一律 400。
+- **页面零外部依赖**。不引任何 CDN / 外链脚本 / 外链字体，内网与离线 NAS 可直接使用；
+  自适应 `prefers-color-scheme`；用户名做 HTML 转义（Header 来的值不该被当成可信 HTML）。
+
+### 为什么 `restart_services.sh` 刻意不动管理页面
+
+保存配置后需要重启才能生效。如果重启流程把 ui 进程也停了，**发起重启的这个 HTTP 请求就会
+把自己的服务杀掉**——响应永远回不来，用户只看到页面转圈卡死，还以为保存失败了。
+所以拆出 `restart_services.sh`：只停/起 `proxy` 与 `musicbox`，ui 全程存活。
+
+停机顺序也因此调整为「先停 ui，再停代理，再还原 socket，最后停音源」：
+先断掉 ui 这条可能在停机途中又发起一次重启的路径，避免竞争。
+
+### socket 权限与孤儿进程
+
+- `ui.sock` 创建后 `chmod 666`：unix socket 的 **connect 权限取决于文件写位**，
+  不设 666 网关进程可能连不上，表现为桌面图标点开 502。
+- `stop.sh` 除按 pidfile 停进程外，还会用 `lib_kill_stale_by_sock` 按**本应用自己的 socket
+  绝对路径**精确匹配清理孤儿。因为一旦启动竞态导致 pidfile 丢失，只 `rm` socket 文件是没用的——
+  旧进程仍持有那个已删除的 inode，新进程绑到新 inode，两者并存且旧的再也回收不掉。
+  匹配串限定为 `--uds <本应用 socket 路径>`，不会波及任何其它 uvicorn。
+- `build_fpk.sh` 自检会核对 `ui/config` 的 `gatewaySocket` 与 `fnmusic-lib.sh` 里的
+  `UI_SOCK` 文件名**完全一致**：不一致的话桌面图标点开就是 502，且极难排查。
 
 ## 配置向导
 
@@ -242,7 +320,13 @@ $TRIM_PKGVAR/logs/{upgrade,uninstall,config}.log
   重复 stop 幂等、停机后无残留进程）。安装器是否强制校验 `checksum` 无法离线验证，
   但打包时始终写入正确值。
 - **`platform=all`**：包内不含任何架构相关二进制（纯 Python + bash）。若将来引入编译产物需改为 `x86`/`arm` 分包。
-- **8770 端口未被 manifest 声明**：`service_port` 留给「应用自己的 Web UI 入口」。本应用没有
-  独立 UI（它增强的是官方飞牛音乐界面），8770 仅用于音源服务的健康检查与局域网扫码，
-  故 `checkport=false` 且不声明 `service_port`。若需要纳入飞牛远程访问的端口转发，
-  社区有 `.sc` + `port-config` 的做法，但**官方文档无记载、字段语义未确认**，本包暂未使用。
+- **不声明 `service_port`**：本应用没有对外的 Web 端口——管理页面走统一网关的 unix socket，
+  8770 只是音源服务的内部端点且**默认只绑 `127.0.0.1`**（它的接口无鉴权，含"发起扫码登录"，
+  对外暴露等于同网段任何人都能扫自己的号顶掉你的网易云登录）。故 `checkport=false`
+  且不声明 `service_port`，飞牛也不会在启动前做端口占用检查。
+  若确实要纳入飞牛远程访问的端口转发，社区有 `.sc` + `port-config` 的做法，
+  但**官方文档无记载、字段语义未确认**，本包暂未使用。
+- **管理页面的 root 身份**：`admin_ui.py` 以 root 运行，因为它要改 root 代理读取的 `.env`
+  并调用需要 root 的重启脚本。它不监听任何端口、只经由校验 NAS 登录态的统一网关可达，
+  且限管理员。若审核对此有异议，可行的收敛方向是把「写配置」与「重启」拆给一个由
+  `config_callback` 驱动的最小特权辅助进程，但那是更大的改动。

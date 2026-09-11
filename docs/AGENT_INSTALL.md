@@ -36,8 +36,9 @@
    扩展失败必须安全秒级回滚到官方直连。
 7. 音源组件与端口规划：
    - musicbox: https://github.com/darknessomi/musicbox（PyPI 包名 NetEase-MusicBox）。
-     Docker / Host 均映射 0.0.0.0:8770，便于局域网扫码
-     http://<NAS-IP>:8770/api/v1/auth/login/qr.png；登录凭证持久化在 musicbox-data/。
+     Docker / Host 默认只绑 127.0.0.1:8770（FNMUSIC_MUSICBOX_BIND 可改）；登录凭证持久化在
+     musicbox-data/。音源接口无鉴权，不要擅自改成 0.0.0.0 —— 那等于让同网段任何人都能
+     扫自己的号顶掉用户的网易云登录。
    - 容器名固定 fnmusic-musicbox，宿主机模式 systemd unit 固定 fnmusic-musicbox.service。
    - FNMUSIC_NETEASE_ENABLED 为 false 时在线功能全部关闭，等于扩展失去意义，应向用户确认而非静默继续。
 
@@ -84,7 +85,9 @@ Unix Domain Socket 接管与端到端验收自检，实现安装+接管一步到
 音源取决于登录账号的权益，未登录只能播免费曲且没有每日推荐。
   - 终端扫码（推荐，ASCII 二维码 + 过期自动刷新 + 状态轮询）：
     ./netease_login.sh        # 或 ./extend.sh --qr
-  - 局域网浏览器扫码（备选）：http://<NAS-IP>:8770/api/v1/auth/login/qr.png
+  - fpk 安装用户优先走飞牛桌面「飞牛音乐扩展」图标里的网页扫码（统一网关，需 NAS 登录 + 管理员）
+  - 局域网浏览器扫码 http://<NAS-IP>:8770/api/v1/auth/login/qr.png 默认不可用
+    （音源服务已收紧为 127.0.0.1），需要时把 FNMUSIC_MUSICBOX_BIND 改为 0.0.0.0 并加固网络
   - 查询登录状态：curl -s http://127.0.0.1:8770/api/v1/auth/detail
     返回 data.logged_in / data.nickname / data.vip_type / data.vip_expires_ms。
   - 若用户暂时不扫码，如实告知当前处于免费曲降级模式即可，不要反复重试扫码。
@@ -125,7 +128,7 @@ Unix Domain Socket 接管与端到端验收自检，实现安装+接管一步到
 【完成汇报规范】
 任务完成后用简短中文输出总结，内容包含：
 1. 部署模式判断（Docker 模式或 Host 模式，及环境预检依据）；
-2. 音源与端口说明（musicbox: 0.0.0.0:8770）；
+2. 音源与端口说明（musicbox: 127.0.0.1:8770，默认不对外）；
 3. 网易云登录状态（logged_in / nickname / 是否 VIP / VIP 剩余天数）——严禁复述 cookie 或 token；
 4. 每日推荐与降级策略是否开启（daily_enabled / free_only_on_logout）；
 5. PushPlus 是否启用（只说 enabled/disabled 与是否配了群组，严禁输出 token 原文）；

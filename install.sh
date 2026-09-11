@@ -377,6 +377,8 @@ fi
 
 # 开关最终值（未在命令行/交互中明确指定时回落到 .env.example 同款默认值）
 FREE_ONLY_VAL="${FREE_ONLY_ON_LOGOUT:-true}"
+# 音源服务监听地址：默认只绑回环（接口无鉴权，对外暴露等于谁都能顶掉你的网易云登录）
+MUSICBOX_BIND="${MUSICBOX_BIND:-127.0.0.1}"
 DAILY_VAL="${DAILY_ENABLED:-true}"
 PUSHPLUS_ENABLED_VAL="${PUSHPLUS_ENABLED:-true}"
 
@@ -559,7 +561,7 @@ Environment=XDG_DATA_HOME=${BASE_DIR}/musicbox-data
 Environment=XDG_CACHE_HOME=${BASE_DIR}/musicbox-data/cache
 Environment=XDG_CONFIG_HOME=${BASE_DIR}/musicbox-data/config
 Environment=FNMUSIC_FREE_ONLY_ON_LOGOUT=${FREE_ONLY_VAL:-true}
-ExecStart=${BASE_DIR}/.venv-musicbox/bin/uvicorn app:app --host 0.0.0.0 --port 8770
+ExecStart=${BASE_DIR}/.venv-musicbox/bin/uvicorn app:app --host ${MUSICBOX_BIND} --port 8770
 Restart=always
 RestartSec=5
 

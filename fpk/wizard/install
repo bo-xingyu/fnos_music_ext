@@ -48,8 +48,8 @@
         "type": "select",
         "field": "wizard_musicbox_bind",
         "label": "音源服务监听地址",
-        "initValue": "0.0.0.0",
-        "helpText": "0.0.0.0 允许局域网浏览器打开二维码图片扫码（http://<NAS_IP>:8770/api/v1/auth/login/qr.png）；127.0.0.1 更安全，只能用终端 netease_login.sh 扫码。",
+        "initValue": "127.0.0.1",
+        "helpText": "默认 127.0.0.1（仅本机）——扫码登录与配置都在飞牛桌面的「飞牛音乐扩展」页面里完成，不需要对外开端口。只有当你必须在别的设备上用浏览器直接打开 http://<NAS_IP>:8770/api/v1/auth/login/qr.png 时才改成 0.0.0.0；注意那样一来同网段的任何人都能无鉴权访问并可能扫自己的号顶掉你的登录。",
         "options": [
           { "label": "0.0.0.0（可局域网浏览器扫码）", "value": "0.0.0.0" },
           { "label": "127.0.0.1（仅本机，最安全）", "value": "127.0.0.1" }

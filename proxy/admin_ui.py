@@ -1,0 +1,1162 @@
+"""飞牛桌面内的管理页面：扫码登录网易云 + 全部配置，一个页面搞定。
+
+通过**统一网关**暴露为 `/app/fnmusicext`（由 `fpk/payload/ui/config` 注册，
+应用服务监听 `${TRIM_APPDEST}/ui.sock`）。网关会在转发前校验 NAS 登录态，
+并注入可信身份 Header：
+
+    X-Trim-Userid / X-Trim-Isadmin / X-Trim-Username
+
+因此本模块**只**信任这三个 Header。缺失即说明请求没有经过网关
+（例如有人直接连到 unix socket），一律拒绝——官方明确要求
+「不要信任客户端传入的用户 ID」。
+
+登录与改配置都限定管理员：扫码会决定整个 NAS 用哪个网易云账号做音源，
+PushPlus token 属于凭据，都不是家庭成员该随手改的东西。
+
+安全约定：
+  - PushPlus token 回显时一律打码，只在用户显式提交新值时写入；
+  - token 绝不出现在日志、异常信息或任何响应体里；
+  - 所有写入值都按白名单/正则校验后再落盘，`.env` 保持 0600 与原子替换。
+
+本地开发（无网关）调试方式见 ADMIN_UI_ALLOW_NO_GATEWAY 的注释。
+"""
+from __future__ import annotations
+
+import asyncio
+import html
+import json
+import logging
+import os
+import re
+import subprocess
+import time
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from starlette.middleware.base import BaseHTTPMiddleware
+
+try:
+    from . import env_merge
+    from . import netease_auth
+    from . import pushplus
+    from .version import get_version
+except ImportError:  # uvicorn --app-dir proxy
+    import env_merge  # type: ignore
+    import netease_auth  # type: ignore
+    import pushplus  # type: ignore
+    from version import get_version  # type: ignore
+
+logger = logging.getLogger("fnmusic_proxy.admin_ui")
+
+GATEWAY_PREFIX = os.environ.get("FNMUSIC_ADMIN_PREFIX", "/app/fnmusicext")
+MUSICBOX_URL = os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770").rstrip("/")
+PROXY_SOCK = os.environ.get("FNMUSIC_ADMIN_PROXY_SOCK", "/var/run/trim_music.socket")
+ENV_FILE = os.environ.get("FNMUSIC_ADMIN_ENV_FILE", "")
+RESTART_SCRIPT = os.environ.get("FNMUSIC_ADMIN_RESTART_SCRIPT", "")
+UPSTREAM_SOCK = os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket")
+
+# 仅在无网关的环境（git 克隆安装、本地开发）把管理页放到 TCP 端口上时才需要打开。
+# 打开意味着任何能连到该端口的人都拿到管理员权限，因此默认关闭，
+# 且必须由运维显式设置为 true，同时自行加防火墙/内网限制。
+ALLOW_NO_GATEWAY = (
+    os.environ.get("FNMUSIC_ADMIN_ALLOW_NO_GATEWAY", "false").strip().lower()
+    in ("true", "1", "yes", "on")
+)
+
+MUSICBOX_TIMEOUT_S = 12.0
+RESTART_TIMEOUT_S = 90.0
+LOG_LINE_LIMIT = 400
+
+# 配置项白名单：field -> (env key, 校验器, 是否敏感)
+# 只有列在这里的键才允许被页面写入，杜绝任意 .env 注入。
+QUALITIES = ("lossless", "exhigh", "higher", "standard")
+TEMPLATES = ("markdown", "html", "txt", "json")
+
+
+def _as_bool(v: Any) -> str:
+    return "true" if str(v).strip().lower() in ("true", "1", "yes", "on") else "false"
+
+
+def _in_choices(*choices: str):
+    def check(v: Any) -> str:
+        s = str(v).strip().lower()
+        if s not in choices:
+            raise ValueError(f"取值必须是 {'/'.join(choices)} 之一，收到 {s!r}")
+        return s
+
+    return check
+
+
+def _int_range(lo: int, hi: int):
+    def check(v: Any) -> str:
+        s = str(v).strip()
+        if not re.fullmatch(r"\d+", s):
+            raise ValueError(f"必须是 {lo}..{hi} 的整数，收到 {v!r}")
+        n = int(s)
+        if not lo <= n <= hi:
+            raise ValueError(f"必须在 {lo}..{hi} 之间，收到 {n}")
+        return str(n)
+
+    return check
+
+
+def _http_url(v: Any) -> str:
+    s = str(v).strip()
+    if not s:
+        return ""
+    if not re.match(r"^https?://[^\s]+$", s):
+        raise ValueError(f"必须以 http:// 或 https:// 开头，收到 {s!r}")
+    return s
+
+
+def _free_text(maxlen: int = 200):
+    def check(v: Any) -> str:
+        s = str(v).strip()
+        if len(s) > maxlen:
+            raise ValueError(f"长度不能超过 {maxlen}")
+        # 这些值会写进单引号包裹的 .env，dotenv_escape 已处理引号；
+        # 这里再挡掉换行与控制字符，避免破坏 .env 的行结构
+        if any(ord(c) < 32 for c in s):
+            raise ValueError("不能包含换行或控制字符")
+        return s
+
+    return check
+
+
+def _token(v: Any) -> str:
+    s = str(v).strip()
+    if not s:
+        return ""
+    if len(s) < 8:
+        raise ValueError("token 长度异常（少于 8 位），请到 pushplus.plus 个人中心重新复制")
+    if len(s) > 200:
+        raise ValueError("token 过长")
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", s):
+        raise ValueError("token 只能包含字母、数字、下划线与连字符")
+    return s
+
+
+CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
+    "netease_quality": ("FNMUSIC_NETEASE_QUALITY", _in_choices(*QUALITIES), False),
+    "free_only_on_logout": ("FNMUSIC_FREE_ONLY_ON_LOGOUT", _as_bool, False),
+    "daily_enabled": ("FNMUSIC_DAILY_ENABLED", _as_bool, False),
+    "daily_limit": ("FNMUSIC_DAILY_LIMIT", _int_range(1, 100), False),
+    "pushplus_enabled": ("FNMUSIC_PUSHPLUS_ENABLED", _as_bool, False),
+    "pushplus_token": ("FNMUSIC_PUSHPLUS_TOKEN", _token, True),
+    "pushplus_topic": ("FNMUSIC_PUSHPLUS_TOPIC", _free_text(64), True),
+    "pushplus_template": ("FNMUSIC_PUSHPLUS_TEMPLATE", _in_choices(*TEMPLATES), False),
+    "pushplus_url": ("FNMUSIC_PUSHPLUS_URL", _http_url, False),
+    "netease_search_limit": ("FNMUSIC_NETEASE_SEARCH_LIMIT", _int_range(1, 100), False),
+    "online_limit": ("FNMUSIC_ONLINE_LIMIT", _int_range(1, 100), False),
+    "search_cache_ttl_days": ("FNMUSIC_SEARCH_CACHE_TTL", _int_range(0, 365), False),
+    "vip_warn_days": ("FNMUSIC_VIP_WARN_DAYS", _int_range(0, 90), False),
+    "login_check_interval_h": ("FNMUSIC_LOGIN_CHECK_INTERVAL", _int_range(0, 168), False),
+}
+
+# 页面上以「天/小时」为单位展示，落盘时换算成秒
+UNIT_SECONDS = {
+    "search_cache_ttl_days": 86400,
+    "login_check_interval_h": 3600,
+}
+
+DEFAULTS = {
+    "netease_quality": "lossless",
+    "free_only_on_logout": "true",
+    "daily_enabled": "true",
+    "daily_limit": "20",
+    "pushplus_enabled": "true",
+    "pushplus_token": "",
+    "pushplus_topic": "",
+    "pushplus_template": "markdown",
+    "pushplus_url": pushplus.DEFAULT_URL,
+    "netease_search_limit": "50",
+    "online_limit": "30",
+    "search_cache_ttl_days": "7",
+    "vip_warn_days": "7",
+    "login_check_interval_h": "1",
+}
+
+MASK = "••••••••"
+
+
+# ---------------------------------------------------------------- 身份鉴权 ----
+
+
+class GatewayIdentity:
+    __slots__ = ("uid", "is_admin", "username")
+
+    def __init__(self, uid: str, is_admin: bool, username: str):
+        self.uid = uid
+        self.is_admin = is_admin
+        self.username = username
+
+    def as_dict(self) -> dict:
+        return {"uid": self.uid, "is_admin": self.is_admin, "username": self.username}
+
+
+def identify(request: Request) -> GatewayIdentity | None:
+    """从网关注入的 Header 取身份。缺失或非法一律返回 None。"""
+    uid = str(request.headers.get("x-trim-userid") or "").strip()
+    username = str(request.headers.get("x-trim-username") or "").strip()
+    is_admin_raw = str(request.headers.get("x-trim-isadmin") or "").strip().lower()
+    is_admin = is_admin_raw in ("true", "1", "yes")
+
+    if not uid and not username:
+        return None
+    if not re.fullmatch(r"[\w.\-@]{1,64}", uid or ""):
+        logger.warning("拒绝可疑的 X-Trim-Userid: %r", uid[:80])
+        return None
+    return GatewayIdentity(uid=uid, is_admin=is_admin, username=username)
+
+
+def _deny(reason: str, *, code: int = 403) -> JSONResponse:
+    return JSONResponse(status_code=code, content={"ok": False, "error": reason})
+
+
+def _forbidden_page() -> HTMLResponse:
+    body = (
+        "<!doctype html><meta charset=utf-8>"
+        "<title>无权访问</title>"
+        "<body style=\"font-family:system-ui;margin:3rem auto;max-width:34rem;color:#222\">"
+        "<h2>需要通过飞牛桌面打开</h2>"
+        "<p>本页面依赖飞牛统一网关校验 NAS 登录态。</p>"
+        "<p>请在飞牛桌面点击「飞牛音乐扩展」图标打开；"
+        "直接访问端口或套接字不会带身份 Header，因此被拒绝。</p>"
+        "</body>"
+    )
+    return HTMLResponse(content=body, status_code=403)
+
+
+# ------------------------------------------------------------------ 配置 IO ----
+
+
+def _env_file() -> str:
+    return ENV_FILE or os.path.join(
+        os.environ.get("FNMUSIC_HOME") or os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+        ".env",
+    )
+
+
+def _raw_env() -> dict[str, str]:
+    path = _env_file()
+    if not os.path.exists(path):
+        return {}
+    try:
+        kv, _others = env_merge.parse_env_file(path)
+        return dict(kv)
+    except Exception as exc:  # noqa: BLE001 - 配置损坏不能让页面 500
+        logger.warning("读取 .env 失败: %s", exc)
+        return {}
+
+
+def _to_editable(env: dict[str, str]) -> dict[str, str]:
+    """内部编辑视图：**保留敏感项真实值**，只做单位换算。
+
+    绝不能把它直接返回给前端——对客户端只允许返回 _to_display()。
+    """
+    out: dict[str, str] = {}
+    for field, (key, _check, _secret) in CONFIG_FIELDS.items():
+        raw = str(env.get(key, DEFAULTS.get(field, "")))
+        if field in UNIT_SECONDS and raw.strip():
+            try:
+                raw = str(max(0, round(int(float(raw)) / UNIT_SECONDS[field])))
+            except (TypeError, ValueError):
+                raw = DEFAULTS.get(field, "")
+        out[field] = raw
+    return out
+
+
+def _to_display(env: dict[str, str]) -> dict[str, str]:
+    """对客户端的脱敏视图：敏感项一律打码。"""
+    out = _to_editable(env)
+    for field, (_key, _check, secret) in CONFIG_FIELDS.items():
+        if secret and out.get(field):
+            out[field] = MASK
+    return out
+
+
+def read_config_masked() -> dict[str, Any]:
+    env = _raw_env()
+    return {
+        "values": _to_display(env),
+        "env_file": _env_file(),
+        "has_token": bool(str(env.get("FNMUSIC_PUSHPLUS_TOKEN", "")).strip()),
+        "writable": os.access(os.path.dirname(_env_file()) or ".", os.W_OK),
+    }
+
+
+def _from_display(values: dict[str, str]) -> dict[str, str]:
+    """把页面值换算回 .env 里的实际形式。"""
+    out: dict[str, str] = {}
+    for field, value in values.items():
+        if field in UNIT_SECONDS:
+            try:
+                out[field] = str(int(value) * UNIT_SECONDS[field])
+            except (TypeError, ValueError):
+                out[field] = value
+        else:
+            out[field] = value
+    return out
+
+
+def apply_config(submitted: dict[str, Any]) -> tuple[dict[str, str] | None, str]:
+    """校验并写入配置。返回 (新的脱敏视图, 错误信息)。
+
+    token 留空表示「保持现有值不变」——password 字段不回显真实值，
+    若照原样写回就会把用户之前填的 token 冲掉。
+    """
+    env = _raw_env()
+    # base 必须取【真实值】视图：若这里用了打码视图，任何一次保存都会把
+    # pushplus_token / topic 写成 ••••••••，把用户凭据冲掉。
+    base = _to_editable(env)
+    merged_display: dict[str, str] = {}
+    errors: list[str] = []
+
+    for field, (key, check, secret) in CONFIG_FIELDS.items():
+        if field not in submitted:
+            # 页面没提交这一项 → 原样保留真实值
+            merged_display[field] = base.get(field, DEFAULTS.get(field, ""))
+            continue
+        raw_new = submitted.get(field)
+        if secret and str(raw_new).strip() in ("", MASK):
+            # 用户没改这一项 → 沿用真实原值（跳过校验，原值当初已通过校验）
+            merged_display[field] = base.get(field, "")
+            continue
+        try:
+            merged_display[field] = check(raw_new)
+        except ValueError as exc:
+            errors.append(f"{field}: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{field}: 取值非法（{exc}）")
+
+    if errors:
+        return None, "；".join(errors)
+
+    desired_pairs = _from_display(merged_display)
+    kv, _other = env_merge.parse_env_file(_env_file()) if os.path.exists(_env_file()) else ([], [])
+
+    # 已有键按本次提交更新；缺失键补齐；其余用户自定义键原样保留
+    explicit = {CONFIG_FIELDS[f][0] for f in desired_pairs}
+    desired_kv = [(CONFIG_FIELDS[f][0], v) for f, v in desired_pairs.items()]
+    if not kv:
+        kv = [(k, DEFAULTS.get(f, "")) for f, (k, _c, _s) in CONFIG_FIELDS.items()
+              if f not in desired_pairs]
+    out_kv, summary = env_merge.merge_env(kv, desired_kv, explicit)
+    out_kv, removed = env_merge.drop_obsolete(out_kv)
+    out_kv, added = env_merge.ensure_prefix_defaults(out_kv)
+    summary["added"].extend(added)
+
+    path = _env_file()
+    try:
+        backup = f"{path}.bak"
+        if os.path.exists(path):
+            with open(path, "rb") as src, open(backup, "wb") as dst:
+                dst.write(src.read())
+            try:
+                os.chmod(backup, 0o600)
+            except OSError:
+                pass
+        env_merge.write_env_atomic(
+            path,
+            env_merge.render_env(out_kv, "generated by admin ui — do not commit"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("写入 .env 失败: %s", exc)
+        return None, f"写入配置失败：{exc}"
+
+    changed = sorted(summary.get("updated", [])) + sorted(summary.get("added", []))
+    if removed:
+        changed += [f"-{k}" for k in sorted(removed)]
+    logger.info("配置已更新（%d 项变更，敏感值不落日志）", len(changed))
+    return read_config_masked(), ""
+
+
+# ------------------------------------------------------------------- 应用 ----
+
+app = FastAPI(title="fnmusic-ext 管理页", docs_url=None, redoc_url=None, openapi_url=None)
+
+
+class PrefixStripMiddleware(BaseHTTPMiddleware):
+    """统一网关可能带着 /app/fnmusicext 前缀转发过来，也可能已剥离。
+
+    两种情况都要能工作，因此在这里把前缀统一去掉；页面内一律用相对路径请求。
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        prefix = GATEWAY_PREFIX.rstrip("/")
+        path = request.scope.get("path", "")
+        if prefix and (path == prefix or path.startswith(prefix + "/")):
+            new_path = path[len(prefix):] or "/"
+            request.scope["path"] = new_path
+            raw = request.scope.get("raw_path")
+            if isinstance(raw, bytes):
+                request.scope["raw_path"] = new_path.encode("utf-8")
+        return await call_next(request)
+
+
+app.add_middleware(PrefixStripMiddleware)
+
+_MB_CLIENT: httpx.AsyncClient | None = None
+
+
+def mb_client() -> httpx.AsyncClient:
+    global _MB_CLIENT
+    if _MB_CLIENT is None:
+        _MB_CLIENT = httpx.AsyncClient(base_url=MUSICBOX_URL, timeout=MUSICBOX_TIMEOUT_S)
+    return _MB_CLIENT
+
+
+def _err(code: int, msg: str) -> JSONResponse:
+    return JSONResponse(status_code=code, content={"ok": False, "error": msg})
+
+
+def _require(request: Request) -> GatewayIdentity:
+    """返回管理员身份；不满足时抛 _AuthError。"""
+    ident = identify(request)
+    if ident is None:
+        if ALLOW_NO_GATEWAY:
+            return GatewayIdentity(uid="0", is_admin=True, username="local-dev")
+        raise _AuthError("缺少飞牛网关身份 Header，请从飞牛桌面打开本页面")
+    if not ident.is_admin:
+        raise _AuthError("需要管理员权限")
+    return ident
+
+
+class _AuthError(Exception):
+    def __init__(self, msg: str):
+        self.msg = msg
+
+
+@app.middleware("http")
+async def _auth_error_middleware(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except _AuthError as exc:
+        if request.scope.get("path", "/") in ("/", ""):
+            return _forbidden_page()
+        return _deny(exc.msg)
+
+
+async def _probe_proxy_health() -> dict:
+    """透过被接管的 socket 读扩展自身的 healthz。"""
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=PROXY_SOCK),
+            base_url="http://unix",
+            timeout=5.0,
+        ) as client:
+            r = await client.get("/_ext/healthz")
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, dict):
+                    return data
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("proxy healthz probe failed: %s", exc)
+    return {"ok": False, "upstream": "unknown", "musicbox": "unknown"}
+
+
+@app.get("/api/health")
+async def api_health(request: Request):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+
+    proxy_health, login = await asyncio.gather(
+        _probe_proxy_health(),
+        netease_auth.fetch_state(mb_client(), force=True),
+        return_exceptions=True,
+    )
+    if isinstance(proxy_health, Exception):
+        proxy_health = {"ok": False}
+    if isinstance(login, Exception):
+        login = netease_auth.LoginState(error="probe_failed")
+
+    env = _raw_env()
+    return {
+        "ok": True,
+        "version": get_version(),
+        "proxy": proxy_health,
+        "netease": login.to_public_dict(),
+        "socket_takeover": bool(os.path.exists(UPSTREAM_SOCK)),
+        "pushplus_enabled": pushplus.enabled(),
+        "pushplus_configured": bool(str(env.get("FNMUSIC_PUSHPLUS_TOKEN", "")).strip()),
+        "checked_at": int(time.time()),
+    }
+
+
+@app.get("/api/login/state")
+async def api_login_state(request: Request):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    state = await netease_auth.fetch_state(mb_client(), force=True)
+    return {"ok": True, "data": state.to_public_dict(), "error": state.error}
+
+
+@app.post("/api/login/qr")
+async def api_login_qr(request: Request):
+    """发起一次扫码登录，返回 unikey 与二维码 PNG 的取图地址。
+
+    二维码本身走独立 GET（img src 直接引用），但用同一个 unikey，
+    保证「展示的码」与「轮询的码」是同一个。
+    """
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+
+    try:
+        r = await mb_client().post("/api/v1/auth/login", timeout=MUSICBOX_TIMEOUT_S)
+        if r.status_code != 200:
+            return _err(502, f"音源服务返回 {r.status_code}")
+        payload = r.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("发起扫码失败: %s", exc)
+        return _err(502, "音源服务不可达，请确认扩展已启动")
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        data = payload if isinstance(payload, dict) else {}
+    unikey = str(data.get("unikey") or data.get("codekey") or "")
+    if not unikey:
+        return _err(502, "音源服务未返回 unikey，无法生成二维码")
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{8,128}", unikey):
+        logger.warning("unikey 形状异常，已拒绝")
+        return _err(502, "音源服务返回的 unikey 形状异常")
+
+    return {"ok": True, "unikey": unikey, "qr_png": f"api/login/qr.png?unikey={unikey}"}
+
+
+@app.get("/api/login/qr.png")
+async def api_login_qr_png(request: Request, unikey: str = ""):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    unikey = (unikey or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{8,128}", unikey):
+        return _err(400, "unikey 非法")
+    try:
+        r = await mb_client().get(
+            "/api/v1/auth/login/qr.png", params={"unikey": unikey}, timeout=MUSICBOX_TIMEOUT_S
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("取二维码失败: %s", exc)
+        return _err(502, "音源服务不可达")
+    if r.status_code != 200:
+        return _err(r.status_code, f"音源服务返回 {r.status_code}")
+    return Response(content=r.content, media_type="image/png",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/login/check")
+async def api_login_check(request: Request, unikey: str = ""):
+    """轮询扫码结果。透传 musicbox 的 code：
+    801 等待扫码 / 802 已扫码待手机确认 / 803 成功 / 800 已过期。"""
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    unikey = (unikey or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{8,128}", unikey):
+        return _err(400, "unikey 非法")
+
+    try:
+        r = await mb_client().get(
+            "/api/v1/auth/login/check", params={"unikey": unikey}, timeout=MUSICBOX_TIMEOUT_S
+        )
+        payload = r.json() if r.status_code == 200 else {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("轮询登录状态失败: %s", exc)
+        return _err(502, "音源服务不可达")
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        data = {}
+    code = 0
+    try:
+        code = int(data.get("code") or 0)
+    except (TypeError, ValueError):
+        code = 0
+
+    result: dict[str, Any] = {"ok": True, "code": code}
+    if code == 803:
+        netease_auth.invalidate_state()
+        state = await netease_auth.fetch_state(mb_client(), force=True)
+        result["logged_in"] = state.logged_in
+        result["nickname"] = state.nickname
+        try:
+            await pushplus.send(None, "网页端扫码登录成功", f"账号：{state.nickname or state.user_id}")
+        except Exception:  # noqa: BLE001
+            pass
+    return result
+
+
+@app.get("/api/config")
+async def api_config_get(request: Request):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    cfg = read_config_masked()
+    cfg["ok"] = True
+    cfg["schema"] = {
+        field: {"sensitive": secret, "default": DEFAULTS.get(field, "")}
+        for field, (_k, _c, secret) in CONFIG_FIELDS.items()
+    }
+    return cfg
+
+
+@app.post("/api/config")
+async def api_config_post(request: Request):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return _err(400, "请求体不是合法 JSON")
+    if not isinstance(body, dict):
+        return _err(400, "请求体必须是 JSON 对象")
+
+    values = body.get("values")
+    if not isinstance(values, dict):
+        return _err(400, "缺少 values 字段")
+    unknown = [k for k in values if k not in CONFIG_FIELDS]
+    if unknown:
+        return _err(400, f"不支持的配置项：{', '.join(sorted(unknown))}")
+
+    cfg, error = apply_config(values)
+    if cfg is None:
+        return _err(422, error)
+
+    restart = bool(body.get("restart", True))
+    result: dict[str, Any] = {"ok": True, "config": cfg, "restarted": False}
+    if restart:
+        ok, msg = await restart_services()
+        result["restarted"] = ok
+        result["restart_message"] = msg
+        if not ok:
+            result["warning"] = "配置已保存，但重启未成功，请在飞牛应用中心手动重启本应用"
+    return result
+
+
+async def restart_services() -> tuple[bool, str]:
+    """调用生命周期脚本重启代理与音源服务（不含本页面的 ui 进程）。"""
+    script = RESTART_SCRIPT
+    if not script or not os.path.exists(script):
+        return False, f"未找到重启脚本（{script or '未配置'}）"
+    log_dir = os.path.join(os.path.dirname(script), "..", "logs")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "bash", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env={**os.environ, "FNMUSIC_ADMIN_LOG_DIR": os.path.abspath(log_dir)},
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=RESTART_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            return False, f"重启超时（>{int(RESTART_TIMEOUT_S)}s），请到应用中心手动重启"
+        text = (out or b"").decode("utf-8", "replace")[-1500:]
+        if proc.returncode == 0:
+            return True, "已重启，新配置生效"
+        logger.warning("restart_services 失败 rc=%s: %s", proc.returncode, text[:400])
+        return False, text.strip() or f"重启脚本返回 {proc.returncode}"
+    except Exception as exc:  # noqa: BLE001
+        logger.error("调用重启脚本异常: %s", exc)
+        return False, f"调用重启脚本异常：{exc}"
+
+
+def _secret_values() -> set[str]:
+    """收集所有需要在日志里抹掉的凭据值。
+
+    必须同时覆盖两处：
+      1. 进程环境变量里的 token（代理/推送进程实际在用的）；
+      2. `.env` 文件里的 token —— 用户在页面刚保存的新值还没被任何进程加载，
+         只读环境变量的话，这条新 token 就会原样出现在日志回显里。
+    另外把网关身份 Header 里的用户名一并纳入，避免日志侧信道泄露。
+    """
+    out = set()
+    tok_env = pushplus.token()
+    if len(tok_env) >= 6:
+        out.add(tok_env)
+    tok_file = str(_raw_env().get("FNMUSIC_PUSHPLUS_TOKEN", "")).strip()
+    if len(tok_file) >= 6:
+        out.add(tok_file)
+    return out
+
+
+def _scrub(text: str) -> str:
+    for secret in _secret_values():
+        if secret and secret in text:
+            text = text.replace(secret, "***")
+    return text
+
+
+@app.get("/api/logs")
+async def api_logs(request: Request, what: str = "info", lines: int = 80):
+    """回看最近日志，省掉 SSH。只读白名单文件，且做路径穿越防护。"""
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+
+    allowed = {"info", "proxy", "musicbox", "setup", "restore", "ui", "config"}
+    if what not in allowed:
+        return _err(400, f"what 必须是 {'/'.join(sorted(allowed))} 之一")
+    try:
+        n = max(1, min(int(lines), LOG_LINE_LIMIT))
+    except (TypeError, ValueError):
+        n = 80
+
+    log_dir = os.environ.get("FNMUSIC_ADMIN_LOG_DIR")
+    if not log_dir:
+        base = os.environ.get("FNMUSIC_ADMIN_VAR_DIR") or ""
+        log_dir = os.path.join(base, "logs") if base else ""
+    if not log_dir or not os.path.isdir(log_dir):
+        return {"ok": True, "what": what, "lines": [], "note": "日志目录未配置或不存在"}
+
+    path = os.path.realpath(os.path.join(log_dir, f"{what}.log"))
+    if not path.startswith(os.path.realpath(log_dir) + os.sep):
+        return _err(400, "非法日志路径")
+    if not os.path.exists(path):
+        return {"ok": True, "what": what, "lines": [], "note": "尚无日志"}
+
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 256 * 1024))
+            tail = f.read().decode("utf-8", "replace")
+    except Exception as exc:  # noqa: BLE001
+        return _err(500, f"读取日志失败：{exc}")
+
+    rows = [ln for ln in tail.splitlines() if ln.strip()][-n:]
+    # 防御性脱敏：日志理论上不该有凭据，但不能假设上游一定干净，
+    # 尤其是"用户刚在页面保存、尚未被任何进程加载"的新 token。
+    secrets = _secret_values()
+    if secrets:
+        rows = [_scrub(ln) for ln in rows]
+    return {"ok": True, "what": what, "path": path, "lines": rows}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    try:
+        ident = _require(request)
+    except _AuthError:
+        return _forbidden_page()
+    return HTMLResponse(content=_render_page(ident))
+
+
+def _render_page(ident: GatewayIdentity) -> str:
+    return PAGE_HTML.replace("__USERNAME__", html.escape(ident.username or ident.uid or "unknown"))
+
+
+# ------------------------------------------------------------------ 前端 ----
+# 单文件、零外部依赖：NAS 可能处于离线/内网环境，不允许引任何 CDN。
+PAGE_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>飞牛音乐扩展</title>
+<style>
+:root{
+  --bg:#f5f6f8;--card:#fff;--fg:#1d2129;--mut:#6b7280;--line:#e5e7eb;
+  --ok:#0a7d43;--okbg:#e8f6ee;--warn:#a15c00;--warnbg:#fdf3e3;--err:#b42318;--errbg:#fdecea;
+  --acc:#4b3fd4;--accbg:#eeeaff;
+}
+@media(prefers-color-scheme:dark){:root{
+  --bg:#14161a;--card:#1d2026;--fg:#e6e8eb;--mut:#9aa2ad;--line:#2c313a;
+  --ok:#4ade80;--okbg:#12291c;--warn:#fbbf24;--warnbg:#2b2313;--err:#f87171;--errbg:#2d1717;
+  --acc:#a99cff;--accbg:#221f3d;
+}}
+*{box-sizing:border-box}
+body{margin:0;padding:20px;background:var(--bg);color:var(--fg);
+  font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:880px;margin:0 auto}
+h1{font-size:18px;margin:0 0 2px}
+.sub{color:var(--mut);font-size:12px;margin-bottom:18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:14px}
+.card h2{font-size:14px;margin:0 0 14px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+.row{display:flex;flex-wrap:wrap;gap:10px 22px}
+.kv{min-width:200px;flex:1}
+.kv .k{color:var(--mut);font-size:12px}
+.kv .v{font-weight:600;font-size:14px;word-break:break-all}
+.pill{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;font-weight:600}
+.pill.ok{background:var(--okbg);color:var(--ok)}
+.pill.warn{background:var(--warnbg);color:var(--warn)}
+.pill.err{background:var(--errbg);color:var(--err)}
+label{display:block;margin-bottom:12px}
+label .lb{font-size:13px;font-weight:600;margin-bottom:4px}
+label .ht{color:var(--mut);font-size:12px;margin-top:3px}
+input,select{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;
+  background:var(--bg);color:var(--fg);font:inherit;font-size:13px}
+input:focus,select:focus{outline:2px solid var(--accbg);border-color:var(--acc)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:0 20px}
+.sw{display:flex;align-items:center;gap:10px;padding:9px 0}
+.sw input{width:auto;flex:0 0 auto;transform:scale(1.25)}
+.sw .t{flex:1}
+.sw .t .lb{font-size:13px;font-weight:600}
+.sw .t .ht{color:var(--mut);font-size:12px}
+.btn{padding:9px 18px;border-radius:8px;border:1px solid var(--line);background:var(--card);
+  color:var(--fg);font:inherit;font-size:13px;font-weight:600;cursor:pointer}
+.btn:hover{border-color:var(--acc);color:var(--acc)}
+.btn.pri{background:var(--acc);border-color:var(--acc);color:#fff}
+.btn.pri:hover{opacity:.9;color:#fff}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.acts{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px}
+.msg{margin-top:12px;padding:10px 12px;border-radius:8px;font-size:13px;display:none;white-space:pre-wrap}
+.msg.ok{display:block;background:var(--okbg);color:var(--ok)}
+.msg.err{display:block;background:var(--errbg);color:var(--err)}
+.msg.info{display:block;background:var(--accbg);color:var(--acc)}
+.qr{display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap;margin-top:14px}
+.qr img{width:212px;height:212px;border:1px solid var(--line);border-radius:10px;background:#fff;padding:6px}
+.qr .st{flex:1;min-width:220px}
+.steps{color:var(--mut);font-size:13px;margin:0;padding-left:18px}
+.steps li{margin-bottom:5px}
+pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;
+  font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:340px;overflow:auto;
+  white-space:pre-wrap;word-break:break-all;margin:10px 0 0}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.tabs button{padding:5px 12px;border-radius:999px;border:1px solid var(--line);
+  background:var(--card);color:var(--mut);font:inherit;font-size:12px;cursor:pointer}
+.tabs button.on{background:var(--accbg);border-color:var(--acc);color:var(--acc);font-weight:600}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid currentColor;
+  border-right-color:transparent;border-radius:50%;animation:r .7s linear infinite;vertical-align:-1px}
+@keyframes r{to{transform:rotate(360deg)}}
+.hide{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>飞牛音乐扩展</h1>
+  <div class="sub">网易云单源 · 当前用户 <b>__USERNAME__</b> · <span id="ver">…</span></div>
+
+  <div class="card">
+    <h2>运行状态</h2>
+    <div class="row" id="status"><div class="kv"><div class="k">加载中</div><div class="v"><span class="spin"></span></div></div></div>
+    <div class="acts">
+      <button class="btn" id="refresh">刷新状态</button>
+      <span id="statusMsg" class="sub" style="margin:0"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>网易云扫码登录</h2>
+    <div class="sub" style="margin:-6px 0 12px">
+      在线音源全部来自你扫码登录的这一个私人账号。未登录时只能播免费曲目，且不会出现「每日推荐」。
+    </div>
+    <div class="acts" style="margin-top:0">
+      <button class="btn pri" id="qrBtn">生成二维码</button>
+      <button class="btn hide" id="qrRefresh">换一张</button>
+      <span id="qrState" class="sub" style="margin:0"></span>
+    </div>
+    <div class="qr hide" id="qrBox">
+      <img id="qrImg" alt="网易云登录二维码">
+      <div class="st">
+        <ol class="steps">
+          <li>打开手机上的<b>网易云音乐 App</b></li>
+          <li>首页左上角菜单 → <b>扫一扫</b></li>
+          <li>扫描左侧二维码，并在手机上<b>确认登录</b></li>
+        </ol>
+        <p class="sub" style="margin:12px 0 0">二维码约 3 分钟有效，过期会自动换一张，不用手动刷新。</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>配置</h2>
+    <form id="cfgForm" autocomplete="off">
+      <div class="grid">
+        <label><span class="lb">音质</span>
+          <select name="netease_quality">
+            <option value="lossless">无损 lossless</option>
+            <option value="exhigh">极高 exhigh (320k)</option>
+            <option value="higher">较高 higher (192k)</option>
+            <option value="standard">标准 standard (128k)</option>
+          </select>
+          <span class="ht">账号无对应权益时自动回退，不会因此播放失败</span>
+        </label>
+
+        <label><span class="lb">每日推荐曲目数</span>
+          <input name="daily_limit" inputmode="numeric" placeholder="20">
+          <span class="ht">1–100，抓取网易云官方每日推荐</span>
+        </label>
+
+        <label><span class="lb">单次搜索请求条数</span>
+          <input name="netease_search_limit" inputmode="numeric" placeholder="50">
+          <span class="ht">1–100，向网易云请求的候选数量</span>
+        </label>
+
+        <label><span class="lb">搜索结果并入上限</span>
+          <input name="online_limit" inputmode="numeric" placeholder="30">
+          <span class="ht">1–100，最终显示在飞牛搜索列表里的在线条数</span>
+        </label>
+
+        <label><span class="lb">搜索缓存有效期（天）</span>
+          <input name="search_cache_ttl_days" inputmode="numeric" placeholder="7">
+          <span class="ht">0 表示不缓存</span>
+        </label>
+
+        <label><span class="lb">VIP 到期提醒提前量（天）</span>
+          <input name="vip_warn_days" inputmode="numeric" placeholder="7">
+          <span class="ht">0 表示不提醒</span>
+        </label>
+
+        <label><span class="lb">登录态巡检间隔（小时）</span>
+          <input name="login_check_interval_h" inputmode="numeric" placeholder="1">
+          <span class="ht">0 表示只在请求时按需探测</span>
+        </label>
+
+        <label><span class="lb">PushPlus 接口地址</span>
+          <input name="pushplus_url" placeholder="https://www.pushplus.plus/send">
+          <span class="ht">一般不用改，除非你自建了转发</span>
+        </label>
+      </div>
+
+      <div class="sw"><input type="checkbox" name="free_only_on_logout" id="c_free">
+        <div class="t"><span class="lb">未登录时降级为只播免费曲目</span>
+        <span class="ht">关闭则未登录时完全不提供在线播放，搜索结果只剩本地曲库</span></div></div>
+
+      <div class="sw"><input type="checkbox" name="daily_enabled" id="c_daily">
+        <div class="t"><span class="lb">启用网易云官方「每日推荐」歌单</span>
+        <span class="ht">需要登录；未登录时不会注入空歌单</span></div></div>
+
+      <div class="sw"><input type="checkbox" name="pushplus_enabled" id="c_push">
+        <div class="t"><span class="lb">启用 PushPlus 推送提醒</span>
+        <span class="ht">登录失效 / 首次未登录 / 登录成功 / VIP 临期</span></div></div>
+
+      <div class="grid" style="margin-top:6px">
+        <label><span class="lb">PushPlus 用户 token</span>
+          <input name="pushplus_token" type="password" placeholder="留空表示不修改" autocomplete="new-password">
+          <span class="ht">到 pushplus.plus 个人中心复制。该服务需实名认证，否则收不到推送。<b>留空 = 保持原值</b></span>
+        </label>
+
+        <label><span class="lb">PushPlus 群组编码</span>
+          <input name="pushplus_topic" placeholder="留空则只推送给自己" autocomplete="off">
+          <span class="ht">填了就推送到该群组（一对多）</span>
+        </label>
+
+        <label><span class="lb">消息模板</span>
+          <select name="pushplus_template">
+            <option value="markdown">markdown（推荐）</option>
+            <option value="html">html</option>
+            <option value="txt">txt 纯文本</option>
+            <option value="json">json</option>
+          </select>
+          <span class="ht"></span>
+        </label>
+      </div>
+
+      <div class="acts">
+        <button class="btn pri" type="submit" id="saveBtn">保存并重启生效</button>
+        <button class="btn" type="button" id="reloadBtn">放弃修改</button>
+        <label style="display:flex;align-items:center;gap:6px;margin:0;width:auto">
+          <input type="checkbox" id="restartChk" checked style="width:auto"> <span class="lb" style="margin:0">保存后重启</span>
+        </label>
+      </div>
+      <div class="msg" id="cfgMsg"></div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>日志</h2>
+    <div class="tabs" id="logTabs">
+      <button data-w="info" class="on">生命周期</button>
+      <button data-w="proxy">代理</button>
+      <button data-w="musicbox">音源服务</button>
+      <button data-w="restore">socket 还原</button>
+      <button data-w="setup">安装/依赖</button>
+      <button data-w="ui">本页</button>
+    </div>
+    <div class="acts" style="margin-top:0">
+      <button class="btn" id="logBtn">读取最近 120 行</button>
+    </div>
+    <pre class="log hide" id="logBox"></pre>
+  </div>
+
+  <div class="sub" style="text-align:center;margin-top:20px">
+    fnmusic-ext · 音源仅来自你登录的私人网易云账号 ·
+    <a href="https://github.com/gzywd/fnos_music_ext" style="color:var(--acc)">项目主页</a>
+  </div>
+</div>
+
+<script>
+(function(){
+"use strict";
+var $=function(s){return document.querySelector(s)};
+var BOOLS=["free_only_on_logout","daily_enabled","pushplus_enabled"];
+var pollTimer=null, qrUnikey="", expireTimer=null;
+
+function api(path,opt){
+  return fetch(path,opt).then(function(r){
+    return r.json().catch(function(){return {ok:false,error:"HTTP "+r.status}})
+      .then(function(j){ if(!r.ok&&!j.error) j.error="HTTP "+r.status; return j; });
+  }).catch(function(e){return {ok:false,error:String(e)}});
+}
+function pill(ok,txt){return '<span class="pill '+(ok?"ok":"err")+'">'+txt+'</span>'}
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){
+  return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]})}
+
+function kv(k,v){return '<div class="kv"><div class="k">'+esc(k)+'</div><div class="v">'+v+'</div></div>'}
+
+function status(){
+  $("#statusMsg").innerHTML='<span class="spin"></span> 探测中';
+  api("api/health").then(function(j){
+    $("#statusMsg").textContent="";
+    if(!j.ok){ $("#status").innerHTML=kv("状态",pill(false,"获取失败")); return; }
+    $("#ver").textContent="v"+(j.version||"?");
+    var p=j.proxy||{}, n=j.netease||{};
+    var take=j.socket_takeover;
+    var h="";
+    h+=kv("代理接管", take?pill(true,"已接管"):pill(false,"未接管"));
+    h+=kv("官方后端", p.upstream==="ok"?pill(true,"连通"):pill(false,String(p.upstream||"未知")));
+    h+=kv("音源服务", p.musicbox==="ok"?pill(true,"运行中"):(p.musicbox==="disabled"?pill(true,"已停用"):pill(false,String(p.musicbox||"未知"))));
+    if(n.logged_in){
+      var v=n.vip?'<span class="pill ok">VIP</span> ':'<span class="pill warn">非 VIP</span> ';
+      h+=kv("网易云", pill(true,"已登录")+" "+v+esc(n.nickname||""));
+      h+=kv("VIP 剩余", n.vip_days_left==null?"—":n.vip_days_left+" 天");
+    }else{
+      h+=kv("网易云", pill(false,"未登录")+(n.free_only?' <span class="pill warn">免费曲降级</span>':""));
+    }
+    h+=kv("每日推荐", p.daily==="ok"?pill(true,"可用"):(p.daily==="need_login"?'<span class="pill warn">需登录</span>':pill(false,String(p.daily||"未知"))));
+    h+=kv("PushPlus", j.pushplus_enabled?pill(true,"已启用"):(j.pushplus_configured?'<span class="pill warn">已关闭</span>':'<span class="pill warn">未配置</span>'));
+    h+=kv("检测时间", new Date((j.checked_at||0)*1000).toLocaleString());
+    $("#status").innerHTML=h;
+  });
+}
+
+function stopPolling(){
+  if(pollTimer){clearInterval(pollTimer);pollTimer=null}
+  if(expireTimer){clearTimeout(expireTimer);expireTimer=null}
+}
+function qrState(txt,cls){
+  var e=$("#qrState");
+  e.textContent=txt||"";
+  e.className="sub"+(cls?" "+cls:"");
+  e.style.margin="0";
+}
+function newQr(){
+  stopPolling(); $("#qrRefresh").classList.add("hide");
+  qrState("正在向音源服务申请二维码…");
+  api("api/login/qr",{method:"POST"}).then(function(j){
+    if(!j.ok){ qrState("失败：" + (j.error||"未知错误")); return; }
+    qrUnikey=j.unikey;
+    $("#qrBox").classList.remove("hide");
+    $("#qrRefresh").classList.remove("hide");
+    $("#qrImg").src=j.qr_png+"&t="+Date.now();
+    qrState("等待扫码…","");
+    pollTimer=setInterval(function(){poll()},2500);
+    expireTimer=setTimeout(function(){qrState("二维码已过期，自动换一张…");newQr()},170000);
+  });
+}
+function poll(){
+  if(!qrUnikey) return;
+  api("api/login/check?unikey="+encodeURIComponent(qrUnikey)).then(function(j){
+    if(!j.ok) return;
+    if(j.code===802){ qrState("已扫码，请在手机上点确认登录",""); }
+    else if(j.code===803){
+      stopPolling(); qrUnikey="";
+      qrState("登录成功："+(j.nickname||""),"");
+      $("#qrBox").classList.add("hide"); $("#qrRefresh").classList.add("hide");
+      status(); loadCfg();
+    }
+    else if(j.code===800){ stopPolling(); qrState("二维码已过期，自动换一张…"); newQr(); }
+  });
+}
+
+function loadCfg(){
+  return api("api/config").then(function(j){
+    if(!j.ok) return j;
+    var v=j.values||{};
+    Object.keys(v).forEach(function(k){
+      var el=document.getElementsByName(k)[0];
+      if(!el) return;
+      if(BOOLS.indexOf(k)>=0) el.checked=(v[k]==="true");
+      else el.value=v[k]==null?"":v[k];
+      if(k==="pushplus_token") el.placeholder = j.has_token ? "已保存（留空则不修改）" : "留空表示不启用推送";
+    });
+    return j;
+  });
+}
+
+$("#qrBtn").onclick=function(){ newQr() };
+$("#qrRefresh").onclick=function(){ newQr() };
+$("#refresh").onclick=status;
+$("#reloadBtn").onclick=function(){ $("#cfgMsg").className="msg"; loadCfg() };
+
+$("#logBtn").onclick=function(){
+  var w=$("#logTabs button.on").getAttribute("data-w");
+  $("#logBox").classList.remove("hide");
+  $("#logBox").textContent="读取中…";
+  api("api/logs?what="+encodeURIComponent(w)+"&lines=120").then(function(j){
+    if(!j.ok){ $("#logBox").textContent="失败："+(j.error||""); return; }
+    var ls=j.lines||[];
+    $("#logBox").textContent = ls.length ? ls.join("\n")
+      : (j.note || "（暂无日志）") + "\n\n路径："+(j.path||"未知");
+  });
+};
+Array.prototype.forEach.call($("#logTabs").querySelectorAll("button"),function(b){
+  b.onclick=function(){
+    Array.prototype.forEach.call($("#logTabs").querySelectorAll("button"),function(x){x.classList.remove("on")});
+    b.classList.add("on");
+    if(!$("#logBox").classList.contains("hide")) $("#logBtn").onclick();
+  };
+});
+
+$("#cfgForm").onsubmit=function(ev){
+  ev.preventDefault();
+  var fd=new FormData(ev.target), values={};
+  BOOLS.forEach(function(k){ values[k]=document.getElementsByName(k)[0].checked?"true":"false" });
+  Array.prototype.forEach.call(document.querySelectorAll("#cfgForm input,#cfgForm select"),function(el){
+    if(!el.name||BOOLS.indexOf(el.name)>=0||el.type==="checkbox") return;
+    values[el.name]=el.value;
+  });
+  var restart=$("#restartChk").checked;
+  if(restart){
+    var okc=window.confirm(
+      "保存后将重启扩展进程，新配置才会生效。\n\n"+
+      "重启的几秒钟里接管会先解除、再重新建立，\n"+
+      "期间飞牛音乐会短暂回到官方原生直连（本地曲库始终可用），\n"+
+      "正在播放的在线曲目可能中断一次。\n\n"+
+      "确定继续吗？"
+    );
+    if(!okc) return;
+  }
+  var btn=$("#saveBtn"); btn.disabled=true; btn.innerHTML='<span class="spin"></span> 保存中';
+  $("#cfgMsg").className="msg info"; $("#cfgMsg").textContent="正在写入配置…";
+  api("api/config",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({values:values,restart:restart})}).then(function(j){
+    btn.disabled=false; btn.textContent="保存并重启生效";
+    var m=$("#cfgMsg");
+    if(!j.ok){ m.className="msg err"; m.textContent="失败："+(j.error||"未知错误"); return; }
+    var lines=["配置已保存。"];
+    if(j.restart_message) lines.push(j.restart_message);
+    if(j.warning) lines.push("⚠ "+j.warning);
+    m.className=(j.warning||j.restarted===false)?"msg err":"msg ok";
+    m.textContent=lines.join("\n");
+    loadCfg();
+    setTimeout(status, 1500);
+  });
+};
+
+status(); loadCfg();
+setInterval(status, 60000);
+})();
+</script>
+</body>
+</html>
+"""

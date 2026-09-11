@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Path, Query, Response, status
 from fastapi.exceptions import RequestValidationError
@@ -281,19 +282,28 @@ def auth_login_check(unikey: str = Query(...)):
 
 @app.get("/api/v1/auth/login/qr.png")
 @app.get("/api/v1/auth/qr.png")
-def auth_login_qr():
+def auth_login_qr(unikey: str = Query("")):
+    """二维码 PNG。
+
+    不传 unikey 时新发起一次登录并返回该次的码；传 unikey 时**渲染已存在的码**，
+    这样网页端可以先拿 unikey 开始轮询，再取图，两者不会错位（否则会各生成一张
+    不同的码，扫了也登不上轮询的那个 unikey）。
+    """
     try:
         import qrcode
     except ImportError as exc:
         raise HTTPException(status_code=501, detail="qrcode extra not installed") from exc
-    data = exec_musicbox(["auth", "login", "--no-wait", "--json"])
-    payload = _extract_payload(data)
-    unikey = ""
-    if isinstance(payload, dict):
-        unikey = str(payload.get("unikey") or payload.get("codekey") or "")
+
+    unikey = (unikey or "").strip()
     if not unikey:
-        raise UpstreamException(0, "Missing unikey in auth login response")
-    qr_url = f"https://music.163.com/login?codekey={unikey}"
+        data = exec_musicbox(["auth", "login", "--no-wait", "--json"])
+        payload = _extract_payload(data)
+        if isinstance(payload, dict):
+            unikey = str(payload.get("unikey") or payload.get("codekey") or "")
+        if not unikey:
+            raise UpstreamException(0, "Missing unikey in auth login response")
+
+    qr_url = f"https://music.163.com/login?codekey={quote(unikey)}"
     qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=2)
     qr.add_data(qr_url)
     qr.make(fit=True)

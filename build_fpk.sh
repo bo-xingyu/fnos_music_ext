@@ -176,6 +176,7 @@ sync_into_app "proxy/recommend.py"
 sync_into_app "proxy/netease_auth.py"
 sync_into_app "proxy/pushplus.py"
 sync_into_app "proxy/netease_items.py"
+sync_into_app "proxy/admin_ui.py"
 sync_into_app "proxy/env_merge.py"
 sync_into_app "proxy/version.py"
 sync_into_app "proxy/__init__.py"
@@ -189,8 +190,16 @@ sync_into_app "musicbox-service/.dockerignore"
 sync_into_app "restore.sh"
 sync_into_app "netease_login.sh"
 sync_into_app "VERSION"
-# fpk 专属胶水层
+# fpk 专属胶水层 + 桌面入口（ui/config 与 ui/images 由 payload/ 一起带进来）
 cp -a "${FPK_DIR}/payload/." "${APP_SRC}/"
+
+# 声明 desktop_uidir 时，官方 fnpack 要求 app/{desktop_uidir}/ 必须存在
+DESKTOP_UIDIR="$(sed -n 's/^[[:space:]]*desktop_uidir[[:space:]]*=[[:space:]]*//p' "${FPK_DIR}/manifest" | tr -d '[:space:]')"
+if [ -n "${DESKTOP_UIDIR}" ]; then
+    [ -d "${APP_SRC}/${DESKTOP_UIDIR}" ] || { log_err "manifest 声明了 desktop_uidir=${DESKTOP_UIDIR}，但 app/${DESKTOP_UIDIR}/ 不存在"; exit 1; }
+    [ -f "${APP_SRC}/${DESKTOP_UIDIR}/config" ] || { log_err "缺少桌面入口配置 app/${DESKTOP_UIDIR}/config"; exit 1; }
+    log_info "桌面入口: app/${DESKTOP_UIDIR}/config 已就位"
+fi
 
 # 清理一切不该进包的东西
 log_info "清理载荷中的构建垃圾 ..."
@@ -316,15 +325,38 @@ mkdir -p "${APPV}"
 tar xzf "${VERIFY}/app.tgz" -C "${APPV}"
 for required in config/privilege config/resource \
                 proxy/app.py proxy/netease_auth.py proxy/pushplus.py \
-                proxy/netease_items.py proxy/recommend.py proxy/env_merge.py \
-                proxy/run_proxy.sh proxy/requirements.txt \
+                proxy/netease_items.py proxy/admin_ui.py \
+                proxy/recommend.py proxy/env_merge.py proxy/run_proxy.sh proxy/requirements.txt \
                 musicbox-service/app.py musicbox-service/requirements.txt \
                 bin/fnmusic-lib.sh bin/setup.sh bin/start.sh bin/stop.sh bin/status.sh \
+                bin/restart_services.sh \
                 restore.sh netease_login.sh VERSION; do
     [ -e "${APPV}/${required}" ] || fail_verify "app.tgz 缺少 ${required}"
 done
 # app.tgz 内不应带 app/ 前缀层级
 [ ! -d "${APPV}/app" ] || fail_verify "app.tgz 内不应存在 app/ 前缀目录层级"
+
+# 6.5b 桌面入口：ui/config 合法，且 gatewaySocket 与生命周期脚本创建的 socket 名一致
+if [ -n "${DESKTOP_UIDIR}" ]; then
+    [ -f "${APPV}/${DESKTOP_UIDIR}/config" ] || fail_verify "app.tgz 缺少 ${DESKTOP_UIDIR}/config"
+    GATEWAY_SOCK="$(python3 - "${APPV}/${DESKTOP_UIDIR}/config" <<'PYEOF'
+import json, sys
+cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+urls = cfg.get(".url") or {}
+assert urls, "ui/config 的 .url 不能为空"
+socks = {v.get("gatewaySocket") for v in urls.values()}
+prefixes = {v.get("gatewayPrefix") for v in urls.values()}
+assert len(socks) == 1 and all(socks), "所有入口必须声明同一个 gatewaySocket"
+assert len(prefixes) == 1 and all(prefixes), "所有入口必须声明 gatewayPrefix"
+print(list(socks)[0])
+PYEOF
+)" || fail_verify "${DESKTOP_UIDIR}/config 校验失败"
+    [ -n "${GATEWAY_SOCK}" ] || fail_verify "无法从 ui/config 解析 gatewaySocket"
+    grep -q "UI_SOCK=\"\${APPDEST}/${GATEWAY_SOCK}\"" "${APPV}/bin/fnmusic-lib.sh" \
+        || fail_verify "生命周期脚本创建的 socket 名与 ui/config 的 gatewaySocket(${GATEWAY_SOCK}) 不一致"
+    [ -d "${APPV}/${DESKTOP_UIDIR}/images" ] || log_warn "${DESKTOP_UIDIR}/images 不存在，桌面图标将缺失"
+    log_info "桌面入口校验通过: gatewaySocket=${GATEWAY_SOCK}"
+fi
 
 # 6.6 载荷中不得混入已删除的多音源残留与测试/构建垃圾
 JUNK="$(find "${APPV}" \( -name 'test_*.py' -o -name '__pycache__' \

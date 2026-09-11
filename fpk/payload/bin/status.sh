@@ -42,7 +42,12 @@ main() {
             | jq -r 'if .data.logged_in == true then "logged_in" else "logged_out" end' 2>/dev/null || echo unknown)"
     fi
 
-    echo "running: proxy pid=$(head -n 1 "${PROXY_PID}" | tr -d '[:space:]') musicbox=${mb_state} netease=${login}"
+    local ui_state="down"
+    if lib_pid_alive "${UI_PID}" && [ -S "${UI_SOCK}" ]; then
+        ui_state="ok"
+    fi
+
+    echo "running: proxy pid=$(head -n 1 "${PROXY_PID}" | tr -d '[:space:]') musicbox=${mb_state} ui=${ui_state} netease=${login}"
     exit 0
 }
 
