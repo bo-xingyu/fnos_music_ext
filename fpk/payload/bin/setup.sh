@@ -28,6 +28,9 @@ WIZ_PUSH_TOKEN="${wizard_pushplus_token:-}"
 WIZ_PUSH_TOPIC="${wizard_pushplus_topic:-}"
 WIZ_PUSH_TEMPLATE="${wizard_pushplus_template:-markdown}"
 WIZ_PIP_INDEX="${wizard_pip_index:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+# 日志保留策略（不进向导，需要精调直接改 .env）
+LOG_MAX_MB="${FNMUSIC_LOG_MAX_MB:-10}"
+LOG_MAX_DAYS="${FNMUSIC_LOG_MAX_DAYS:-30}"
 
 # 重建虚拟环境（升级时装新依赖）——设为 0 可跳过，节省升级时间
 REBUILD_VENV="${FNMUSICEXT_REBUILD_VENV:-1}"
@@ -132,6 +135,10 @@ write_env_file() {
         echo "FNMUSIC_LIBRARY_DIR=$(dq "")"
         echo "FNMUSIC_MUSIC_DB=$(dq "/usr/local/apps/@appdata/trim.music/db/music.db")"
         echo "FNMUSIC_PIP_INDEX=$(dq "${WIZ_PIP_INDEX}")"
+        echo "# --- 日志保留策略：超过 10MB 就地截断保留尾部，超过 30 天清理 ---"
+        echo "FNMUSIC_LOG_MAX_MB=$(dq "${LOG_MAX_MB}")"
+        echo "FNMUSIC_LOG_MAX_DAYS=$(dq "${LOG_MAX_DAYS}")"
+        echo "FNMUSIC_LOG_SCAN_INTERVAL=$(dq "3600")"
     } > "${tmp}" || {
         lib_fail "写入 ${tmp} 失败"
         rm -f "${tmp}"

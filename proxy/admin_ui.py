@@ -29,7 +29,9 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import time
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -39,16 +41,20 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 try:
     from . import env_merge
+    from . import loghouse
     from . import netease_auth
     from . import pushplus
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import env_merge  # type: ignore
+    import loghouse  # type: ignore
     import netease_auth  # type: ignore
     import pushplus  # type: ignore
     from version import get_version  # type: ignore
 
 logger = logging.getLogger("fnmusic_proxy.admin_ui")
+
+_STARTED_AT = time.time()
 
 GATEWAY_PREFIX = os.environ.get("FNMUSIC_ADMIN_PREFIX", "/app/fnmusicext")
 MUSICBOX_URL = os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770").rstrip("/")
@@ -68,6 +74,12 @@ ALLOW_NO_GATEWAY = (
 MUSICBOX_TIMEOUT_S = 12.0
 RESTART_TIMEOUT_S = 90.0
 LOG_LINE_LIMIT = 400
+
+# 日志保留策略：单文件超过 LOG_MAX_MB 就轮转，超过 LOG_MAX_DAYS 的文件直接删。
+# 由 loghouse 模块执行；管理页面进程每小时跑一次，start.sh 在启动时也跑一次。
+LOG_MAX_MB = float(os.environ.get("FNMUSIC_LOG_MAX_MB", "10"))
+LOG_MAX_DAYS = float(os.environ.get("FNMUSIC_LOG_MAX_DAYS", "30"))
+LOG_SCAN_INTERVAL_S = float(os.environ.get("FNMUSIC_LOG_SCAN_INTERVAL", "3600"))
 
 # 配置项白名单：field -> (env key, 校验器, 是否敏感)
 # 只有列在这里的键才允许被页面写入，杜绝任意 .env 注入。
@@ -153,6 +165,8 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     "search_cache_ttl_days": ("FNMUSIC_SEARCH_CACHE_TTL", _int_range(0, 365), False),
     "vip_warn_days": ("FNMUSIC_VIP_WARN_DAYS", _int_range(0, 90), False),
     "login_check_interval_h": ("FNMUSIC_LOGIN_CHECK_INTERVAL", _int_range(0, 168), False),
+    "log_max_mb": ("FNMUSIC_LOG_MAX_MB", _int_range(0, 1024), False),
+    "log_max_days": ("FNMUSIC_LOG_MAX_DAYS", _int_range(0, 3650), False),
 }
 
 # 页面上以「天/小时」为单位展示，落盘时换算成秒
@@ -176,6 +190,8 @@ DEFAULTS = {
     "search_cache_ttl_days": "7",
     "vip_warn_days": "7",
     "login_check_interval_h": "1",
+    "log_max_mb": "10",
+    "log_max_days": "30",
 }
 
 MASK = "••••••••"
@@ -375,24 +391,146 @@ def apply_config(submitted: dict[str, Any]) -> tuple[dict[str, str] | None, str]
 
 # ------------------------------------------------------------------- 应用 ----
 
-app = FastAPI(title="fnmusic-ext 管理页", docs_url=None, redoc_url=None, openapi_url=None)
+def _log_dir() -> str:
+    d = os.environ.get("FNMUSIC_ADMIN_LOG_DIR") or ""
+    if d:
+        return d
+    base = os.environ.get("FNMUSIC_ADMIN_VAR_DIR") or ""
+    return os.path.join(base, "logs") if base else ""
+
+
+def _num_setting(env_field: str, os_var: str, default: float) -> float:
+    """读数值型设置：优先 .env（页面改完立即生效，无需重启），
+    其次进程环境变量，最后默认值。"""
+    raw = str(_raw_env().get(env_field, "") or "").strip()
+    if not raw:
+        raw = str(os.environ.get(os_var, "") or "").strip()
+    try:
+        return float(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+
+
+def log_max_mb() -> float:
+    return _num_setting("FNMUSIC_LOG_MAX_MB", "FNMUSIC_LOG_MAX_MB", LOG_MAX_MB)
+
+
+def log_max_days() -> float:
+    return _num_setting("FNMUSIC_LOG_MAX_DAYS", "FNMUSIC_LOG_MAX_DAYS", LOG_MAX_DAYS)
+
+
+async def _log_janitor(stop_event: asyncio.Event) -> None:
+    """日志清理巡检：默认每小时一次，也可由页面手动触发。"""
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=LOG_SCAN_INTERVAL_S)
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            loghouse.scan(_log_dir(), max_mb=log_max_mb(), max_days=log_max_days())
+        except Exception as exc:  # noqa: BLE001 - 清理失败绝不影响服务
+            logger.warning("日志清理巡检失败: %s", exc)
+
+
+@asynccontextmanager
+async def _lifespan(fastapi_app: FastAPI):
+    log_dir = _log_dir()
+    # 启动即清一次：上一次运行攒下的超大/过期日志不该继续占盘
+    if log_dir:
+        try:
+            rep = loghouse.scan(log_dir, max_mb=log_max_mb(), max_days=log_max_days())
+            if rep.get("actions"):
+                logger.info("启动日志清理：%s",
+                            json.dumps(rep["actions"], ensure_ascii=False)[:400])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("启动日志清理失败: %s", exc)
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(_log_janitor(stop_event))
+    try:
+        yield
+    finally:
+        stop_event.set()
+        if not task.done():
+            task.cancel()
+
+
+app = FastAPI(title="fnmusic-ext 管理页面", lifespan=_lifespan,
+              docs_url=None, redoc_url=None, openapi_url=None)
+
+
+# 已知端点，按最长优先匹配。用于把「任意层数反代前缀 + 端点」归一化，
+# 这样用户经组网工具、Nginx 反代、宝塔等再套一层前缀时页面依然可用。
+KNOWN_ENDPOINTS = (
+    "/api/login/qr.png",
+    "/api/login/qr",
+    "/api/login/check",
+    "/api/login/state",
+    "/api/health",
+    "/api/diag",
+    "/api/config",
+    "/api/logs",
+)
+
+# /app/fnmusicext -> fnmusicext。用于识别「反代后仍以应用名结尾」的页面请求。
+APP_SLUG = GATEWAY_PREFIX.rstrip("/").rsplit("/", 1)[-1]
+
+
+def normalize_path(path: str) -> tuple[str, str]:
+    """把外部路径归一化成服务内部路径。
+
+    返回 ``(内部路径, base 前缀)``；base 前缀恒以 ``/`` 结尾（根时为 ``"/"``），
+    由页面注入给前端，前端一律拼绝对 URL，不再依赖浏览器的相对路径解析。
+
+    为什么不能靠相对路径：浏览器在 ``/app/fnmusicext``（无尾斜杠）下解析
+    ``api/health`` 会得到 ``/app/api/health``，网关前缀被吃掉一段，
+    请求根本到不了本服务，只会得到网关的 404。
+    """
+    prefix = GATEWAY_PREFIX.rstrip("/")
+
+    # 1. 已经是内部路径
+    if path in KNOWN_ENDPOINTS or path in ("/", "/index.html", "/favicon.ico"):
+        return path, "/"
+
+    # 2. 标准网关前缀
+    if prefix and (path == prefix or path.startswith(prefix + "/")):
+        rest = path[len(prefix):] or "/"
+        base = prefix + "/"
+        return (rest if rest.startswith("/") else "/" + rest), base
+
+    # 3. 反代又套了一层（组网隧道 / Nginx / 宝塔等）：按已知端点做后缀匹配，
+    #    把端点前面的整段当作 base。要求 path 比端点长，即前面确实有前缀。
+    #    注意不要再检查前一字符是否为 "/" —— 端点自身就以 "/" 开头，
+    #    前一字符是前缀的最后一个字符（如 fnmusicext 的 t）。
+    for endpoint in KNOWN_ENDPOINTS:
+        if len(path) > len(endpoint) and path.endswith(endpoint):
+            return endpoint, path[: len(path) - len(endpoint)] + "/"
+
+    # 4. 反代下的页面请求：路径以应用名（或 /app）结尾，视为首页
+    stripped = path.rstrip("/")
+    if stripped and (
+        stripped.rsplit("/", 1)[-1] == APP_SLUG or stripped.endswith("/app")
+    ):
+        return "/", (stripped + "/") if stripped != "/" else "/"
+
+    # 5. 认不出来就原样交给路由，让它自然 404
+    return path, "/"
 
 
 class PrefixStripMiddleware(BaseHTTPMiddleware):
-    """统一网关可能带着 /app/fnmusicext 前缀转发过来，也可能已剥离。
-
-    两种情况都要能工作，因此在这里把前缀统一去掉；页面内一律用相对路径请求。
-    """
+    """路径归一化，并把 base 前缀透给下游，供页面注入给前端。"""
 
     async def dispatch(self, request: Request, call_next):
-        prefix = GATEWAY_PREFIX.rstrip("/")
-        path = request.scope.get("path", "")
-        if prefix and (path == prefix or path.startswith(prefix + "/")):
-            new_path = path[len(prefix):] or "/"
+        raw = request.scope.get("path", "") or "/"
+        new_path, base = normalize_path(raw)
+        if new_path != raw:
             request.scope["path"] = new_path
-            raw = request.scope.get("raw_path")
-            if isinstance(raw, bytes):
+            encoded = request.scope.get("raw_path")
+            if isinstance(encoded, bytes):
                 request.scope["raw_path"] = new_path.encode("utf-8")
+        request.scope["fn_base"] = base
+        request.scope["fn_original_path"] = raw
         return await call_next(request)
 
 
@@ -457,6 +595,126 @@ async def _probe_proxy_health() -> dict:
     return {"ok": False, "upstream": "unknown", "musicbox": "unknown"}
 
 
+async def _probe_musicbox(path: str = "/healthz", timeout: float = 4.0) -> dict:
+    """探测音源服务，把失败原因如实带回来（页面要显示得出来才排得了障）。
+
+    detail 会原样回显给浏览器，因此一律先过 _scrub() 脱敏：异常文本可能带上
+    请求 URL 或上游返回内容，那里面理论上可能混进凭据。
+    """
+    t0 = time.time()
+    try:
+        r = await mb_client().get(path, timeout=timeout)
+        ms = int((time.time() - t0) * 1000)
+        if r.status_code == 200:
+            return {"reachable": True, "status": 200, "ms": ms}
+        return {"reachable": True, "status": r.status_code, "ms": ms,
+                "detail": _scrub(r.text[:200])}
+    except Exception as exc:  # noqa: BLE001
+        ms = int((time.time() - t0) * 1000)
+        return {"reachable": False, "status": 0, "ms": ms,
+                "detail": _scrub(f"{type(exc).__name__}: {exc}"[:200])}
+
+
+@app.get("/api/diag")
+async def api_diag(request: Request):
+    """一次性把排障需要的信息全给出来，省掉 SSH。
+
+    页面任何一处失败都可以点「诊断」，把这里的内容连同日志一起贴出来。
+    不含任何凭据：token 只报「是否已配置 / 长度」，绝不报值。
+    """
+    try:
+        ident = _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+
+    env = _raw_env()
+    tok = str(env.get("FNMUSIC_PUSHPLUS_TOKEN", "")).strip()
+    log_dir = os.environ.get("FNMUSIC_ADMIN_LOG_DIR") or ""
+
+    logdir_info = []
+    if log_dir and os.path.isdir(log_dir):
+        for name in sorted(os.listdir(log_dir)):
+            fp = os.path.join(log_dir, name)
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            if not os.path.isfile(fp):
+                continue
+            logdir_info.append({
+                "name": name,
+                "bytes": st.st_size,
+                "size_mb": round(st.st_size / 1048576, 2),
+                "mtime": int(st.st_mtime),
+                "age_days": round((time.time() - st.st_mtime) / 86400, 2),
+            })
+
+    env_file = _env_file()
+    env_stat = None
+    if os.path.exists(env_file):
+        st = os.stat(env_file)
+        env_stat = {"exists": True, "bytes": st.st_size,
+                    "mode": oct(st.st_mode & 0o777)}
+    else:
+        env_stat = {"exists": False}
+
+    mb = await _probe_musicbox("/healthz")
+    mb_auth = await _probe_musicbox("/api/v1/auth/detail")
+    login = await netease_auth.fetch_state(mb_client(), force=True)
+
+    proxy_socket = {
+        "path": PROXY_SOCK,
+        "exists": os.path.exists(PROXY_SOCK),
+        "is_socket": os.path.exists(PROXY_SOCK) and not os.path.isdir(PROXY_SOCK),
+    }
+    try:
+        import stat as _stat
+        proxy_socket["mode"] = oct(_stat.S_IMODE(os.stat(PROXY_SOCK).st_mode))
+    except OSError:
+        proxy_socket["mode"] = None
+    proxy_socket["upstream_exists"] = os.path.exists(UPSTREAM_SOCK)
+
+    ui_socket = os.environ.get("FNMUSIC_ADMIN_UI_SOCK", "")
+    return {
+        "ok": True,
+        "version": get_version(),
+        "request": {
+            "original_path": request.scope.get("fn_original_path"),
+            "normalized_path": request.scope.get("path"),
+            "base_prefix": request.scope.get("fn_base"),
+            "gateway_prefix_config": GATEWAY_PREFIX,
+            "identity": ident.as_dict(),
+            "seen_headers": sorted(
+                k for k in request.headers.keys()
+                if k.lower().startswith("x-trim") or k.lower() in ("host", "x-forwarded-prefix")
+            ),
+            "x_forwarded_prefix": request.headers.get("x-forwarded-prefix"),
+        },
+        "proxy_socket": proxy_socket,
+        "musicbox": {
+            "url": MUSICBOX_URL,
+            "healthz": mb,
+            "auth_detail": mb_auth,
+            "login": login.to_public_dict(),
+            "login_error": login.error,
+        },
+        "env_file": {**env_stat, "path": env_file,
+                     "writable": os.access(os.path.dirname(env_file) or ".", os.W_OK),
+                     "keys": len(env),
+                     "pushplus_token_configured": bool(tok),
+                     "pushplus_token_length": len(tok)},
+        "pushplus": {"send_enabled": pushplus.enabled(), "send_url": pushplus.push_url(),
+                     "template": pushplus.template(), "topic_set": bool(pushplus.topic())},
+        "logs": {"dir": log_dir, "dir_exists": bool(log_dir and os.path.isdir(log_dir)),
+                 "max_mb": log_max_mb(), "max_days": log_max_days(),
+                 "scan_interval_s": LOG_SCAN_INTERVAL_S, "files": logdir_info},
+        "restart_script": {"path": RESTART_SCRIPT,
+                           "exists": bool(RESTART_SCRIPT and os.path.exists(RESTART_SCRIPT))},
+        "runtime": {"python": sys.version.split()[0], "pid": os.getpid(),
+                    "uptime_s": int(time.time() - _STARTED_AT)},
+    }
+
+
 @app.get("/api/health")
 async def api_health(request: Request):
     try:
@@ -475,11 +733,44 @@ async def api_health(request: Request):
         login = netease_auth.LoginState(error="probe_failed")
 
     env = _raw_env()
+
+    # 逐项给出人类可读的降级原因：只要有一项不健康，页面就要把它显式摊开，
+    # 而不是只回一个 ok:true 让用户对着"音源服务 unknown"猜。
+    problems: list[str] = []
+    if proxy_health.get("upstream") != "ok":
+        problems.append(
+            f"官方后端不可达（upstream={proxy_health.get('upstream', '?')}）。"
+            f"请确认飞牛音乐已启动，socket={PROXY_SOCK}"
+        )
+    mb_health = await _probe_musicbox("/healthz")
+    if not mb_health.get("reachable"):
+        problems.append(
+            f"音源服务不可达（{MUSICBOX_URL}）：{mb_health.get('detail') or '连接失败'}"
+        )
+    elif mb_health.get("status") != 200:
+        problems.append(
+            f"音源服务返回 {mb_health.get('status')}：{mb_health.get('detail') or ''}"[:300]
+        )
+    if not os.path.exists(UPSTREAM_SOCK):
+        problems.append(
+            f"未检测到官方 socket 备份 {UPSTREAM_SOCK}，代理可能尚未完成接管"
+        )
+    if not login.logged_in:
+        if netease_auth.free_only_on_logout():
+            problems.append("网易云未登录：当前只能播放免费曲目，且不会有「每日推荐」")
+        else:
+            problems.append("网易云未登录且已关闭免费曲降级：在线播放完全不可用")
+    mb_detail = await _probe_musicbox("/api/v1/auth/detail")
+
     return {
         "ok": True,
+        "healthy": not problems,
+        "problems": problems,
         "version": get_version(),
         "proxy": proxy_health,
+        "musicbox_probe": {"healthz": mb_health, "auth_detail": mb_detail},
         "netease": login.to_public_dict(),
+        "netease_error": login.error,
         "socket_takeover": bool(os.path.exists(UPSTREAM_SOCK)),
         "pushplus_enabled": pushplus.enabled(),
         "pushplus_configured": bool(str(env.get("FNMUSIC_PUSHPLUS_TOKEN", "")).strip()),
@@ -720,12 +1011,11 @@ async def api_logs(request: Request, what: str = "info", lines: int = 80):
     except (TypeError, ValueError):
         n = 80
 
-    log_dir = os.environ.get("FNMUSIC_ADMIN_LOG_DIR")
-    if not log_dir:
-        base = os.environ.get("FNMUSIC_ADMIN_VAR_DIR") or ""
-        log_dir = os.path.join(base, "logs") if base else ""
+    log_dir = _log_dir()
     if not log_dir or not os.path.isdir(log_dir):
-        return {"ok": True, "what": what, "lines": [], "note": "日志目录未配置或不存在"}
+        return {"ok": True, "what": what, "lines": [],
+                "note": f"日志目录未配置或不存在：{log_dir or '(未配置 FNMUSIC_ADMIN_LOG_DIR)'}",
+                "policy": {"dir": log_dir, "max_mb": log_max_mb(), "max_days": log_max_days()}}
 
     path = os.path.realpath(os.path.join(log_dir, f"{what}.log"))
     if not path.startswith(os.path.realpath(log_dir) + os.sep):
@@ -748,7 +1038,27 @@ async def api_logs(request: Request, what: str = "info", lines: int = 80):
     secrets = _secret_values()
     if secrets:
         rows = [_scrub(ln) for ln in rows]
-    return {"ok": True, "what": what, "path": path, "lines": rows}
+    return {"ok": True, "what": what, "path": path, "lines": rows,
+            "size_bytes": os.path.getsize(path) if os.path.exists(path) else 0,
+            "policy": {"dir": log_dir, "max_mb": log_max_mb(), "max_days": log_max_days()}}
+
+
+@app.post("/api/logs/rotate")
+async def api_logs_rotate(request: Request):
+    """手动触发一次日志清理（页面「立即清理」按钮）。返回逐个文件的处理动作。"""
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    try:
+        report = loghouse.scan(_log_dir(), max_mb=log_max_mb(), max_days=log_max_days())
+    except Exception as exc:  # noqa: BLE001
+        logger.error("手动日志清理失败: %s", exc)
+        return _err(500, f"日志清理失败：{exc}")
+    report["ok"] = not report.get("errors")
+    if report.get("errors"):
+        report["error"] = "；".join(report["errors"][:5])
+    return report
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -757,11 +1067,25 @@ async def index(request: Request):
         ident = _require(request)
     except _AuthError:
         return _forbidden_page()
-    return HTMLResponse(content=_render_page(ident))
+    # base 由服务端算出：它是唯一知道自己被什么前缀访问的一方
+    base = str(request.scope.get("fn_base") or "/")
+    return HTMLResponse(content=_render_page(ident, base))
 
 
-def _render_page(ident: GatewayIdentity) -> str:
-    return PAGE_HTML.replace("__USERNAME__", html.escape(ident.username or ident.uid or "unknown"))
+def _render_page(ident: GatewayIdentity, base: str = "/") -> str:
+    if not base.endswith("/"):
+        base += "/"
+    return (
+        PAGE_HTML
+        .replace("__BASE__", html.escape(base, quote=True))
+        .replace("__USERNAME__", html.escape(ident.username or ident.uid or "unknown"))
+    )
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    """浏览器必然会请求 favicon；给个 204 免得日志里出现无意义的 404 干扰排查。"""
+    return Response(status_code=204)
 
 
 # ------------------------------------------------------------------ 前端 ----
@@ -850,7 +1174,14 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
     <div class="row" id="status"><div class="kv"><div class="k">加载中</div><div class="v"><span class="spin"></span></div></div></div>
     <div class="acts">
       <button class="btn" id="refresh">刷新状态</button>
+      <button class="btn" id="diagBtn">一键诊断</button>
       <span id="statusMsg" class="sub" style="margin:0"></span>
+    </div>
+    <div class="msg" id="diagMsg"></div>
+    <pre class="log hide" id="diagBox"></pre>
+    <div class="acts hide" id="diagActs">
+      <button class="btn" id="diagCopy">复制诊断信息</button>
+      <span class="sub" style="margin:0">反馈问题时把这段连同日志一起贴上，能直接定位</span>
     </div>
   </div>
 
@@ -921,6 +1252,16 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
           <span class="ht">0 表示只在请求时按需探测</span>
         </label>
 
+        <label><span class="lb">单文件日志上限（MB）</span>
+          <input name="log_max_mb" inputmode="numeric" placeholder="10">
+          <span class="ht">超过即就地截断保留最近一半，0 表示不限制</span>
+        </label>
+
+        <label><span class="lb">日志保留天数</span>
+          <input name="log_max_days" inputmode="numeric" placeholder="30">
+          <span class="ht">超期的备份日志直接删除、超期的活跃日志清空，0 表示永久保留</span>
+        </label>
+
         <label><span class="lb">PushPlus 接口地址</span>
           <input name="pushplus_url" placeholder="https://www.pushplus.plus/send">
           <span class="ht">一般不用改，除非你自建了转发</span>
@@ -984,7 +1325,10 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
     </div>
     <div class="acts" style="margin-top:0">
       <button class="btn" id="logBtn">读取最近 120 行</button>
+      <button class="btn" id="rotateBtn">立即清理超额日志</button>
+      <span class="sub" id="logPolicy" style="margin:0"></span>
     </div>
+    <div class="msg" id="logMsg"></div>
     <pre class="log hide" id="logBox"></pre>
   </div>
 
@@ -1001,11 +1345,24 @@ var $=function(s){return document.querySelector(s)};
 var BOOLS=["free_only_on_logout","daily_enabled","pushplus_enabled"];
 var pollTimer=null, qrUnikey="", expireTimer=null;
 
+// 服务端注入的绝对前缀（形如 /app/fnmusicext/）。
+// 必须用它，不能用相对路径：页面 URL 无尾斜杠时（/app/fnmusicext），
+// 浏览器会把 api/health 解析成 /app/api/health，网关前缀被吃掉一段，
+// 请求根本到不了后端，只会拿到网关的 404。反代再套一层时同理。
+var BASE="__BASE__";
+if(BASE.charAt(BASE.length-1)!=="/") BASE+="/";
+function url(p){ return BASE + String(p).replace(/^\/+/, "") }
+
 function api(path,opt){
-  return fetch(path,opt).then(function(r){
-    return r.json().catch(function(){return {ok:false,error:"HTTP "+r.status}})
-      .then(function(j){ if(!r.ok&&!j.error) j.error="HTTP "+r.status; return j; });
-  }).catch(function(e){return {ok:false,error:String(e)}});
+  return fetch(url(path),opt).then(function(r){
+    return r.text().then(function(txt){
+      var j=null; try{ j=JSON.parse(txt) }catch(e){}
+      if(!j||typeof j!=="object") j={ok:false,error:"HTTP "+r.status+(txt?"："+txt.slice(0,160):"")};
+      if(!r.ok&&!j.error) j.error="HTTP "+r.status;
+      j._status=r.status;
+      return j;
+    });
+  }).catch(function(e){return {ok:false,error:"网络错误 "+String(e)}});
 }
 function pill(ok,txt){return '<span class="pill '+(ok?"ok":"err")+'">'+txt+'</span>'}
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){
@@ -1013,18 +1370,51 @@ function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){
 
 function kv(k,v){return '<div class="kv"><div class="k">'+esc(k)+'</div><div class="v">'+v+'</div></div>'}
 
+function showDiag(txt){
+  $("#diagMsg").className="msg err";
+  $("#diagMsg").textContent=txt;
+}
 function status(){
   $("#statusMsg").innerHTML='<span class="spin"></span> 探测中';
   api("api/health").then(function(j){
     $("#statusMsg").textContent="";
-    if(!j.ok){ $("#status").innerHTML=kv("状态",pill(false,"获取失败")); return; }
+    if(!j.ok){
+      $("#status").innerHTML=kv("状态",pill(false,"获取失败"))+
+        kv("原因",esc(j.error||("HTTP "+(j._status||"?"))));
+      showDiag("状态获取失败："+(j.error||("HTTP "+(j._status||"?")))+
+        "\n下面已自动抓取后端探测详情与日志，不必 SSH。");
+      runDiag(true);
+      return;
+    }
+    // 接口本身成功，但系统有降级项：把每一条原因显式摊开并自动抓诊断
+    if(j.healthy===false && (j.problems||[]).length){
+      var ps=j.problems;
+      $("#status").innerHTML=ps.map(function(x){return kv("需要注意",pill(false,"异常"))+kv("原因",esc(x))}).join("")
+        +kv("接口调用","成功（以下是探测到的真实问题）");
+      $("#statusMsg").textContent="";
+      showDiag("检测到 "+ps.length+" 项异常：\n  · "+ps.join("\n  · ")+
+        "\n\n已自动抓取后端探测详情与各组件日志，展开下方即可看到；"+
+        "需要反馈时点「复制诊断信息」。");
+      if(!DIAG_DONE){ runDiag(true); }
+      // 仍然把能拿到的状态渲染出来，别把页面变成一片空白
+      renderStatus(j);
+      return;
+    }
+    $("#statusMsg").textContent="";
+    renderStatus(j);
+  });
+}
+
+var DIAG_DONE=false;
+function renderStatus(j){
     $("#ver").textContent="v"+(j.version||"?");
     var p=j.proxy||{}, n=j.netease||{};
     var take=j.socket_takeover;
+    var mbp=(j.musicbox_probe&&j.musicbox_probe.healthz)||{};
     var h="";
     h+=kv("代理接管", take?pill(true,"已接管"):pill(false,"未接管"));
     h+=kv("官方后端", p.upstream==="ok"?pill(true,"连通"):pill(false,String(p.upstream||"未知")));
-    h+=kv("音源服务", p.musicbox==="ok"?pill(true,"运行中"):(p.musicbox==="disabled"?pill(true,"已停用"):pill(false,String(p.musicbox||"未知"))));
+    h+=kv("音源服务", p.musicbox==="ok"?pill(true,"运行中"):(p.musicbox==="disabled"?pill(true,"已停用"):pill(false,String(p.musicbox||"未知"))+(mbp.detail?" · "+esc(String(mbp.detail)).slice(0,60):"")));
     if(n.logged_in){
       var v=n.vip?'<span class="pill ok">VIP</span> ':'<span class="pill warn">非 VIP</span> ';
       h+=kv("网易云", pill(true,"已登录")+" "+v+esc(n.nickname||""));
@@ -1035,8 +1425,12 @@ function status(){
     h+=kv("每日推荐", p.daily==="ok"?pill(true,"可用"):(p.daily==="need_login"?'<span class="pill warn">需登录</span>':pill(false,String(p.daily||"未知"))));
     h+=kv("PushPlus", j.pushplus_enabled?pill(true,"已启用"):(j.pushplus_configured?'<span class="pill warn">已关闭</span>':'<span class="pill warn">未配置</span>'));
     h+=kv("检测时间", new Date((j.checked_at||0)*1000).toLocaleString());
-    $("#status").innerHTML=h;
-  });
+    var box=$("#status");
+    if(j.healthy===false && (j.problems||[]).length){
+      box.innerHTML += h.replace(/^/,"");
+    }else{
+      box.innerHTML=h;
+    }
 }
 
 function stopPolling(){
@@ -1053,11 +1447,17 @@ function newQr(){
   stopPolling(); $("#qrRefresh").classList.add("hide");
   qrState("正在向音源服务申请二维码…");
   api("api/login/qr",{method:"POST"}).then(function(j){
-    if(!j.ok){ qrState("失败：" + (j.error||"未知错误")); return; }
+    if(!j.ok){
+      qrState("失败：" + (j.error||("HTTP "+(j._status||"?"))));
+      showDiag("生成二维码失败："+(j.error||("HTTP "+(j._status||"?")))+
+        "\n常见原因：音源服务（musicbox）没起来，或依赖未装好。点「一键诊断」查看详情与日志。");
+      runDiag(true);
+      return;
+    }
     qrUnikey=j.unikey;
     $("#qrBox").classList.remove("hide");
     $("#qrRefresh").classList.remove("hide");
-    $("#qrImg").src=j.qr_png+"&t="+Date.now();
+    $("#qrImg").src=url(j.qr_png)+"&t="+Date.now();
     qrState("等待扫码…","");
     pollTimer=setInterval(function(){poll()},2500);
     expireTimer=setTimeout(function(){qrState("二维码已过期，自动换一张…");newQr()},170000);
@@ -1098,22 +1498,135 @@ $("#qrRefresh").onclick=function(){ newQr() };
 $("#refresh").onclick=status;
 $("#reloadBtn").onclick=function(){ $("#cfgMsg").className="msg"; loadCfg() };
 
-$("#logBtn").onclick=function(){
-  var w=$("#logTabs button.on").getAttribute("data-w");
+function fmtBytes(n){ n=Number(n)||0; return n>1048576 ? (n/1048576).toFixed(2)+" MB"
+  : n>1024 ? (n/1024).toFixed(1)+" KB" : n+" B" }
+
+function currentLogName(){ return $("#logTabs button.on").getAttribute("data-w") }
+
+function renderLogs(){
+  var w=currentLogName();
   $("#logBox").classList.remove("hide");
   $("#logBox").textContent="读取中…";
   api("api/logs?what="+encodeURIComponent(w)+"&lines=120").then(function(j){
-    if(!j.ok){ $("#logBox").textContent="失败："+(j.error||""); return; }
+    if(!j.ok){
+      $("#logBox").textContent="读取失败："+(j.error||("HTTP "+(j._status||"?")));
+      return;
+    }
+    if(j.policy){
+      $("#logPolicy").textContent="策略：单文件 > "+j.policy.max_mb+" MB 就地截断保留尾部，超过 "
+        +j.policy.max_days+" 天自动清理；目录 "+(j.policy.dir||"未配置");
+    }
     var ls=j.lines||[];
-    $("#logBox").textContent = ls.length ? ls.join("\n")
+    var head="— "+w+".log（"+(j.size_bytes?fmtBytes(j.size_bytes):"空")+"，显示末尾 "+ls.length+" 行）—\n";
+    $("#logBox").textContent = ls.length ? head+ls.join("\n")
       : (j.note || "（暂无日志）") + "\n\n路径："+(j.path||"未知");
+    $("#logBox").scrollTop=$("#logBox").scrollHeight;
+  });
+}
+$("#logBtn").onclick=renderLogs;
+
+$("#rotateBtn").onclick=function(){
+  var b=this; b.disabled=true; b.textContent="清理中…";
+  var m=$("#logMsg"); m.className="msg info"; m.textContent="正在按策略清理…";
+  api("api/logs/rotate",{method:"POST"}).then(function(j){
+    b.disabled=false; b.textContent="立即清理超额日志";
+    if(!j.ok){ m.className="msg err"; m.textContent="清理失败："+(j.error||("HTTP "+(j._status||"?"))); return; }
+    var acts=j.actions||[];
+    var msg=acts.length
+      ? "已清理 "+acts.length+" 项，回收 "+(j.freed_mb||0)+" MB：\n"
+        + acts.map(function(a){return "  · "+a.file+" — "+a.action
+            +(a.size_mb?" ("+a.size_mb+"MB → "+(a.kept_mb||0)+"MB)":"")
+            +(a.age_days?" (留存 "+a.age_days+" 天)":"")}).join("\n")
+      : "没有需要清理的日志（都在阈值内）。";
+    if(j.errors&&j.errors.length) msg+="\n\n部分失败：\n  "+j.errors.join("\n  ");
+    m.className=(j.errors&&j.errors.length)?"msg err":"msg ok";
+    m.textContent=msg;
+    renderLogs();
   });
 };
+
+function runDiag(auto){
+  DIAG_DONE=true;
+  var box=$("#diagBox"), acts=$("#diagActs");
+  box.classList.remove("hide"); acts.classList.remove("hide");
+  if(!auto){ $("#diagMsg").className="msg info"; $("#diagMsg").textContent="正在收集诊断信息…"; }
+  var w=currentLogName();
+  Promise.all([
+    api("api/diag"),
+    api("api/logs?what=info&lines=60"),
+    api("api/logs?what="+encodeURIComponent(w)+"&lines=60"),
+    api("api/logs?what=musicbox&lines=40"),
+    api("api/logs?what=proxy&lines=40")
+  ]).then(function(rs){
+    var d=rs[0], out=[];
+    out.push("========== fnmusic-ext 诊断 "+new Date().toLocaleString()+" ==========");
+    if(!d.ok){ out.push("诊断接口失败："+(d.error||("HTTP "+(d._status||"?")))); }
+    else{
+      out.push("版本: "+d.version+"   页面进程 pid="+d.runtime.pid+" 已运行 "+d.runtime.uptime_s+"s");
+      out.push("");
+      out.push("-- 请求路径（反代/组网排障关键）--");
+      out.push("  浏览器侧 base 前缀 : "+d.request.base_prefix);
+      out.push("  后端收到原始路径   : "+d.request.original_path);
+      out.push("  归一化后内部路径   : "+d.request.normalized_path);
+      out.push("  配置的网关前缀     : "+d.request.gateway_prefix_config);
+      out.push("  X-Forwarded-Prefix : "+(d.request.x_forwarded_prefix||"(无)"));
+      out.push("  网关身份 Header    : "+JSON.stringify(d.request.identity));
+      out.push("");
+      out.push("-- socket 接管 --");
+      out.push("  "+d.proxy_socket.path+" 存在="+d.proxy_socket.exists+" 权限="+d.proxy_socket.mode);
+      out.push("  upstream("+d.proxy_socket.upstream_exists+")");
+      out.push("");
+      out.push("-- 音源服务 (musicbox) --");
+      out.push("  "+d.musicbox.url);
+      out.push("  healthz     : "+JSON.stringify(d.musicbox.healthz));
+      out.push("  auth/detail : "+JSON.stringify(d.musicbox.auth_detail));
+      out.push("  登录态      : "+JSON.stringify(d.musicbox.login)+"  error="+d.musicbox.login_error);
+      out.push("");
+      out.push("-- 配置文件 --");
+      out.push("  "+d.env_file.path+"  存在="+d.env_file.exists+" 可写="+d.env_file.writable
+               +" 权限="+d.env_file.mode+" 键数="+d.env_file.keys);
+      out.push("  PushPlus token 已配置="+d.env_file.pushplus_token_configured
+               +" 长度="+d.env_file.pushplus_token_length+"（值不外泄）");
+      out.push("  推送="+JSON.stringify(d.pushplus));
+      out.push("  重启脚本="+d.restart_script.path+" 存在="+d.restart_script.exists);
+      out.push("");
+      out.push("-- 日志目录 "+d.logs.dir+" (存在="+d.logs.dir_exists+") 策略: >"+d.logs.max_mb
+               +"MB 截断 / >"+d.logs.max_days+"天清理 --");
+      (d.logs.files||[]).forEach(function(f){
+        out.push("  "+f.name+"  "+fmtBytes(f.bytes)+"  修改于 "+new Date(f.mtime*1000).toLocaleString());
+      });
+    }
+    [["info",rs[1]],[w,rs[2]],["musicbox",rs[3]],["proxy",rs[4]]].forEach(function(pair){
+      var name=pair[0], r=pair[1];
+      out.push("");
+      out.push("========== "+name+".log ==========");
+      if(!r.ok){ out.push("读取失败："+(r.error||("HTTP "+(r._status||"?")))); return; }
+      var ls=r.lines||[];
+      out.push(ls.length?ls.join("\n"):((r.note||"（暂无日志）")+"  path="+(r.path||"?")));
+    });
+    var txt=out.join("\n");
+    box.textContent=txt;
+    box.scrollTop=0;
+    $("#diagMsg").className = d.ok ? "msg ok" : "msg err";
+    $("#diagMsg").textContent = d.ok
+      ? "诊断信息已收集完毕，可点「复制诊断信息」贴给维护者。其中不含任何 token。"
+      : "诊断接口本身也失败了，下面是已能取到的信息。";
+    $("#diagCopy").onclick=function(){
+      if(navigator.clipboard&&navigator.clipboard.writeText){
+        navigator.clipboard.writeText(txt).then(function(){
+          $("#diagMsg").className="msg ok";
+          $("#diagMsg").textContent="已复制到剪贴板。若浏览器因非安全上下文拒绝，请手动全选复制。";
+        },function(){ prompt("浏览器拒绝剪贴板，请手动全选复制：",txt) });
+      }else{ prompt("请手动全选复制：",txt) }
+    };
+  });
+}
+$("#diagBtn").onclick=function(){ DIAG_DONE=false; runDiag(false) };
 Array.prototype.forEach.call($("#logTabs").querySelectorAll("button"),function(b){
   b.onclick=function(){
     Array.prototype.forEach.call($("#logTabs").querySelectorAll("button"),function(x){x.classList.remove("on")});
     b.classList.add("on");
-    if(!$("#logBox").classList.contains("hide")) $("#logBtn").onclick();
+    if(!$("#logBox").classList.contains("hide")) renderLogs();
   };
 });
 

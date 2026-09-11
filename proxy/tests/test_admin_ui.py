@@ -136,10 +136,28 @@ def test_gateway_prefix_is_stripped(path):
         assert r.status_code == 200, path
 
 
-def test_prefix_strip_does_not_open_unrelated_paths():
+def test_unrelated_paths_still_404():
+    """不以已知端点结尾的陌生路径必须 404，不能被归一化规则误放行。
+
+    注意：为了支持任意层数的反代/组网隧道，「以已知端点结尾」的路径会被
+    归一化——这是有意的。安全性不依赖路径，鉴权靠网关 Header，见下面的用例。
+    """
     with TestClient(admin_ui.app) as c:
-        # 不在网关前缀下、也不在根路由内的路径不该被误判放行
-        assert c.get("/app/otherapp/api/health", headers=ADMIN).status_code == 404
+        for path in ("/totally/unknown/path", "/app/otherapp/status",
+                     "/api/unknown", "/api/healt", "/app/fnmusicext/nope"):
+            assert c.get(path, headers=ADMIN).status_code == 404, path
+
+
+def test_authorization_is_path_independent():
+    """无论请求走哪条前缀路径进来，鉴权都必须照样生效。"""
+    mock_mb(lambda r: httpx.Response(200, json={"ok": True, "data": {"logged_in": False}}))
+    tainted = ["/api/health", "/app/fnmusicext/api/health",
+               "/tunnel/x/app/fnmusicext/api/health", "/fnmusicext/api/health"]
+    with TestClient(admin_ui.app) as c:
+        for path in tainted:
+            assert c.get(path).status_code == 403, f"{path} 无网关身份竟放行"
+            assert c.get(path, headers=USER).status_code == 403, f"{path} 非管理员竟放行"
+            assert c.get(path, headers=ADMIN).status_code == 200, path
 
 
 # -------------------------------------------------------------- 配置读取 ----
@@ -545,3 +563,307 @@ def test_restart_timeout_is_reported(monkeypatch, tmp_path):
     monkeypatch.setattr(admin_ui, "RESTART_TIMEOUT_S", 0.3)
     ok, msg = asyncio.run(admin_ui.restart_services())
     assert ok is False and "超时" in msg
+
+
+# ============================ v2.1.1 反代/组网路径归一化 ============================
+#
+# 真实故障：页面在 /app/fnmusicext（无尾斜杠）下用相对路径请求 api/health，
+# 浏览器解析成 /app/api/health，网关前缀被吃掉一段，请求根本到不了后端，
+# 用户只看到满屏 404。以下用例锁死这个行为。
+
+@pytest.mark.parametrize("path,expect_inner,expect_base", [
+    # 直连根路径
+    ("/api/health", "/api/health", "/"),
+    ("/", "/", "/"),
+    # 标准网关前缀，有无尾斜杠都行
+    ("/app/fnmusicext", "/", "/app/fnmusicext/"),
+    ("/app/fnmusicext/", "/", "/app/fnmusicext/"),
+    ("/app/fnmusicext/api/health", "/api/health", "/app/fnmusicext/"),
+    ("/app/fnmusicext/api/logs", "/api/logs", "/app/fnmusicext/"),
+    # 反代/组网隧道又套一层甚至多层
+    ("/group/app/fnmusicext/api/health", "/api/health", "/group/app/fnmusicext/"),
+    ("/nodebaby/tunnel/fnmusicext/api/config", "/api/config", "/nodebaby/tunnel/fnmusicext/"),
+    ("/a/b/c/app/fnmusicext/api/login/qr.png", "/api/login/qr.png", "/a/b/c/app/fnmusicext/"),
+    ("/xx/app/fnmusicext", "/", "/xx/app/fnmusicext/"),
+    # 反代把 /app 也吃掉了，只剩应用名
+    ("/fnmusicext/api/health", "/api/health", "/fnmusicext/"),
+    ("/fnmusicext", "/", "/fnmusicext/"),
+    ("/whatever/app", "/", "/whatever/app/"),
+    # 未知路径原样交给路由自然 404
+    ("/totally/unknown/path", "/totally/unknown/path", "/"),
+])
+def test_normalize_path(path, expect_inner, expect_base):
+    inner, base = admin_ui.normalize_path(path)
+    assert inner == expect_inner, path
+    assert base == expect_base, path
+    assert base.endswith("/"), "base 必须以 / 结尾，否则前端拼接会错位"
+
+
+@pytest.mark.parametrize("endpoint", sorted(admin_ui.KNOWN_ENDPOINTS))
+def test_every_known_endpoint_normalizes_under_arbitrary_prefix(endpoint):
+    """任何已知端点在任意前缀下都必须归一化成功（新增端点时该用例自动覆盖）。"""
+    for prefix in ("/app/fnmusicext", "/tunnel/x/app/fnmusicext", "/deep/a/b/app/fnmusicext"):
+        inner, base = admin_ui.normalize_path(prefix + endpoint)
+        assert inner == endpoint, (prefix, endpoint, inner)
+        assert base == prefix + "/"
+
+
+def test_normalize_does_not_false_positive_on_similar_suffix():
+    """/xapi/health 这类形似路径不能被误判成 /api/health。"""
+    inner, _ = admin_ui.normalize_path("/app/fnmusicext/xapi/health")
+    assert inner != "/api/health"
+
+
+def test_base_prefix_reaches_all_api_paths_end_to_end():
+    """核心回归：浏览器基于 BASE 拼出的 URL 打到后端必须全部命中路由。"""
+    mock_mb(lambda r: httpx.Response(200, json={"ok": True, "data": {"logged_in": False}}))
+    with TestClient(admin_ui.app) as c:
+        for prefix in ("/", "/app/fnmusicext", "/group/app/fnmusicext",
+                       "/nodebaby/tunnel/fnmusicext", "/fnmusicext"):
+            page_prefix = "" if prefix == "/" else prefix
+            pr = c.get(page_prefix or "/", headers=ADMIN)
+            assert pr.status_code == 200, prefix
+            import re as _re
+            m = _re.search(r'var BASE="([^"]*)"', pr.text)
+            assert m, f"{prefix}: 页面未注入 BASE"
+            base = m.group(1)
+            assert base.startswith(prefix.rstrip("/")) or prefix == "/"
+            # 前端用 BASE + "api/health" 发起的请求
+            r = c.get(base + "api/health", headers=ADMIN)
+            assert r.status_code == 200, f"{prefix} -> {base}api/health 仍 404"
+            assert r.json()["ok"] is True
+
+
+def test_index_page_never_uses_relative_api_paths():
+    """页面 JS 里不许再出现裸的相对路径请求，否则无尾斜杠场景必然复现 404。"""
+    with TestClient(admin_ui.app) as c:
+        body = c.get("/app/fnmusicext", headers=ADMIN).text
+        assert 'var BASE="/app/fnmusicext/"' in body
+        # 所有 fetch 都必须经过 url() 包装
+        assert "fetch(url(path),opt)" in body
+        assert 'src=url(j.qr_png)' in body
+
+
+def test_favicon_does_not_404():
+    """浏览器必然请求 favicon；404 会在用户眼里伪装成"接口坏了"。"""
+    with TestClient(admin_ui.app) as c:
+        assert c.get("/favicon.ico").status_code == 204
+        assert c.get("/app/fnmusicext/favicon.ico", headers=ADMIN).status_code == 204
+
+
+# ------------------------------------------------------------------ 诊断 ----
+
+def test_diag_reports_routing_info_for_proxy_debugging(monkeypatch):
+    monkeypatch.setenv("FNMUSIC_ADMIN_LOG_DIR", "")
+    mock_mb(lambda r: httpx.Response(200, json={"ok": True, "data": {"logged_in": False}}))
+    with TestClient(admin_ui.app) as c:
+        r = c.get("/group/app/fnmusicext/api/diag", headers=ADMIN)
+        assert r.status_code == 200
+        d = r.json()
+    req = d["request"]
+    assert req["original_path"] == "/group/app/fnmusicext/api/diag"
+    assert req["normalized_path"] == "/api/diag"
+    assert req["base_prefix"] == "/group/app/fnmusicext/"
+    assert req["identity"]["username"] == "gzy"
+    assert req["identity"]["is_admin"] is True
+    assert "proxy_socket" in d and "musicbox" in d and "env_file" in d
+    assert "logs" in d and "restart_script" in d and "runtime" in d
+
+
+def test_diag_never_leaks_token(env, monkeypatch):
+    monkeypatch.setenv("FNMUSIC_ADMIN_LOG_DIR", "")
+    mock_mb(lambda r: httpx.Response(200, json={"ok": True, "data": {"logged_in": False}}))
+    with TestClient(admin_ui.app) as c:
+        r = c.get("/api/diag", headers=ADMIN)
+    body = r.text
+    assert FAKE_TOKEN not in body
+    assert r.json()["env_file"]["pushplus_token_configured"] is True
+    assert r.json()["env_file"]["pushplus_token_length"] == len(FAKE_TOKEN)
+
+
+def test_diag_denied_without_gateway_or_admin():
+    with TestClient(admin_ui.app) as c:
+        assert c.get("/api/diag").status_code == 403
+        assert c.get("/api/diag", headers=USER).status_code == 403
+
+
+def test_diag_survives_musicbox_down(monkeypatch):
+    def boom(r):
+        raise httpx.ConnectError("拒绝连接")
+
+    mock_mb(boom)
+    monkeypatch.setattr(admin_ui, "PROXY_SOCK", "/nonexistent.sock")
+    with TestClient(admin_ui.app) as c:
+        r = c.get("/api/diag", headers=ADMIN)
+        assert r.status_code == 200
+        mb = r.json()["musicbox"]["healthz"]
+    assert mb["reachable"] is False
+    assert "detail" in mb, "失败原因必须带回来，否则用户无从排查"
+
+
+# ------------------------------------------------------------ 日志策略 ----
+
+def test_logs_response_carries_policy(tmp_path, monkeypatch):
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+    (logdir / "info.log").write_text("a\nb\n", encoding="utf-8")
+    monkeypatch.setenv("FNMUSIC_ADMIN_LOG_DIR", str(logdir))
+    with TestClient(admin_ui.app) as c:
+        body = c.get("/api/logs?what=info", headers=ADMIN).json()
+    assert body["policy"]["max_mb"] == 10
+    assert body["policy"]["max_days"] == 30
+    assert body["size_bytes"] == 4
+
+
+def test_log_policy_is_configurable(env):
+    with TestClient(admin_ui.app) as c:
+        r = post_cfg(c, {"log_max_mb": "5", "log_max_days": "7"})
+        assert r.status_code == 200 and r.json()["ok"] is True
+    after = read_env(env)
+    assert after["FNMUSIC_LOG_MAX_MB"] == "5"
+    assert after["FNMUSIC_LOG_MAX_DAYS"] == "7"
+    # 读回时立即生效（改完不必等重启）
+    assert admin_ui.log_max_mb() == 5.0
+    assert admin_ui.log_max_days() == 7.0
+
+
+@pytest.mark.parametrize("values", [
+    {"log_max_mb": "-1"}, {"log_max_mb": "abc"}, {"log_max_mb": "99999"},
+    {"log_max_days": "-3"}, {"log_max_days": "99999"},
+])
+def test_log_policy_validated(env, values):
+    with TestClient(admin_ui.app) as c:
+        assert post_cfg(c, values).status_code == 422, values
+
+
+def test_manual_rotate_endpoint(tmp_path, monkeypatch):
+    logdir = tmp_path / "logs"
+    monkeypatch.setenv("FNMUSIC_ADMIN_LOG_DIR", str(logdir))
+    bigp = logdir / "proxy.log"
+    with TestClient(admin_ui.app) as c:
+        # 必须在进入 TestClient 之后再造大文件：lifespan 启动时会先扫一遍，
+        # 否则这里测到的是启动清理而不是端点本身（该行为由下面的用例单独覆盖）
+        logdir.mkdir(exist_ok=True)
+        bigp.write_text("".join(f"l{i}\n" + "z" * 80 for i in range(150000)),
+                        encoding="utf-8")
+        assert bigp.stat().st_size > 10 * 1048576, "必须真的超过默认阈值"
+
+        r = c.post("/api/logs/rotate", headers=ADMIN)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True
+        assert body["actions"] and body["freed_mb"] > 0
+        assert bigp.stat().st_size <= 10 * 1048576
+
+        # 再清一次应无事可做（幂等）
+        again = c.post("/api/logs/rotate", headers=ADMIN).json()
+        assert again["ok"] is True and again["actions"] == []
+
+
+def test_manual_rotate_requires_admin():
+    with TestClient(admin_ui.app) as c:
+        assert c.post("/api/logs/rotate").status_code == 403
+        assert c.post("/api/logs/rotate", headers=USER).status_code == 403
+
+
+def test_lifespan_scans_logs_on_startup(tmp_path, monkeypatch):
+    """启动即清一次：上次运行攒下的超大日志不该继续占盘。"""
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+    bigp = logdir / "info.log"
+    bigp.write_text("q" * (12 * 1048576), encoding="utf-8")
+    monkeypatch.setenv("FNMUSIC_ADMIN_LOG_DIR", str(logdir))
+    mock_mb(lambda r: httpx.Response(200, json={"ok": True, "data": {"logged_in": False}}))
+    with TestClient(admin_ui.app):
+        pass
+    assert bigp.stat().st_size <= 10 * 1048576, "lifespan 启动时应已按策略清理"
+
+
+# ================================= 降级可见性：异常必须被显式摊开 =================================
+#
+# 故障时 /api/health 仍返回 200 + ok:true（否则页面直接打不开、用户无法自救），
+# 但必须额外给出 healthy=false 与逐条可读的 problems，前端据此自动展开诊断与日志。
+
+def test_health_reports_healthy_true_when_all_good(monkeypatch):
+    mock_mb(lambda r: httpx.Response(200, json={"ok": True, "data": {
+        "logged_in": True, "nickname": "张三",
+        "profile": {"nickname": "张三", "userId": "1", "vipType": 11}}}))
+    monkeypatch.setattr(admin_ui, "PROXY_SOCK", "/nonexistent.sock")
+    # 让代理探测报 ok
+    async def fake_proxy_health():
+        return {"ok": True, "upstream": "ok", "musicbox": "ok"}
+    monkeypatch.setattr(admin_ui, "_probe_proxy_health", fake_proxy_health)
+    monkeypatch.setattr(admin_ui, "UPSTREAM_SOCK", "/tmp/qwenwork/uipreview/trim_music_upstream.socket")
+    import pathlib
+    pathlib.Path(admin_ui.UPSTREAM_SOCK).parent.mkdir(parents=True, exist_ok=True)
+    pathlib.Path(admin_ui.UPSTREAM_SOCK).touch(exist_ok=True)
+    with TestClient(admin_ui.app) as c:
+        body = c.get("/api/health", headers=ADMIN).json()
+    assert body["ok"] is True
+    assert body["healthy"] is True
+    assert body["problems"] == []
+    pathlib.Path(admin_ui.UPSTREAM_SOCK).unlink(missing_ok=True)
+
+
+def test_health_reports_unreachable_musicbox_with_reason(monkeypatch):
+    def boom(r):
+        raise httpx.ConnectError("连接被拒绝")
+
+    mock_mb(boom)
+    monkeypatch.setattr(admin_ui, "PROXY_SOCK", "/nonexistent.sock")
+    with TestClient(admin_ui.app) as c:
+        r = c.get("/api/health", headers=ADMIN)
+        assert r.status_code == 200, "音源挂了页面也必须能打开"
+        body = r.json()
+    assert body["ok"] is True, "接口调用本身是成功的"
+    assert body["healthy"] is False
+    joined = "\n".join(body["problems"])
+    assert "音源服务不可达" in joined
+    assert "ConnectError" in joined, "必须带出真实异常类型，否则用户无从排查"
+    assert body["musicbox_probe"]["healthz"]["reachable"] is False
+
+
+def test_health_reports_not_logged_in_as_problem(monkeypatch):
+    mock_mb(lambda r: httpx.Response(200, json={"ok": True, "data": {"logged_in": False}}))
+    monkeypatch.setattr(admin_ui, "PROXY_SOCK", "/nonexistent.sock")
+    monkeypatch.setenv("FNMUSIC_FREE_ONLY_ON_LOGOUT", "true")
+    with TestClient(admin_ui.app) as c:
+        body = c.get("/api/health", headers=ADMIN).json()
+    joined = "\n".join(body["problems"])
+    assert "未登录" in joined and "免费曲目" in joined
+
+
+def test_health_reports_login_required_harder_when_degradation_off(monkeypatch):
+    mock_mb(lambda r: httpx.Response(200, json={"ok": True, "data": {"logged_in": False}}))
+    monkeypatch.setattr(admin_ui, "PROXY_SOCK", "/nonexistent.sock")
+    monkeypatch.setenv("FNMUSIC_FREE_ONLY_ON_LOGOUT", "false")
+    with TestClient(admin_ui.app) as c:
+        body = c.get("/api/health", headers=ADMIN).json()
+    joined = "\n".join(body["problems"])
+    assert "完全不可用" in joined, "关闭降级后必须明确告知在线播放彻底不可用"
+
+
+def test_health_reports_upstream_and_takeover_problems(monkeypatch):
+    mock_mb(lambda r: httpx.Response(200, json={"ok": True, "data": {"logged_in": True}}))
+    monkeypatch.setattr(admin_ui, "PROXY_SOCK", "/nonexistent.sock")
+    monkeypatch.setattr(admin_ui, "UPSTREAM_SOCK", "/nonexistent_upstream.sock")
+    async def fake_proxy_health():
+        return {"ok": False, "upstream": "fail"}
+    monkeypatch.setattr(admin_ui, "_probe_proxy_health", fake_proxy_health)
+    with TestClient(admin_ui.app) as c:
+        body = c.get("/api/health", headers=ADMIN).json()
+    joined = "\n".join(body["problems"])
+    assert "官方后端不可达" in joined
+    assert "尚未完成接管" in joined
+    assert body["socket_takeover"] is False
+
+
+def test_health_problems_never_leak_token(env, monkeypatch):
+    def boom(r):
+        raise httpx.ConnectError(FAKE_TOKEN)   # 故意让异常信息里带上 token
+
+    mock_mb(boom)
+    monkeypatch.setattr(admin_ui, "PROXY_SOCK", "/nonexistent.sock")
+    with TestClient(admin_ui.app) as c:
+        r = c.get("/api/health", headers=ADMIN)
+    assert FAKE_TOKEN not in r.text, "异常详情回显前必须脱敏"

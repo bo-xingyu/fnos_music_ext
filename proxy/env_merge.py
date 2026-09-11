@@ -41,8 +41,13 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_PUSHPLUS_TOPIC", ""),
     ("FNMUSIC_PUSHPLUS_TEMPLATE", "markdown"),
     ("FNMUSIC_PUSHPLUS_URL", DEFAULT_PUSHPLUS_URL),
+    # 日志保留策略：单文件超 MB 就地截断保留尾部，超龄文件按类型清理
+    ("FNMUSIC_LOG_MAX_MB", "10"),
+    ("FNMUSIC_LOG_MAX_DAYS", "30"),
+    ("FNMUSIC_LOG_SCAN_INTERVAL", "3600"),
 ]
-NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOGIN_", "FNMUSIC_VIP_", "FNMUSIC_PUSHPLUS_")
+NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOGIN_",
+                "FNMUSIC_VIP_", "FNMUSIC_PUSHPLUS_", "FNMUSIC_LOG_")
 
 # v2.0 已废弃的配置项：升级合并时从 .env 中清理，避免残留误导。
 # 只删「确定已无代码读取」的键；FNMUSIC_MODE / BASE_IMAGE / PIP_INDEX 等 docker 相关项保留。

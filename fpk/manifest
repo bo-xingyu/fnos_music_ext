@@ -1,5 +1,5 @@
 appname               = fnmusicext
-version               = 2.1.0
+version               = 2.1.1
 display_name          = 飞牛音乐扩展（网易云）
 desc                  = 为飞牛音乐（trim.music）提供网易云在线音源扩展：在官方 App 搜索框内直接搜播网易云曲库，补齐 LRC 歌词与高清封面，边播边存无感离线，多用户隔离红心收藏，并注入网易云官方「每日推荐」歌单。<br/><br/>安装后飞牛桌面会出现「飞牛音乐扩展」图标，打开即可在网页里扫码登录网易云、配置全部选项、查看运行日志，全程无需 SSH。<br/><br/>采用无侵入 Unix Domain Socket 接管，完全不修改飞牛官方程序、nginx 配置与数据库。在线音源只使用你扫码登录的那一个私人网易云账号的权益；未登录时自动降级为只播免费曲目，并可通过 PushPlus 推送登录失效与 VIP 临期提醒。
 source                = thirdparty
@@ -18,7 +18,7 @@ ctl_stop              = true
 checkport             = false
 disable_authorization_path = true
 
-changelog             = v2.1.0：新增飞牛桌面内管理页面（统一网关 /app/fnmusicext，需 NAS 登录且限管理员），网页内即可完成扫码登录、全部配置修改与日志查看，不再需要 SSH；音源服务默认收紧为仅监听 127.0.0.1。v2.0.0：在线音源收敛为网易云单一渠道，只使用扫码登录的私人账号权益；移除 musicdl / lxmusic 与大模型每日推荐；每日推荐改为抓取网易云官方日推；新增 PushPlus 提醒；未登录降级为只播免费曲目。
+changelog             = v2.1.1：修复经反向代理/组网隧道访问时页面能打开但所有接口 404（改为服务端注入绝对 base 前缀，并对任意层数前缀做路径归一化）；新增一键诊断端点把路由/socket/音源/配置/日志一次性回吐到页面，异常自动展开日志无需 SSH；新增日志保留策略（单文件超 10MB 就地截断保留尾部、超 30 天清理，可在页面调整与手动触发）。v2.1.0：新增飞牛桌面管理页面。v2.0.0：网易云单源化。
 
 desktop_uidir         = ui
 desktop_applaunchname = fnmusicext.main

@@ -163,6 +163,10 @@ start_ui() {
         FNMUSIC_ADMIN_LOG_DIR="${LOG_DIR}" \
         FNMUSIC_ADMIN_VAR_DIR="${PKGVAR}" \
         FNMUSIC_ADMIN_PREFIX="/app/${APP_NAME}" \
+        FNMUSIC_ADMIN_UI_SOCK="${UI_SOCK}" \
+        FNMUSIC_LOG_MAX_MB="$(lib_read_env_value FNMUSIC_LOG_MAX_MB 10)" \
+        FNMUSIC_LOG_MAX_DAYS="$(lib_read_env_value FNMUSIC_LOG_MAX_DAYS 30)" \
+        FNMUSIC_LOG_SCAN_INTERVAL="$(lib_read_env_value FNMUSIC_LOG_SCAN_INTERVAL 3600)" \
         "${RUN_DIR}/.venv-proxy/bin/uvicorn" admin_ui:app \
             --app-dir "${RUN_DIR}/proxy" \
             --uds "${UI_SOCK}"
@@ -204,6 +208,9 @@ start_ui() {
 main() {
     lib_log "=== start 开始 ==="
     mkdir -p "${LOG_DIR}" "${PKGVAR}" 2>/dev/null
+
+    # 启动前轮转一次日志：此时还没有进程持有日志 fd，rename 是安全的
+    lib_rotate_logs
 
     start_musicbox || return 1
     start_proxy || {

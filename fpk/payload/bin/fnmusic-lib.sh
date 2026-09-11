@@ -325,6 +325,70 @@ lib_kill_stale_by_sock() {
     return 0
 }
 
+lib_rotate_logs() {
+    # 日志保留策略：单文件超上限就轮转成 .1 备份，超龄文件直接删。
+    # 默认 10MB / 30 天，可由 .env 的 FNMUSIC_LOG_MAX_MB / FNMUSIC_LOG_MAX_DAYS 覆盖。
+    # 只在【启动前】调用（此时没有进程持有日志 fd，rename 安全）；
+    # 运行期由管理页面进程用 loghouse.scan() 就地截断，避免 inode 被带走。
+    local max_mb max_days keep
+    max_mb="$(lib_read_env_value FNMUSIC_LOG_MAX_MB 10)"
+    max_days="$(lib_read_env_value FNMUSIC_LOG_MAX_DAYS 30)"
+    case "${max_mb}" in ''|*[!0-9.]*) max_mb=10 ;; esac
+    case "${max_days}" in ''|*[!0-9.]*) max_days=30 ;; esac
+    keep=1
+
+    [ -d "${LOG_DIR}" ] || return 0
+
+    local max_bytes
+    max_bytes="$(awk -v m="${max_mb}" 'BEGIN{printf "%d", m*1048576}')"
+    local cutoff
+    cutoff="$(awk -v d="${max_days}" 'BEGIN{printf "%d", systime() - d*86400}')" 2>/dev/null || cutoff=0
+
+    local f name size mtime freed=0 acted=0
+    for f in "${LOG_DIR}"/*.log "${LOG_DIR}"/*.log.*; do
+        [ -f "${f}" ] || continue
+        name="$(basename "${f}")"
+        size="$(stat -c %s "${f}" 2>/dev/null || echo 0)"
+        mtime="$(stat -c %Y "${f}" 2>/dev/null || echo 0)"
+
+        # 超龄：备份直接删，活跃日志清空（可能仍有进程持有 fd，不能 unlink）
+        if [ "${max_days}" != "0" ] && [ "${cutoff}" -gt 0 ] && [ "${mtime}" -lt "${cutoff}" ]; then
+            case "${name}" in
+                *.log.[0-9]*)
+                    rm -f "${f}" 2>/dev/null && { freed=$((freed + size)); acted=$((acted+1)); }
+                    lib_log "清理超龄备份日志 ${name}（$((size / 1024)) KB）"
+                    continue ;;
+                *)
+                    : > "${f}" 2>/dev/null && { freed=$((freed + size)); acted=$((acted+1)); }
+                    lib_log "清空超龄日志 ${name}（$((size / 1024)) KB）"
+                    continue ;;
+            esac
+        fi
+
+        # 超大：活跃日志轮转成 .1（启动前无写入端持有 fd，rename 安全）
+        if [ "${max_mb}" != "0" ] && [ "${size}" -gt "${max_bytes}" ]; then
+            case "${name}" in
+                *.log)
+                    rm -f "${f}.${keep}" 2>/dev/null
+                    for ((n = keep; n > 1; n--)); do
+                        [ -f "${f}.$((n - 1))" ] && mv -f "${f}.$((n - 1))" "${f}.${n}" 2>/dev/null
+                    done
+                    mv -f "${f}" "${f}.1" 2>/dev/null || continue
+                    : > "${f}" 2>/dev/null
+                    chmod 644 "${f}" 2>/dev/null
+                    freed=$((freed + size)); acted=$((acted + 1))
+                    lib_log "轮转超大日志 ${name}（$((size / 1048576)) MB > ${max_mb} MB）"
+                    ;;
+                *)
+                    rm -f "${f}" 2>/dev/null && { freed=$((freed + size)); acted=$((acted+1)); }
+                    ;;
+            esac
+        fi
+    done
+    [ "${acted}" -gt 0 ] && lib_log "日志清理完成：${acted} 个文件，回收 $((freed / 1048576)) MB"
+    return 0
+}
+
 lib_probe_proxy() {
     # 代理自身健康端点
     local resp
