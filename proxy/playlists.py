@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Awaitable, Callable
 
@@ -350,9 +351,135 @@ def forget_stale(keep_guids: set[str]) -> int:
             doomed.append(g)
     for g in doomed:
         reg.pop(g, None)
+        drop_tracks_cache(g)
     if doomed:
         save_registry()
     return len(doomed)
+
+
+# ---------------------------------------------------------------------------
+# 歌单曲目缓存（v2.6）：stale-while-revalidate + 每日定时刷新
+#
+# 打开一个伪歌单原先要现场跑完整条上游链路（歌单 trackIds → songs_detail →
+# songs_url 逐首过滤 → 补封面），实测要好几秒。本节把解析结果按 guid 落盘：
+#   * 命中且在 TTL 内 → 直接返回，零上游往返；
+#   * 命中但已过 TTL → **先返回旧值**（打开永远是快的），后台单飞刷新；
+#   * 未命中（首次打开）→ 现场拉取并落盘；
+#   * 每天在配置的时间后台全量刷新一遍（歌单内容变了第二天自动跟上）。
+# ---------------------------------------------------------------------------
+
+_TRACKS_CACHE_TS = "ts"
+
+
+def tracks_cache_dir() -> str:
+    override = str(os.environ.get("FNMUSIC_PLAYLIST_TRACK_CACHE_DIR") or "").strip()
+    if override:
+        return override
+    base = os.environ.get("FNMUSIC_PLAYLIST_CACHE_DIR") or os.path.join(
+        os.environ.get("FNMUSIC_HOME") or os.path.expanduser("~"), "playlist_cache")
+    return os.path.join(base, "tracks")
+
+
+def _tracks_cache_path(guid: str | None) -> str:
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in str(guid or ""))
+    return os.path.join(tracks_cache_dir(), f"{safe}.json")
+
+
+def tracks_cache_ttl() -> int:
+    """缓存视为「新鲜」的时长（秒）；过新鲜期后走 stale-while-revalidate。"""
+    try:
+        return max(60, int(os.environ.get("FNMUSIC_PLAYLIST_TRACK_CACHE_TTL", "21600") or 21600))
+    except (TypeError, ValueError):
+        return 21600
+
+
+def load_cached_tracks(guid: str | None) -> "tuple[float, list] | None":
+    path = _tracks_cache_path(guid)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            body = json.load(fh)
+        ts = float(body.get(_TRACKS_CACHE_TS) or 0)
+        items = body.get("items")
+        if ts <= 0 or not isinstance(items, list):
+            return None
+        return ts, items
+    except FileNotFoundError:
+        return None
+    except Exception as exc:  # noqa: BLE001 - 缓存坏了就当没有，现场拉取
+        logger.warning("tracks cache load failed (%s): %s: %s",
+                       path, type(exc).__name__, exc)
+        return None
+
+
+def store_cached_tracks(guid: str | None, items: list) -> bool:
+    """落盘曲目缓存。空列表不写——上游一次抖动不该把好缓存覆盖成空的。"""
+    if not items:
+        return False
+    path = _tracks_cache_path(guid)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({_TRACKS_CACHE_TS: time.time(), "items": items},
+                      fh, ensure_ascii=False)
+        os.replace(tmp, path)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("tracks cache save failed (%s): %s: %s",
+                       path, type(exc).__name__, exc)
+        return False
+
+
+def drop_tracks_cache(guid: str | None) -> None:
+    try:
+        os.remove(_tracks_cache_path(guid))
+    except OSError:
+        pass
+
+
+def cached_track_guids() -> list[str]:
+    """当前注册表里、且曲目缓存已存在的伪歌单 guid（预热/状态展示用）。"""
+    out: list[str] = []
+    for g in registry_channel_guids():
+        if load_cached_tracks(g) is not None:
+            out.append(g)
+    return out
+
+
+def registry_channel_guids() -> list[str]:
+    """注册表里当前在列的非每日推荐伪歌单 guid。"""
+    reg = load_registry()
+    return [g for g in reg
+            if str(g).startswith(CHANNEL_NS) and not str(g).startswith(DAILY_NS)]
+
+
+def refresh_time_of_day() -> str:
+    """每日定时刷新时间（"HH:MM"）；空串 = 关闭定时刷新。"""
+    return str(os.environ.get("FNMUSIC_PLAYLIST_REFRESH_AT", "04:30") or "").strip()
+
+
+def seconds_until_daily_refresh(now: float | None = None) -> "float | None":
+    """距下一次定时刷新还有多少秒；未配置返回 None。
+
+    每天固定时刻触发：今天已过就排到明天同一时刻。解析失败按未配置处理
+    （返回 None），绝不能让一个手滑写错的时间把调度循环变成忙轮询。
+    """
+    spec = refresh_time_of_day()
+    if not spec:
+        return None
+    m = re.match(r"^(\d{1,2}):(\d{1,2})$", spec)
+    if not m:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    import datetime as _dt
+
+    base = _dt.datetime.fromtimestamp(time.time() if now is None else now)
+    target = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= base:
+        target += _dt.timedelta(days=1)
+    return max(1.0, (target - base).total_seconds())
 
 
 # ---------------------------------------------------------------------------

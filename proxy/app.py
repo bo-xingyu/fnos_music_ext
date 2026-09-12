@@ -1572,10 +1572,17 @@ async def lifespan(fastapi_app: FastAPI):
     if CONF["netease_enabled"]:
         netease_auth.start_watch(musicbox_client, stop_event)
 
+    # 每日定时刷新歌单曲目缓存（v2.6，管理页可配置时间，留空关闭）
+    refresh_task: asyncio.Task | None = None
+    if CONF["netease_enabled"]:
+        refresh_task = asyncio.create_task(_playlist_refresh_loop(fastapi_app, stop_event))
+
     try:
         yield
     finally:
         stop_event.set()
+        if refresh_task is not None:
+            refresh_task.cancel()
         netease_auth.stop_watch()
         if created_upstream and getattr(fastapi_app.state, "upstream_client", None):
             await fastapi_app.state.upstream_client.aclose()
@@ -1762,14 +1769,31 @@ async def ext_playlists_preview():
     items.sort(key=lambda it: stamped_order.index(it["channel"])
                if it["channel"] in stamped_order else len(stamped_order))
     items = playlists.apply_explicit_order(items)
+    cached = playlists.cached_track_guids()
     return {
         "ok": True,
         "data": {
             "items": [{**it, "is_daily": it["channel"] == "daily"} for it in items],
             "logged_in": logged_in,
             "manual_order": list(playlists.explicit_order_tokens()),
+            "cache": {
+                "cached": len(cached),
+                "total": len(items),
+                "ttl_s": playlists.tracks_cache_ttl(),
+                "refresh_at": playlists.refresh_time_of_day(),
+                "warming": _PLAYLIST_WARMING,
+            },
         },
     }
+
+
+@app.post("/_ext/playlists/warm")
+async def ext_playlists_warm():
+    """立即后台预热全部歌单曲目缓存（管理页按钮，不受冷却限制）。"""
+    if not _schedule_playlist_warm(app, force=True):
+        return {"ok": True, "data": {"started": False, "reason": "already_running"}}
+    return {"ok": True, "data": {"started": True,
+                                 "total": len(playlists.registry_channel_guids())}}
 
 
 @app.get("/music/api/v1/search/track")
@@ -3086,6 +3110,89 @@ async def _channel_playlist_records(client) -> tuple[list[dict], set[str], bool]
     return await playlists.collect_records(client, logged_in)
 
 
+# ---------------------------------------------------------------------------
+# 歌单缓存预热（v2.6）
+#
+# 两条触发路径，共用同一把「正在预热」闸门：
+#   1. 定时：每天 FNMUSIC_PLAYLIST_REFRESH_AT（默认 04:30）全量刷新；
+#   2. 打开歌单列表后自动预热一次（限流：冷却期内不重复），让「点开每个
+#      歌单都是秒开」在第一次打开列表后很快成立，而不要求用户先挨个点一遍。
+# 管理页「预热歌单缓存」按钮走 /_ext/playlists/warm，不受冷却限制。
+# ---------------------------------------------------------------------------
+
+_PLAYLIST_WARMING = False
+_LAST_AUTO_WARM_AT = 0.0
+
+
+def _playlist_warm_cooldown() -> float:
+    """自动预热的冷却时间：与缓存 TTL 对齐（TTL 内的缓存本来就新鲜，无需预热）。"""
+    return float(playlists.tracks_cache_ttl())
+
+
+async def _warm_playlist_caches(fastapi_app: FastAPI) -> dict:
+    """后台刷新全部在列伪歌单的曲目缓存。串行 + 每个之间歇 0.3s，对上游友好。"""
+    global _PLAYLIST_WARMING
+    if _PLAYLIST_WARMING:
+        return {"started": False, "reason": "already_running"}
+    _PLAYLIST_WARMING = True
+    guids = playlists.registry_channel_guids()
+    try:
+        client = get_musicbox_client(fastapi_app)
+        refreshed = 0
+        for guid in guids:
+            try:
+                items = await _fetch_channel_tracks(client, guid)
+                if items:
+                    playlists.store_cached_tracks(guid, items)
+                    refreshed += 1
+            except Exception as exc:  # noqa: BLE001 - 单个失败不挡后面
+                logger.warning("预热歌单 %s 失败: %s: %s", guid, type(exc).__name__, exc)
+            await asyncio.sleep(0.3)
+        logger.info("歌单缓存预热完成：%d/%d 个成功", refreshed, len(guids))
+        return {"started": True, "refreshed": refreshed, "total": len(guids)}
+    finally:
+        _PLAYLIST_WARMING = False
+
+
+def _schedule_playlist_warm(fastapi_app: FastAPI, *, force: bool = False) -> bool:
+    """安排一次后台预热。返回是否真的安排了（已在跑/冷却期内则 False）。"""
+    global _LAST_AUTO_WARM_AT
+    if _PLAYLIST_WARMING:
+        return False
+    if not force:
+        if (time.time() - _LAST_AUTO_WARM_AT) < _playlist_warm_cooldown():
+            return False
+        _LAST_AUTO_WARM_AT = time.time()
+
+    async def _job() -> None:
+        await _warm_playlist_caches(fastapi_app)
+
+    asyncio.create_task(_job())
+    return True
+
+
+async def _playlist_refresh_loop(fastapi_app: FastAPI, stop_event: asyncio.Event) -> None:
+    """每日定时全量刷新歌单缓存（管理页可配置时间，留空关闭）。"""
+    while not stop_event.is_set():
+        delay = playlists.seconds_until_daily_refresh()
+        if delay is None:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=3600.0)
+            except asyncio.TimeoutError:
+                pass
+            continue
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+        if stop_event.is_set():
+            return
+        logger.info("定时刷新歌单缓存开始（%s）", playlists.refresh_time_of_day())
+        _schedule_playlist_warm(fastapi_app, force=True)
+        # 等一小会儿让本轮跑起来；下轮循环会重新计算明天的触发时间
+        await asyncio.sleep(5.0)
+
+
 def _channel_public_fields(rec: dict) -> dict:
     """伪歌单 -> 飞牛歌单列表条目形状。
 
@@ -3108,12 +3215,63 @@ def _channel_public_fields(rec: dict) -> dict:
     }
 
 
-async def _channel_tracks(request: Request, guid: str, limit: int = 0) -> list[dict]:
-    """伪歌单 -> 飞牛 track 对象列表（已补封面、已按可播性过滤）。"""
-    client = get_musicbox_client(request.app)
-    items = await playlists.resolve_track_items(
+async def _fetch_channel_tracks(client: httpx.AsyncClient, guid: str) -> list[dict]:
+    """现场拉取伪歌单曲目（完整上游链路，慢——打开热路径别直接用它）。"""
+    return await playlists.resolve_track_items(
         client, guid, netease_items.map_netease_song, _enrich_netease_items
     )
+
+
+# 单飞刷新：同一 guid 的后台刷新任务全进程只允许一个在跑
+_TRACK_REFRESH_TASKS: "dict[str, asyncio.Task]" = {}
+
+
+def _schedule_track_refresh(fastapi_app: FastAPI, guid: str) -> None:
+    """后台刷新某个歌单的曲目缓存（stale-while-revalidate 的 revalidate 半边）。
+
+    刷新失败或拉到空列表时**保留旧缓存**：上游一次抖动不该把还能用的旧数据
+    覆盖成空的。异常只记日志，绝不影响任何在线请求。
+    """
+    existing = _TRACK_REFRESH_TASKS.get(guid)
+    if existing is not None and not existing.done():
+        return
+
+    async def _job() -> None:
+        try:
+            items = await _fetch_channel_tracks(get_musicbox_client(fastapi_app), guid)
+            if items:
+                playlists.store_cached_tracks(guid, items)
+                logger.info("歌单缓存已后台刷新：%s（%d 首）", guid, len(items))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("歌单缓存后台刷新失败 %s: %s: %s",
+                           guid, type(exc).__name__, exc)
+        finally:
+            _TRACK_REFRESH_TASKS.pop(guid, None)
+
+    _TRACK_REFRESH_TASKS[guid] = asyncio.create_task(_job())
+
+
+async def _channel_tracks_items(fastapi_app: FastAPI, guid: str) -> list[dict]:
+    """伪歌单曲目（内部条目形态），带 stale-while-revalidate 缓存。
+
+    - 命中且新鲜（TTL 内）→ 直接返回，零上游往返，**这就是打开变快的全部**；
+    - 命中但过新鲜期 → 先返回旧值（打开永远快），后台单飞刷新；
+    - 未命中（首次打开）→ 现场拉取并落盘，之后的打开都走缓存。
+    """
+    hit = playlists.load_cached_tracks(guid)
+    if hit is not None:
+        ts, items = hit
+        if (time.time() - ts) > playlists.tracks_cache_ttl():
+            _schedule_track_refresh(fastapi_app, guid)
+        return items
+    items = await _fetch_channel_tracks(get_musicbox_client(fastapi_app), guid)
+    playlists.store_cached_tracks(guid, items)
+    return items
+
+
+async def _channel_tracks(request: Request, guid: str, limit: int = 0) -> list[dict]:
+    """伪歌单 -> 飞牛 track 对象列表（已补封面、已按可播性过滤、走缓存）。"""
+    items = await _channel_tracks_items(request.app, guid)
     if limit and limit > 0:
         items = items[:limit]
     return [build_online_track(it) for it in items]
@@ -3229,6 +3387,12 @@ async def playlist_list(request: Request):
     # 没排到的新歌单按大类相对顺序跟在后面。实时读 .env，保存后立即生效。
     head = playlists.apply_explicit_order([it for _ch, it in head_items])
     head = playlists.stamp_display_order(head)
+
+    # 列表注入完成后安排一次后台预热（冷却期 = 缓存 TTL）：用户打开飞牛音乐
+    # 看一眼歌单列表，几秒后所有歌单的曲目缓存就都在本地了——之后点开
+    # 任何一个都是秒开，而不要求先挨个点一遍。
+    if head:
+        _schedule_playlist_warm(request.app)
 
     data["list"] = head + official
     data["total"] = len(head) + len(official)

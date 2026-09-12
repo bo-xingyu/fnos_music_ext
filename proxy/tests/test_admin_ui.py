@@ -1252,3 +1252,39 @@ def test_playlist_order_saved_without_restart(env):
     assert read_env(env)["FNMUSIC_NETEASE_PLAYLIST_ORDER"] == "daily,online:playlist:ne:11"
     assert read_env(env)["FNMUSIC_PUSHPLUS_TOKEN"] == FAKE_TOKEN, "别的字段不能被冲掉"
     assert read_env(env)["FNMUSIC_NETEASE_QUALITY"] == "exhigh"
+
+
+# ---------------------------------------------------------------------------
+# v2.6：歌单缓存配置（定时时间 / TTL 小时换算）
+# ---------------------------------------------------------------------------
+
+def test_time_of_day_validator():
+    v = admin_ui._as_time_of_day
+    assert v("") == ""
+    assert v("04:30") == "04:30"
+    assert v("4:5") == "04:05", "补零规范化"
+    assert v("23:59") == "23:59"
+    for bad in ("25:00", "12:99", "4pm", "0430", "aa:bb", "12:00:00"):
+        with pytest.raises(ValueError):
+            v(bad)
+
+
+def test_playlist_cache_config_saved_with_unit_conversion(env):
+    """TTL 以小时展示、按秒落盘；定时时间原样保存。"""
+    with TestClient(admin_ui.app) as c:
+        r = post_cfg(c, {"playlist_cache_ttl_h": "12", "playlist_refresh_at": "05:00"})
+        assert r.status_code == 200, r.json()
+    assert read_env(env)["FNMUSIC_PLAYLIST_TRACK_CACHE_TTL"] == "43200"
+    assert read_env(env)["FNMUSIC_PLAYLIST_REFRESH_AT"] == "05:00"
+    # 回读时换算回小时
+    values = admin_ui.read_config_masked()["values"]
+    assert values["playlist_cache_ttl_h"] == "12"
+    assert values["playlist_refresh_at"] == "05:00"
+
+
+def test_invalid_playlist_cache_config_rejected(env):
+    with TestClient(admin_ui.app) as c:
+        r = post_cfg(c, {"playlist_refresh_at": "bogus"})
+        assert r.status_code == 422
+        r = post_cfg(c, {"playlist_cache_ttl_h": "0"})
+        assert r.status_code == 422

@@ -41,6 +41,9 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_NETEASE_CHANNEL_ORDER", "daily,mine,nrec,toplist,category,newalbum,fm"),
     # 手动歌单顺序（v2.5）：管理页逐个拖排的 token 列表；空=按大类顺序
     ("FNMUSIC_NETEASE_PLAYLIST_ORDER", ""),
+    # 歌单曲目缓存（v2.6）：stale-while-revalidate + 每日定时刷新
+    ("FNMUSIC_PLAYLIST_TRACK_CACHE_TTL", "21600"),
+    ("FNMUSIC_PLAYLIST_REFRESH_AT", "04:30"),
     ("FNMUSIC_PLAYLIST_TRACK_LIMIT", "300"),
     ("FNMUSIC_PLAYLIST_CACHE_DIR", ""),
     # --- 收藏归档与红心同步（v2.2 新增）---

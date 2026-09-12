@@ -242,6 +242,8 @@ curl -s http://127.0.0.1:8770/api/v1/auth/detail
 | `FNMUSIC_NETEASE_CHANNELS` | `mine,toplist,category` | 注入哪些口径（mine=我的歌单 nrec=推荐歌单 toplist=排行榜 category=分类歌单 newalbum=新碟上架 fm=私人FM） |
 | `FNMUSIC_NETEASE_CHANNEL_ORDER` | `daily,mine,nrec,toplist,category,newalbum,fm` | 各大类在飞牛歌单列表里的展示顺序（v2.4，管理页可改；没列出的排最后） |
 | `FNMUSIC_NETEASE_PLAYLIST_ORDER` | *(空)* | 手动歌单顺序（v2.5）：管理页「歌单顺序」卡片逐个排好的 token 列表（`daily` 或歌单 guid），空=按大类顺序。代理实时读取，保存即生效 |
+| `FNMUSIC_PLAYLIST_TRACK_CACHE_TTL` | `21600` | 歌单曲目缓存有效期（秒，默认 6 小时）：期内点开直接读本地秒开；超期先返回缓存、后台自动刷新（v2.6） |
+| `FNMUSIC_PLAYLIST_REFRESH_AT` | `04:30` | 每日定时后台刷新全部歌单曲目缓存的时间（HH:MM，留空关闭）。打开歌单列表后也会自动预热一次 |
 | `FNMUSIC_NETEASE_CHANNEL_LIMIT` | `8` | 每个口径最多注入几个歌单 |
 | `FNMUSIC_NETEASE_CATEGORY` | `华语` | 分类歌单的分类名 |
 | `FNMUSIC_PLAYLIST_TRACK_LIMIT` | `300` | 点开歌单时最多解析多少首 |

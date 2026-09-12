@@ -292,6 +292,8 @@ FNMUSIC_NETEASE_CHANNEL_LIMIT='20'
 FNMUSIC_NETEASE_CATEGORY='摇滚'
 FNMUSIC_NETEASE_CHANNEL_ORDER='toplist,mine,daily,category,nrec,newalbum,fm'
 FNMUSIC_NETEASE_PLAYLIST_ORDER='daily,online:playlist:ne:11'
+FNMUSIC_PLAYLIST_TRACK_CACHE_TTL='43200'
+FNMUSIC_PLAYLIST_REFRESH_AT='05:30'
 FNMUSIC_PLAYLIST_TRACK_LIMIT='500'
 FNMUSIC_DOWNLOAD_DIR='/vol1/1000/music/网易云归档'
 FNMUSIC_DOWNLOAD_ON_FAVORITE='false'
@@ -330,6 +332,8 @@ def test_setup_upgrade_preserves_all_user_settings(tmp_path):
     assert env["FNMUSIC_NETEASE_CHANNEL_ORDER"] == "toplist,mine,daily,category,nrec,newalbum,fm"
     assert env["FNMUSIC_NETEASE_PLAYLIST_ORDER"] == "daily,online:playlist:ne:11", \
         "管理页手动排的歌单顺序绝不能被升级冲掉"
+    assert env["FNMUSIC_PLAYLIST_TRACK_CACHE_TTL"] == "43200"
+    assert env["FNMUSIC_PLAYLIST_REFRESH_AT"] == "05:30"
     assert env["FNMUSIC_PLAYLIST_TRACK_LIMIT"] == "500"
     assert env["FNMUSIC_DOWNLOAD_DIR"] == "/vol1/1000/music/网易云归档"
     assert env["FNMUSIC_DOWNLOAD_ON_FAVORITE"] == "false"

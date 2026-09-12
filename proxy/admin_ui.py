@@ -199,6 +199,20 @@ def _as_playlist_order(v: Any) -> str:
     return ",".join(tokens)
 
 
+def _as_time_of_day(v: Any) -> str:
+    """每日定时刷新时间：HH:MM（24h）或留空关闭。"""
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    m = re.fullmatch(r"(\d{1,2}):(\d{1,2})", s)
+    if not m:
+        raise ValueError(f"时间格式应为 HH:MM（如 04:30），收到 {s!r}")
+    h, mi = int(m.group(1)), int(m.group(2))
+    if h > 23 or mi > 59:
+        raise ValueError(f"时间超出范围（00:00–23:59），收到 {s!r}")
+    return f"{h:02d}:{mi:02d}"
+
+
 def _as_path(v: Any) -> str:
     """归档目录：必须是已存在的可写绝对路径，且不能是系统目录。
 
@@ -260,6 +274,9 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     "netease_channel_order": ("FNMUSIC_NETEASE_CHANNEL_ORDER", _as_channel_order, False),
     "netease_playlist_order": ("FNMUSIC_NETEASE_PLAYLIST_ORDER", _as_playlist_order, False),
     "playlist_track_limit": ("FNMUSIC_PLAYLIST_TRACK_LIMIT", _int_range(1, 1000), False),
+    # --- 歌单曲目缓存（v2.6）：打开秒开 ---
+    "playlist_cache_ttl_h": ("FNMUSIC_PLAYLIST_TRACK_CACHE_TTL", _int_range(1, 168), False),
+    "playlist_refresh_at": ("FNMUSIC_PLAYLIST_REFRESH_AT", _as_time_of_day, False),
     # --- 收藏归档与红心同步 ---
     "download_dir": ("FNMUSIC_DOWNLOAD_DIR", _as_path, True),
     "download_on_favorite": ("FNMUSIC_DOWNLOAD_ON_FAVORITE", _as_bool, False),
@@ -276,6 +293,7 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
 UNIT_SECONDS = {
     "search_cache_ttl_days": 86400,
     "login_check_interval_h": 3600,
+    "playlist_cache_ttl_h": 3600,
 }
 
 DEFAULTS = {
@@ -301,6 +319,8 @@ DEFAULTS = {
     "netease_channel_order": "daily,mine,nrec,toplist,category,newalbum,fm",
     "netease_playlist_order": "",
     "playlist_track_limit": "300",
+    "playlist_cache_ttl_h": "6",
+    "playlist_refresh_at": "04:30",
     "download_dir": "",
     "download_on_favorite": "true",
     "fav_sync_like": "true",
@@ -1214,6 +1234,36 @@ async def api_playlists(request: Request):
     return {"ok": True, **data}
 
 
+@app.post("/api/playlists/warm")
+async def api_playlists_warm(request: Request):
+    """「预热歌单缓存」按钮：让代理立即后台刷新全部歌单曲目缓存。"""
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=PROXY_SOCK),
+            base_url="http://unix",
+            timeout=10.0,
+        ) as client:
+            r = await client.post("/_ext/playlists/warm")
+    except Exception as exc:  # noqa: BLE001
+        return _err(502, f"调用代理失败（未运行？）：{type(exc).__name__}: {exc}")
+    if r.status_code != 200:
+        return _err(502, f"代理返回 HTTP {r.status_code}")
+    try:
+        body = r.json()
+    except Exception:  # noqa: BLE001
+        return _err(502, "代理返回的不是 JSON")
+    if not body.get("ok"):
+        return _err(502, f"预热触发失败：{str(body.get('error') or '')[:160]}")
+    data = body.get("data") or {}
+    if data.get("started"):
+        return {"ok": True, "message": f"预热已开始（{data.get('total') or '?'} 个歌单，后台进行中）"}
+    return {"ok": True, "message": "预热已在进行中，请稍候"}
+
+
 async def restart_services() -> tuple[bool, str]:
     """调用生命周期脚本重启代理与音源服务（不含本页面的 ui 进程）。"""
     script = RESTART_SCRIPT
@@ -1544,6 +1594,16 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
           <span class="ht">1–1000，点开歌单时最多解析多少首（越多越慢）</span>
         </label>
 
+        <label><span class="lb">歌单缓存有效期（小时）</span>
+          <input name="playlist_cache_ttl_h" inputmode="numeric" placeholder="6">
+          <span class="ht">缓存期内点开歌单直接读本地（秒开）；超期后先返回缓存、后台自动刷新，你看到的永远是上一次的结果</span>
+        </label>
+
+        <label><span class="lb">每日定时刷新歌单缓存</span>
+          <input name="playlist_refresh_at" placeholder="04:30（留空关闭）">
+          <span class="ht">每天在这个时间后台刷新全部歌单曲目，第二天打开就是最新内容</span>
+        </label>
+
         <label><span class="lb">收藏归档目录</span>
           <input name="download_dir" placeholder="/vol1/1000-xxx/music/网易云收藏（留空=不下载）">
           <span class="ht">必须是已存在的可写<b>绝对路径</b>；系统目录会被拒绝。按 <code>歌手/歌手 - 歌名.flac</code> 落盘并配同名 .lrc</span>
@@ -1701,8 +1761,10 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
       <button class="btn" id="plLoadBtn" type="button">读取当前歌单</button>
       <button class="btn pri" id="plSaveBtn" type="button">保存顺序</button>
       <button class="btn" id="plResetBtn" type="button">恢复默认（按大类）</button>
+      <button class="btn" id="plWarmBtn" type="button">预热歌单缓存</button>
     </div>
     <div class="msg" id="plMsg"></div>
+    <div class="sub" id="plCache" style="margin:0 0 10px"></div>
     <div id="plList"></div>
   </div>
 
@@ -2135,6 +2197,13 @@ function loadPl(){
       ? ("共 "+PL_ITEMS.length+" 个歌单"+(j.logged_in?"":"（当前未登录，需登录的口径未列出）")
          +(j.manual_order&&j.manual_order.length?"；已启用手动顺序":"；当前按大类顺序"))
       : "暂无歌单（未登录或未启用任何口径）";
+    var c=j.cache||{};
+    if(c.total!=null){
+      $("#plCache").textContent="缓存："+c.cached+"/"+c.total+" 个歌单已有本地缓存"+
+        (c.warming?"（正在预热…）":"")+"；有效期 "+Math.round((c.ttl_s||0)/3600)+" 小时"+
+        (c.refresh_at?("；每日 "+c.refresh_at+" 定时刷新"):"；定时刷新已关闭")+
+        "。已缓存的歌单点开即秒开。";
+    }
     renderPl();
   });
 }
@@ -2155,6 +2224,15 @@ function savePlOrder(val){
 $("#plLoadBtn").onclick=loadPl;
 $("#plSaveBtn").onclick=function(){ savePlOrder(PL_ITEMS.map(plToken).join(",")) };
 $("#plResetBtn").onclick=function(){ savePlOrder(null) };
+$("#plWarmBtn").onclick=function(){
+  var b=this; b.disabled=true; b.textContent="预热中…";
+  api("api/playlists/warm",{method:"POST"}).then(function(j){
+    b.disabled=false; b.textContent="预热歌单缓存";
+    var m=$("#plMsg"); m.className=j.ok?"msg ok":"msg err";
+    m.textContent=j.ok?(j.message||"预热已开始"):(j.error||"预热失败");
+    setTimeout(loadPl,5000);  // 预热是后台任务，稍后回读缓存状态
+  });
+};
 loadPl();
 Array.prototype.forEach.call($("#logTabs").querySelectorAll("button"),function(b){
   b.onclick=function(){

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import os
 from pathlib import Path
 
@@ -591,3 +592,57 @@ def test_playlists_preview_endpoint(registry_dir, monkeypatch):
     assert data["items"][0]["is_daily"] is True
     assert data["manual_order"] == ["daily", "online:playlist:ne:19723756"]
     assert data["logged_in"] is True
+
+
+# ===========================================================================
+# v2.6：歌单曲目缓存（stale-while-revalidate + 定时刷新）
+# ===========================================================================
+
+
+def test_tracks_cache_roundtrip_and_ttl(tmp_path, monkeypatch):
+    monkeypatch.setenv("FNMUSIC_PLAYLIST_TRACK_CACHE_DIR", str(tmp_path))
+    assert pl.load_cached_tracks("online:playlist:ne:11") is None, "无缓存返回 None"
+
+    items = [{"id": "online:netease:1", "title": "晴天", "artist": "周杰伦"}]
+    assert pl.store_cached_tracks("online:playlist:ne:11", items) is True
+    ts, got = pl.load_cached_tracks("online:playlist:ne:11")
+    assert got == items
+    assert (time.time() - ts) < 10
+
+    # 空列表不落盘：上游抖动不该把好缓存覆盖成空的
+    assert pl.store_cached_tracks("online:playlist:ne:11", []) is False
+    monkeypatch.setenv("FNMUSIC_PLAYLIST_TRACK_CACHE_TTL", "60")
+    assert pl.tracks_cache_ttl() == 60
+    # guid 里的冒号等字符被安全转义，不会跑出缓存目录
+    p = pl._tracks_cache_path("online:playlist:ne:11/../../etc")
+    assert os.path.dirname(p) == pl.tracks_cache_dir()
+
+
+def test_tracks_cache_bad_file_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("FNMUSIC_PLAYLIST_TRACK_CACHE_DIR", str(tmp_path))
+    (tmp_path / "x.json").write_text("{not json", encoding="utf-8")
+    assert pl.load_cached_tracks("x") is None
+
+
+def test_daily_refresh_time_parsing(monkeypatch):
+    monkeypatch.setenv("FNMUSIC_PLAYLIST_REFRESH_AT", "04:30")
+    assert pl.refresh_time_of_day() == "04:30"
+    d = pl.seconds_until_daily_refresh()
+    assert d is not None and 0 < d <= 86400
+
+    monkeypatch.setenv("FNMUSIC_PLAYLIST_REFRESH_AT", "")
+    assert pl.seconds_until_daily_refresh() is None, "留空 = 关闭定时刷新"
+    for bad in ("bogus", "25:00", "12:99", "4pm"):
+        monkeypatch.setenv("FNMUSIC_PLAYLIST_REFRESH_AT", bad)
+        assert pl.seconds_until_daily_refresh() is None, bad
+
+
+def test_forget_stale_drops_tracks_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("FNMUSIC_PLAYLIST_TRACK_CACHE_DIR", str(tmp_path))
+    pl.remember(pl.build_record("online:playlist:ne:1", "a", "", 1, "toplist"))
+    pl.store_cached_tracks("online:playlist:ne:1", [{"id": "online:netease:9"}])
+    pl.save_registry()
+    n = pl.forget_stale(set())
+    assert n == 1
+    assert pl.load_cached_tracks("online:playlist:ne:1") is None, \
+        "注册表条目被清掉时，曲目缓存文件也该一起删"
