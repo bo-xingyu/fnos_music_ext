@@ -49,7 +49,9 @@ mkdir -p "$(dirname "${log_file}")" 2>/dev/null
 # 升级前被 stop.sh 停掉，这里判断是否需要恢复运行：
 # 若存在 we_were_running 标记则拉起。upgrade_init 无条件停机，因此默认拉起，
 # 这也是用户在应用中心点"更新"后期望的行为。
-if bash "${BIN}/setup.sh" >> "${log_file}" 2>&1; then
+# FNMUSICEXT_PRESERVE_ENV=true：升级绝不重置用户在管理页保存过的任何设置
+# （歌单口径、收藏归档目录、音质策略等），只补齐新版本新增的键。
+if FNMUSICEXT_PRESERVE_ENV=true bash "${BIN}/setup.sh" >> "${log_file}" 2>&1; then
     echo "运行环境已按新版本重建（.env / 登录凭证 / 缓存均已保留）" >> "${log_file}" 2>/dev/null
 else
     fail "升级后重建运行环境失败。详见 ${log_file}。飞牛音乐当前为官方直连状态，可正常使用。"

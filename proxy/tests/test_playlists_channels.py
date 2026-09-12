@@ -291,3 +291,149 @@ async def test_resolve_track_items_tolerates_upstream_failure(registry_dir):
     c2 = _FakeClient({})           # 端点直接 404
     assert await pl.resolve_track_items(c2, "online:playlist:ne:9",
                                        netease_items.map_netease_song, None) == []
+
+
+# ===========================================================================
+# v2.4：歌单大类顺序自定义 + 稳定时间戳
+# ===========================================================================
+
+
+def test_channel_order_custom_and_fallback(monkeypatch):
+    # 自定义顺序：用户给的顺序原样生效，漏掉的按默认序追加
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNEL_ORDER", "toplist, mine, daily")
+    assert pl.channel_order()[:3] == ("toplist", "mine", "daily")
+    assert pl.channel_order()[3:] == ("nrec", "category", "newalbum", "fm")
+
+    # 未知 key 忽略，空值/坏值回落默认
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNEL_ORDER", "")
+    assert pl.channel_order() == ("daily", "mine", "nrec", "toplist", "category", "newalbum", "fm")
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNEL_ORDER", "bogus,,???")
+    assert pl.channel_order() == ("daily", "mine", "nrec", "toplist", "category", "newalbum", "fm")
+
+    assert pl.rank_of("toplist") == pl.channel_order().index("toplist")
+    assert pl.rank_of("nonexistent") == len(pl.CHANNELS)
+
+
+def test_channels_enabled_follows_custom_order(monkeypatch):
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS", "mine,toplist,category")
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNEL_ORDER", "category,toplist,mine")
+    assert pl.channels_enabled() == ("category", "toplist", "mine"), (
+        "勾选的口径要按大类顺序配置输出，否则飞牛列表里的顺序不受用户控制"
+    )
+
+
+def test_stamp_display_order_gives_distinct_descending_timestamps(registry_dir):
+    """每条注入条目拿到互不相同、按位置递减的时间戳。
+
+    原先所有条目共用 int(time.time())，客户端的非稳定排序每次刷新都会
+    换一个顺序——这正是「歌单顺序不固定」的根因。
+    """
+    items = [
+        {"guid": "online:playlist:daily:20260912", "name": "每日推荐"},
+        {"guid": "online:playlist:ne:1", "name": "a", "channel": "mine"},
+        {"guid": "online:playlist:ne:2", "name": "b", "channel": "mine"},
+        {"guid": "online:playlist:ne:3", "name": "c", "channel": "toplist"},
+    ]
+    pl.remember(pl.build_record("online:playlist:ne:1", "a", "", 1, "mine"))
+    out = pl.stamp_display_order(items)
+    ts = [it["createdAt"] for it in out]
+    assert ts == sorted(ts, reverse=True), "时间戳必须严格递减"
+    assert len(set(ts)) == len(ts), "时间戳必须互不相同，否则非稳定排序仍会乱"
+    assert all(it["createdAt"] == it["updatedAt"] for it in out)
+    # 注册表 ts 同步：详情页回显要与列表页一致
+    assert pl.lookup("online:playlist:ne:1")["ts"] == ts[1]
+    # 降序排序（客户端常见行为）应还原注入顺序
+    assert [it["name"] for it in sorted(out, key=lambda x: -x["updatedAt"])] == \
+        ["每日推荐", "a", "b", "c"]
+
+
+def test_stamp_display_order_syncs_registry_for_detail_pages(registry_dir):
+    pl.remember(pl.build_record("online:playlist:ne:8", "y", "", 1, "category"))
+    pl.remember(pl.build_record("online:playlist:ne:9", "x", "", 1, "category"))
+    pl.save_registry()
+    pl.stamp_display_order([
+        {"guid": "online:playlist:ne:8", "name": "y"},
+        {"guid": "online:playlist:ne:9", "name": "x"},
+    ])
+    reg = pl.lookup("online:playlist:ne:9")
+    assert reg["ts"] == pl.lookup("online:playlist:ne:8")["ts"] - 1
+
+
+# ===========================================================================
+# v2.4：playlist_list 注入顺序 = 大类顺序配置，且时间戳严格有序
+# ===========================================================================
+
+import httpx
+from fastapi.testclient import TestClient
+
+from proxy import netease_auth
+from proxy.app import app as proxy_app
+
+
+def _mb_handler_logged_in():
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/auth/status":
+            return httpx.Response(200, json={"ok": True,
+                                             "data": {"logged_in": True, "nickname": "u"}})
+        if path == "/healthz":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/api/v1/playlists/user":
+            return httpx.Response(200, json={"ok": True, "data": [
+                {"playlist_id": 11, "name": "我的自建单", "cover_url": "",
+                 "track_count": 5, "subscribed": False}]})
+        if path == "/api/v1/playlists/toplists":
+            return httpx.Response(200, json={"ok": True, "data": [
+                {"playlist_id": 19723756, "name": "飙升榜", "cover_url": "",
+                 "track_count": 100}]})
+        if path == "/api/v1/recommend/daily":
+            return httpx.Response(200, json={"ok": True, "data": [
+                {"song_id": "d1", "song_name": "晴天", "artist": "周", "album_name": "叶",
+                 "duration": 269, "quality": "SQ"}]})
+        if path == "/api/v1/songs/detail":
+            return httpx.Response(200, json={"ok": True, "data": [
+                {"song_id": "d1", "album_pic_url": "http://p/1.jpg", "has_sq": True}]})
+        return httpx.Response(404, json={"ok": False})
+    return handler
+
+
+def _upstream_handler(request: httpx.Request) -> httpx.Response:
+    path = request.url.path
+    if path.endswith("/user/me"):
+        return httpx.Response(200, json={"code": 0, "data": {"guid": "user-ord"}})
+    if path.endswith("/playlist/list"):
+        return httpx.Response(200, json={"code": 0, "data": {
+            "list": [{"guid": "localpl", "name": "本地单", "coverId": "c",
+                      "createdAt": 1, "updatedAt": 1}], "total": 1}})
+    if "search/track" in path:
+        return httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}})
+    return httpx.Response(200, json={"code": 0, "data": None})
+
+
+def test_playlist_list_follows_custom_channel_order(registry_dir, monkeypatch):
+    """大类顺序配置必须左右注入顺序（含 daily 的位置），时间戳严格递减。"""
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS", "mine,toplist")
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNEL_ORDER", "toplist,daily,mine")
+    monkeypatch.setenv("FNMUSIC_DAILY_ENABLED", "true")
+    proxy_app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_upstream_handler), base_url="http://unix")
+    proxy_app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_mb_handler_logged_in()),
+        base_url="http://127.0.0.1:8770")
+    netease_auth.invalidate_state()
+
+    with TestClient(proxy_app) as client:
+        body = client.get("/music/api/v1/playlist/list").json()
+
+    lst = body["data"]["list"]
+    names = [it["name"] for it in lst]
+    # toplist → daily → mine → 官方本地歌单
+    assert names[0].startswith("榜｜"), names
+    from proxy import recommend as _rec
+    assert _rec.is_daily_playlist_guid(lst[1]["guid"]), names
+    assert names[2].startswith("网易云·"), names
+    assert lst[-1]["guid"] == "localpl"
+    # 头部时间戳严格递减：客户端怎么排序都得到同一顺序
+    head_ts = [it["updatedAt"] for it in lst[:-1]]
+    assert head_ts == sorted(head_ts, reverse=True), head_ts
+    assert len(set(head_ts)) == len(head_ts), "时间戳必须互不相同"

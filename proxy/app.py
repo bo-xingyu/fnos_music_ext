@@ -78,6 +78,13 @@ def _float(name: str, default: float) -> float:
         return default
 
 
+# 播放链路（本地曲目 stream / HLS / 转码会话）转发到官方后端的读超时（秒）。
+# 共享上游客户端是 30s；但官方后端处理 /track/transcode 要等 ffmpeg 产出
+# 首个分片才应答，大文件 + 慢磁盘时 30s 不够，超时会把「能播」变成 504，
+# 用户看到的就是「开转码后本地音乐全部播放失败」。
+PLAYBACK_FORWARD_TIMEOUT_S = _float("FNMUSIC_PLAYBACK_FORWARD_TIMEOUT_S", 300.0)
+
+
 CONF = {
     "musicbox_url": os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770"),
     "netease_enabled": _flag("FNMUSIC_NETEASE_ENABLED", "true"),
@@ -316,10 +323,17 @@ def filter_headers(headers: Any, exclude_keys: set | None = None) -> dict:
 
 
 def copy_incoming_headers(request: Request) -> dict:
-    """透传鉴权 Cookie / Token。Starlette 头名为小写，需显式回填以免丢失 music-token。"""
-    headers = filter_headers(request.headers, exclude_keys={"host", "content-length"})
+    """透传鉴权 Cookie / Token。Starlette 头名为小写，需显式回填以免丢失 music-token。
+
+    ``host`` 必须一并透传：官方后端在转码/HLS 链路里会用请求 Host 拼装
+    绝对地址（m3u8 里的分片 URL 等）。此前把它剥掉后 httpx 会发
+    ``Host: unix``，后端拼出来的地址客户端根本连不上——表现为
+    「开转码后本地音乐播不了」（不开转码的 /track/stream 走相对路径，
+    不受影响，所以平时看不出来）。
+    """
+    headers = filter_headers(request.headers, exclude_keys={"content-length"})
     headers["accept-encoding"] = "identity"
-    for key in ("cookie", "authorization", "x-trim-music-temp-token"):
+    for key in ("cookie", "authorization", "x-trim-music-temp-token", "host"):
         val = request.headers.get(key)
         if val:
             headers[key] = val
@@ -970,7 +984,19 @@ def get_push_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     return client
 
 
-async def forward_to_upstream(request: Request, client: httpx.AsyncClient) -> Response:
+async def forward_to_upstream(
+    request: Request,
+    client: httpx.AsyncClient,
+    timeout: float | None = None,
+) -> Response:
+    """把请求原样转给官方后端。
+
+    ``timeout`` 允许调用方为慢端点放宽读超时（默认沿用客户端的 30s）。
+    转码链路必须放宽：官方后端收到 /track/transcode 后要等 ffmpeg 产出
+    首个 HLS 分片才应答，NAS 磁盘慢或大文件（DSD/APE/FLAC）时 30s 根本
+    不够——超时异常会把「能播」变成 500，用户看到的就是开了转码本地歌
+    全部播放失败。
+    """
     url_path = request.url.path
     if request.url.query:
         url_path = f"{url_path}?{request.url.query}"
@@ -978,13 +1004,29 @@ async def forward_to_upstream(request: Request, client: httpx.AsyncClient) -> Re
     headers = copy_incoming_headers(request)
     body = await request.body()
 
+    extensions = None
+    if timeout is not None:
+        extensions = {"timeout": httpx.Timeout(connect=10.0, read=timeout, write=30.0,
+                                               pool=30.0).as_dict()}
     req = client.build_request(
         method=request.method,
         url=url_path,
         headers=headers,
         content=body if body else None,
+        extensions=extensions,
     )
-    resp = await client.send(req, stream=True)
+    try:
+        resp = await client.send(req, stream=True)
+    except httpx.TimeoutException as exc:
+        logger.warning("upstream forward timeout %s %s: %s", request.method,
+                       request.url.path, type(exc).__name__)
+        return JSONResponse(status_code=504, content={"code": 504, "msg": "upstream timeout",
+                                                      "data": None})
+    except httpx.HTTPError as exc:
+        logger.warning("upstream forward failed %s %s: %s: %s", request.method,
+                       request.url.path, type(exc).__name__, exc)
+        return JSONResponse(status_code=502, content={"code": 502, "msg": "upstream unavailable",
+                                                      "data": None})
     resp_headers = filter_headers(resp.headers, exclude_keys={"content-length", "content-encoding"})
 
     async def body_stream() -> AsyncGenerator[bytes, None]:
@@ -1959,7 +2001,9 @@ def stream_tee_response(
 async def stream_track(request: Request):
     guid = extract_guid(request)
     if not is_online_guid(guid):
-        return await forward_to_upstream(request, get_upstream_client(request.app))
+        # 本地曲目直通官方后端；播放链路放宽读超时（见 PLAYBACK_FORWARD_TIMEOUT_S）
+        return await forward_to_upstream(
+            request, get_upstream_client(request.app), timeout=PLAYBACK_FORWARD_TIMEOUT_S)
 
     range_header = request.headers.get("range")
     cached = find_cache_file(guid)
@@ -2033,7 +2077,9 @@ async def stream_track(request: Request):
 @app.get("/music/api/v1/track/hls/{guid}/{filename}")
 async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
     if not is_online_guid(guid):
-        return await forward_to_upstream(request, get_upstream_client(request.app))
+        # 本地转码的 m3u8 / 分片由官方后端（ffmpeg）产出，首包可能较慢
+        return await forward_to_upstream(
+            request, get_upstream_client(request.app), timeout=PLAYBACK_FORWARD_TIMEOUT_S)
 
     info = await _online_info(request, guid)
     duration_s = 0
@@ -2064,7 +2110,8 @@ async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
 async def track_transcode_session(request: Request):
     guid = await extract_guid_from_body(request)
     if not is_online_guid(guid):
-        return await forward_to_upstream(request, get_upstream_client(request.app))
+        return await forward_to_upstream(
+            request, get_upstream_client(request.app), timeout=PLAYBACK_FORWARD_TIMEOUT_S)
     return JSONResponse(content={"code": 0, "msg": "ok", "data": {"guid": guid}})
 
 
@@ -2072,7 +2119,9 @@ async def track_transcode_session(request: Request):
 async def track_transcode(request: Request):
     guid = await extract_guid_from_body(request)
     if not is_online_guid(guid):
-        return await forward_to_upstream(request, get_upstream_client(request.app))
+        # 本地转码启动要等 ffmpeg 就绪，30s 共享超时会把它打成 504
+        return await forward_to_upstream(
+            request, get_upstream_client(request.app), timeout=PLAYBACK_FORWARD_TIMEOUT_S)
     return JSONResponse(
         content={
             "code": 0,
@@ -2875,7 +2924,10 @@ async def _load_daily_bundle(request: Request, user_guid: str) -> dict:
 async def _netease_logged_in() -> bool:
     """当前网易云账号是否已登录（走带 TTL 的登录态缓存，不额外打上游）。"""
     try:
-        return bool((await netease_auth.fetch_state(musicbox_client())).logged_in)
+        # ⚠️ 必须用 get_musicbox_client(app)：这里曾误写成不存在的 musicbox_client()，
+        # NameError 被本函数自己的 except 吞掉后恒返回 False —— 代理侧于是永远
+        # 认为「未登录」，我的歌单 / 推荐歌单 / 私人FM 这些需登录口径一颗都不会注入。
+        return bool((await netease_auth.fetch_state(get_musicbox_client(app))).logged_in)
     except Exception as exc:  # noqa: BLE001
         logger.warning("login state probe failed: %s: %s", type(exc).__name__, exc)
         return False
@@ -3008,14 +3060,25 @@ async def playlist_list(request: Request):
         logger.warning("channel playlist inject failed: %s: %s", type(e).__name__, e)
         channel_recs = []
 
-    head: list[dict] = []
+    # 组装注入头部：每日推荐 + 各口径伪歌单，按管理页配置的「大类顺序」排列。
+    # daily 也参加排序（默认在最前）；随后统一盖上互不相同的时间戳，
+    # 保证客户端无论怎么排都得到同一个顺序（见 stamp_display_order 注释）。
+    stamped_order = playlists.channel_order()
+    head_items: list[tuple[str, dict]] = []
     if tracks:
         rec = _playlist_public_fields(bundle.get("playlist") or {})
         rec["trackCount"] = len(tracks)
-        head.append(rec)
+        head_items.append(("daily", rec))
     elif str(bundle.get("reason") or ""):
         logger.info("daily playlist not injected for %s: %s", user_guid[:8], bundle.get("reason"))
-    head.extend(_channel_public_fields(r) for r in channel_recs)
+    for r in channel_recs:
+        ch = str(r.get("channel") or "")
+        head_items.append((ch if ch in stamped_order else "category", _channel_public_fields(r)))
+
+    # 稳定排序：同口径内部保持上游顺序（如「我的歌单」里自建在前、收藏在后）
+    head_items.sort(key=lambda pair: stamped_order.index(pair[0])
+                    if pair[0] in stamped_order else len(stamped_order))
+    head = playlists.stamp_display_order([it for _ch, it in head_items])
 
     data["list"] = head + official
     data["total"] = len(head) + len(official)

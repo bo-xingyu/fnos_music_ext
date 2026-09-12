@@ -160,6 +160,26 @@ def _as_channels(v: Any) -> str:
     return ",".join(sorted(picked, key=CHANNEL_KEYS.index))
 
 
+# 大类顺序里额外允许 daily（它不在勾选框里，由独立的每日推荐开关控制）
+_ORDER_KEYS = ("daily",) + CHANNEL_KEYS
+
+
+def _as_channel_order(v: Any) -> str:
+    """歌单大类顺序：逗号分隔，只接受已知 key，按用户给的顺序原样输出。
+
+    与 _as_channels 不同，这里**不**做规范排序——顺序本身就是用户要配的东西。
+    空值回落到默认全序。
+    """
+    picked: list[str] = []
+    for part in str(v or "").replace(";", ",").split(","):
+        key = part.strip().lower()
+        if key and key in _ORDER_KEYS and key not in picked:
+            picked.append(key)
+    if not picked:
+        return ",".join(_ORDER_KEYS)
+    return ",".join(picked)
+
+
 def _as_path(v: Any) -> str:
     """归档目录：必须是已存在的可写绝对路径，且不能是系统目录。
 
@@ -218,6 +238,7 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     "netease_channels": ("FNMUSIC_NETEASE_CHANNELS", _as_channels, False),
     "netease_channel_limit": ("FNMUSIC_NETEASE_CHANNEL_LIMIT", _int_range(1, 50), False),
     "netease_category": ("FNMUSIC_NETEASE_CATEGORY", _free_text(32), False),
+    "netease_channel_order": ("FNMUSIC_NETEASE_CHANNEL_ORDER", _as_channel_order, False),
     "playlist_track_limit": ("FNMUSIC_PLAYLIST_TRACK_LIMIT", _int_range(1, 1000), False),
     # --- 收藏归档与红心同步 ---
     "download_dir": ("FNMUSIC_DOWNLOAD_DIR", _as_path, True),
@@ -257,6 +278,7 @@ DEFAULTS = {
     "netease_channels": "mine,toplist,category",
     "netease_channel_limit": "8",
     "netease_category": "华语",
+    "netease_channel_order": "daily,mine,nrec,toplist,category,newalbum,fm",
     "playlist_track_limit": "300",
     "download_dir": "",
     "download_on_favorite": "true",
@@ -1439,6 +1461,13 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
         <label><span class="lb">每口径注入上限</span>
           <input name="netease_channel_limit" inputmode="numeric" placeholder="8">
           <span class="ht">1–50。排行榜上游有 63 个，不限就会把你自己的本地歌单淹掉</span>
+        </label>
+
+        <label><span class="lb">歌单大类顺序</span>
+          <input name="netease_channel_order" placeholder="daily,mine,nrec,toplist,category,newalbum,fm">
+          <span class="ht">飞牛歌单列表里各大类的前后顺序，逗号分隔。可用值：
+            daily(每日推荐) / mine(我的歌单) / nrec(推荐歌单) / toplist(排行榜) /
+            category(分类歌单) / newalbum(新碟上架) / fm(私人FM)。没列出来的排最后</span>
         </label>
 
         <label><span class="lb">分类歌单的分类</span>

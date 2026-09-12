@@ -17,23 +17,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./fnmusic-lib.sh
 . "${SCRIPT_DIR}/fnmusic-lib.sh"
 
-# 由调用方（cmd/*）通过环境变量传入的向导值
-WIZ_QUALITY="${wizard_netease_quality:-lossless}"
-WIZ_FREE_ONLY="${wizard_free_only_on_logout:-true}"
-WIZ_DAILY="${wizard_daily_enabled:-true}"
-WIZ_DAILY_LIMIT="${wizard_daily_limit:-20}"
-WIZ_BIND="${wizard_musicbox_bind:-127.0.0.1}"
-WIZ_PUSH_ENABLED="${wizard_pushplus_enabled:-true}"
-WIZ_PUSH_TOKEN="${wizard_pushplus_token:-}"
-WIZ_PUSH_TOPIC="${wizard_pushplus_topic:-}"
-WIZ_PUSH_TEMPLATE="${wizard_pushplus_template:-markdown}"
-WIZ_PIP_INDEX="${wizard_pip_index:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+# 向导值不再在此预读成 WIZ_*：一律经 pick_env 按「向导 > 旧值 > 默认」
+# （或保留模式下的「旧值 > 向导 > 默认」）取值，防止把用户已保存的设置冲掉。
 # 日志保留策略（不进向导，需要精调直接改 .env）
 LOG_MAX_MB="${FNMUSIC_LOG_MAX_MB:-10}"
 LOG_MAX_DAYS="${FNMUSIC_LOG_MAX_DAYS:-30}"
 
 # 重建虚拟环境（升级时装新依赖）——设为 0 可跳过，节省升级时间
 REBUILD_VENV="${FNMUSICEXT_REBUILD_VENV:-1}"
+
+# 保留模式（升级专用，由 cmd/upgrade_callback 设置）：
+# .env 里已有的用户设置一律原样保留，向导值只用于补齐缺失键。
+# 背景事故：v2.3 之前 write_env_file 每次都整表重写、只特殊照顾 token，
+# 用户在管理页保存过的歌单口径 / 收藏归档目录等设置在每次升级或
+# 「应用设置」保存后全部被冲回默认值。
+PRESERVE_ENV="${FNMUSICEXT_PRESERVE_ENV:-false}"
 
 norm_bool() {
     case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
@@ -46,6 +44,54 @@ norm_bool() {
 dq() {
     local v="$1"
     printf "'%s'" "$(printf '%s' "${v}" | sed "s/'/'\\\\\\\\''/g")"
+}
+
+# ---------------------------------------------------------------------------
+# 旧 .env 读取：现 .env 优先，其次「卸载+重装」前的快照 .env.preserved
+# ---------------------------------------------------------------------------
+ENV_SRC=""
+if [ -r "${ENV_FILE}" ]; then
+    ENV_SRC="${ENV_FILE}"
+elif [ -r "${PKGVAR}/.env.preserved" ]; then
+    ENV_SRC="${PKGVAR}/.env.preserved"
+fi
+
+OLD_ENV_KEYS=""
+if [ -n "${ENV_SRC}" ]; then
+    OLD_ENV_KEYS="$(sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "${ENV_SRC}" 2>/dev/null | sort -u)"
+    if [ "${ENV_SRC}" = "${PKGVAR}/.env.preserved" ]; then
+        lib_log "检测到重装场景：从 .env.preserved 恢复全部既有设置"
+    fi
+fi
+
+has_old() {
+    [ -n "${OLD_ENV_KEYS}" ] || return 1
+    printf '%s\n' "${OLD_ENV_KEYS}" | grep -qx -- "$1"
+}
+
+old_val() {
+    [ -n "${ENV_SRC}" ] || return 0
+    sed -n "s/^$1='\{0,1\}\([^']*\)'\{0,1\}\s*$/\1/p" "${ENV_SRC}" 2>/dev/null | tail -n 1
+}
+
+# pick_env <KEY> <向导变量名或空> <默认值>
+#   普通模式（安装 / 应用设置保存）：向导值 > 旧值 > 默认
+#   保留模式（升级）：旧值 > 向导值 > 默认
+pick_env() {
+    local key="$1" wiz_var="$2" default="$3" wiz="" old=""
+    [ -n "${wiz_var}" ] && wiz="${!wiz_var:-}"
+    if has_old "${key}"; then
+        old="$(old_val "${key}")"
+    fi
+    if [ "$(norm_bool "${PRESERVE_ENV}")" = "true" ]; then
+        if has_old "${key}"; then printf '%s' "${old}"
+        elif [ -n "${wiz}" ]; then printf '%s' "${wiz}"
+        else printf '%s' "${default}"; fi
+    else
+        if [ -n "${wiz}" ]; then printf '%s' "${wiz}"
+        elif has_old "${key}"; then printf '%s' "${old}"
+        else printf '%s' "${default}"; fi
+    fi
 }
 
 stage_code() {
@@ -78,25 +124,7 @@ stage_code() {
 }
 
 write_env_file() {
-    lib_log "生成 ${ENV_FILE}"
-    local token_line
-    if [ -n "${WIZ_PUSH_TOKEN}" ]; then
-        token_line="$(dq "${WIZ_PUSH_TOKEN}")"
-    else
-        # token 留空 = 保持已保存值不变（避免配置页误提交把 token 冲掉）
-        local kept
-        kept="$(lib_read_env_value FNMUSIC_PUSHPLUS_TOKEN "")"
-        if [ -z "${kept}" ] && [ -f "${PKGVAR}/.env.preserved" ]; then
-            # 「卸载+重装」后 RUN_DIR 已被删除，.env 不在了。手动安装新版 fpk 走的
-            # 正是这条路径，向导里的 token 又是空的 —— 从卸载前快照恢复，
-            # 免得用户每次重装都要重新填 PushPlus token。
-            kept="$(grep -E '^FNMUSIC_PUSHPLUS_TOKEN=' "${PKGVAR}/.env.preserved" 2>/dev/null |
-                    tail -n 1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//')"
-            [ -n "${kept}" ] && lib_log "已从 ${PKGVAR}/.env.preserved 恢复 PushPlus token（值不落日志）"
-        fi
-        token_line="$(dq "${kept}")"
-    fi
-
+    lib_log "生成 ${ENV_FILE}（已有用户设置原样保留，模式 preserve=${PRESERVE_ENV}）"
     local tmp="${ENV_FILE}.new.$$"
     {
         echo "# 由飞牛应用中心向导生成，请勿手工编辑后重新提交向导（会被覆盖）。"
@@ -107,48 +135,50 @@ write_env_file() {
         echo "# --- 网易云音源（唯一音源） ---"
         echo "FNMUSIC_NETEASE_ENABLED=$(dq "true")"
         echo "FNMUSIC_MUSICBOX_URL=$(dq "http://127.0.0.1:${MUSICBOX_PORT}")"
-        echo "FNMUSIC_NETEASE_QUALITY=$(dq "${WIZ_QUALITY}")"
-        echo "FNMUSIC_NETEASE_SEARCH_LIMIT=$(dq "50")"
-        echo "FNMUSIC_ONLINE_LIMIT=$(dq "30")"
-        echo "FNMUSIC_NETEASE_WAIT_S=$(dq "3.0")"
-        echo "FNMUSIC_LATE_PAGE_WAIT_S=$(dq "5.0")"
-        echo "FNMUSIC_SEARCH_TIMEOUT=$(dq "15")"
-        echo "FNMUSIC_SEARCH_CACHE_TTL=$(dq "604800")"
-        echo "FNMUSIC_SEARCH_EMPTY_TTL=$(dq "60")"
-        echo "FNMUSIC_LOGIN_CACHE_TTL=$(dq "300")"
-        echo "FNMUSIC_MUSICBOX_BIND=$(dq "${WIZ_BIND}")"
+        echo "FNMUSIC_NETEASE_QUALITY=$(dq "$(pick_env FNMUSIC_NETEASE_QUALITY wizard_netease_quality lossless)")"
+        echo "FNMUSIC_NETEASE_SEARCH_LIMIT=$(dq "$(pick_env FNMUSIC_NETEASE_SEARCH_LIMIT "" 50)")"
+        echo "FNMUSIC_ONLINE_LIMIT=$(dq "$(pick_env FNMUSIC_ONLINE_LIMIT "" 30)")"
+        echo "FNMUSIC_NETEASE_WAIT_S=$(dq "$(pick_env FNMUSIC_NETEASE_WAIT_S "" 3.0)")"
+        echo "FNMUSIC_LATE_PAGE_WAIT_S=$(dq "$(pick_env FNMUSIC_LATE_PAGE_WAIT_S "" 5.0)")"
+        echo "FNMUSIC_SEARCH_TIMEOUT=$(dq "$(pick_env FNMUSIC_SEARCH_TIMEOUT "" 15)")"
+        echo "FNMUSIC_SEARCH_CACHE_TTL=$(dq "$(pick_env FNMUSIC_SEARCH_CACHE_TTL "" 604800)")"
+        echo "FNMUSIC_SEARCH_EMPTY_TTL=$(dq "$(pick_env FNMUSIC_SEARCH_EMPTY_TTL "" 60)")"
+        echo "FNMUSIC_LOGIN_CACHE_TTL=$(dq "$(pick_env FNMUSIC_LOGIN_CACHE_TTL "" 300)")"
+        echo "FNMUSIC_MUSICBOX_BIND=$(dq "$(pick_env FNMUSIC_MUSICBOX_BIND wizard_musicbox_bind 127.0.0.1)")"
         echo "# --- 登录态与降级 ---"
-        echo "FNMUSIC_FREE_ONLY_ON_LOGOUT=$(dq "$(norm_bool "${WIZ_FREE_ONLY}")")"
-        echo "FNMUSIC_LOGIN_STATE_TTL=$(dq "300")"
-        echo "FNMUSIC_LOGIN_CHECK_INTERVAL=$(dq "3600")"
-        echo "FNMUSIC_VIP_WARN_DAYS=$(dq "7")"
+        echo "FNMUSIC_FREE_ONLY_ON_LOGOUT=$(dq "$(norm_bool "$(pick_env FNMUSIC_FREE_ONLY_ON_LOGOUT wizard_free_only_on_logout true)")")"
+        echo "FNMUSIC_LOGIN_STATE_TTL=$(dq "$(pick_env FNMUSIC_LOGIN_STATE_TTL "" 300)")"
+        echo "FNMUSIC_LOGIN_CHECK_INTERVAL=$(dq "$(pick_env FNMUSIC_LOGIN_CHECK_INTERVAL "" 3600)")"
+        echo "FNMUSIC_VIP_WARN_DAYS=$(dq "$(pick_env FNMUSIC_VIP_WARN_DAYS "" 7)")"
         echo "# --- 网易云官方每日推荐（需登录） ---"
-        echo "FNMUSIC_DAILY_ENABLED=$(dq "$(norm_bool "${WIZ_DAILY}")")"
-        echo "FNMUSIC_DAILY_LIMIT=$(dq "${WIZ_DAILY_LIMIT}")"
+        echo "FNMUSIC_DAILY_ENABLED=$(dq "$(norm_bool "$(pick_env FNMUSIC_DAILY_ENABLED wizard_daily_enabled true)")")"
+        echo "FNMUSIC_DAILY_LIMIT=$(dq "$(pick_env FNMUSIC_DAILY_LIMIT wizard_daily_limit 20)")"
         echo "# --- 更多口径歌单 / 账户歌单 ---"
-        echo "FNMUSIC_NETEASE_CHANNELS=$(dq "mine,toplist,category")"
-        echo "FNMUSIC_NETEASE_CHANNEL_LIMIT=$(dq "8")"
-        echo "FNMUSIC_NETEASE_CATEGORY=$(dq "华语")"
-        echo "FNMUSIC_PLAYLIST_TRACK_LIMIT=$(dq "300")"
+        echo "FNMUSIC_NETEASE_CHANNELS=$(dq "$(pick_env FNMUSIC_NETEASE_CHANNELS "" mine,toplist,category)")"
+        echo "FNMUSIC_NETEASE_CHANNEL_LIMIT=$(dq "$(pick_env FNMUSIC_NETEASE_CHANNEL_LIMIT "" 8)")"
+        echo "FNMUSIC_NETEASE_CATEGORY=$(dq "$(pick_env FNMUSIC_NETEASE_CATEGORY "" 华语)")"
+        echo "# 歌单口径展示顺序（大类固定排序，管理页可改）"
+        echo "FNMUSIC_NETEASE_CHANNEL_ORDER=$(dq "$(pick_env FNMUSIC_NETEASE_CHANNEL_ORDER "" daily,mine,nrec,toplist,category,newalbum,fm)")"
+        echo "FNMUSIC_PLAYLIST_TRACK_LIMIT=$(dq "$(pick_env FNMUSIC_PLAYLIST_TRACK_LIMIT "" 300)")"
         # 放 PKGVAR 而不是 RUN_DIR：RUN_DIR 在「卸载+重装」时整个被删，
         # 注册表存着歌单名字与封面，丢了就会退化成"网易云歌单 12345"+无封面。
         echo "FNMUSIC_PLAYLIST_CACHE_DIR=$(dq "${PKGVAR}/playlist_cache")"
         echo "# --- 收藏归档与红心同步 ---"
-        echo "FNMUSIC_DOWNLOAD_DIR=$(dq "")"
-        echo "FNMUSIC_DOWNLOAD_ON_FAVORITE=$(dq "true")"
-        echo "FNMUSIC_FAV_SYNC_LIKE=$(dq "true")"
+        echo "FNMUSIC_DOWNLOAD_DIR=$(dq "$(pick_env FNMUSIC_DOWNLOAD_DIR "" "")")"
+        echo "FNMUSIC_DOWNLOAD_ON_FAVORITE=$(dq "$(norm_bool "$(pick_env FNMUSIC_DOWNLOAD_ON_FAVORITE "" true)")")"
+        echo "FNMUSIC_FAV_SYNC_LIKE=$(dq "$(norm_bool "$(pick_env FNMUSIC_FAV_SYNC_LIKE "" true)")")"
         echo "# --- 音质策略（跟随飞牛 / 按网络 / 固定）---"
-        echo "FNMUSIC_QUALITY_POLICY=$(dq "follow_fnos")"
-        echo "FNMUSIC_QUALITY_FIXED=$(dq "lossless")"
-        echo "FNMUSIC_QUALITY_WIFI=$(dq "lossless")"
-        echo "FNMUSIC_QUALITY_CELLULAR=$(dq "exhigh")"
-        echo "FNMUSIC_QUALITY_DB_RESCAN=$(dq "300")"
+        echo "FNMUSIC_QUALITY_POLICY=$(dq "$(pick_env FNMUSIC_QUALITY_POLICY "" follow_fnos)")"
+        echo "FNMUSIC_QUALITY_FIXED=$(dq "$(pick_env FNMUSIC_QUALITY_FIXED "" lossless)")"
+        echo "FNMUSIC_QUALITY_WIFI=$(dq "$(pick_env FNMUSIC_QUALITY_WIFI "" lossless)")"
+        echo "FNMUSIC_QUALITY_CELLULAR=$(dq "$(pick_env FNMUSIC_QUALITY_CELLULAR "" exhigh)")"
+        echo "FNMUSIC_QUALITY_DB_RESCAN=$(dq "$(pick_env FNMUSIC_QUALITY_DB_RESCAN "" 300)")"
         echo "# --- PushPlus 推送提醒 ---"
-        echo "FNMUSIC_PUSHPLUS_ENABLED=$(dq "$(norm_bool "${WIZ_PUSH_ENABLED}")")"
-        echo "FNMUSIC_PUSHPLUS_TOKEN=${token_line}"
-        echo "FNMUSIC_PUSHPLUS_TOPIC=$(dq "${WIZ_PUSH_TOPIC}")"
-        echo "FNMUSIC_PUSHPLUS_TEMPLATE=$(dq "${WIZ_PUSH_TEMPLATE}")"
-        echo "FNMUSIC_PUSHPLUS_URL=$(dq "https://www.pushplus.plus/send")"
+        echo "FNMUSIC_PUSHPLUS_ENABLED=$(dq "$(norm_bool "$(pick_env FNMUSIC_PUSHPLUS_ENABLED wizard_pushplus_enabled true)")")"
+        echo "FNMUSIC_PUSHPLUS_TOKEN=$(dq "$(pick_env FNMUSIC_PUSHPLUS_TOKEN wizard_pushplus_token "")")"
+        echo "FNMUSIC_PUSHPLUS_TOPIC=$(dq "$(pick_env FNMUSIC_PUSHPLUS_TOPIC wizard_pushplus_topic "")")"
+        echo "FNMUSIC_PUSHPLUS_TEMPLATE=$(dq "$(pick_env FNMUSIC_PUSHPLUS_TEMPLATE wizard_pushplus_template markdown)")"
+        echo "FNMUSIC_PUSHPLUS_URL=$(dq "$(pick_env FNMUSIC_PUSHPLUS_URL "" https://www.pushplus.plus/send)")"
         echo "# --- 运行时路径 ---"
         echo "FNMUSIC_CACHE_DIR=$(dq "${RUN_DIR}/cache")"
         echo "FNMUSIC_FAV_DIR=$(dq "${RUN_DIR}/online_favorites")"
@@ -156,13 +186,44 @@ write_env_file() {
         echo "FNMUSIC_RECOMMEND_DIR=$(dq "${RUN_DIR}/recommend_cache")"
         echo "FNMUSIC_UPSTREAM_SOCK=$(dq "${UPSTREAM_SOCK}")"
         echo "# 曲库目录留空 = 由代理自动探测飞牛 shared_library.path"
-        echo "FNMUSIC_LIBRARY_DIR=$(dq "")"
-        echo "FNMUSIC_MUSIC_DB=$(dq "/usr/local/apps/@appdata/trim.music/db/music.db")"
-        echo "FNMUSIC_PIP_INDEX=$(dq "${WIZ_PIP_INDEX}")"
+        echo "FNMUSIC_LIBRARY_DIR=$(dq "$(pick_env FNMUSIC_LIBRARY_DIR "" "")")"
+        echo "FNMUSIC_MUSIC_DB=$(dq "$(pick_env FNMUSIC_MUSIC_DB "" /usr/local/apps/@appdata/trim.music/db/music.db)")"
+        echo "FNMUSIC_PIP_INDEX=$(dq "$(pick_env FNMUSIC_PIP_INDEX wizard_pip_index https://pypi.tuna.tsinghua.edu.cn/simple)")"
         echo "# --- 日志保留策略：超过 10MB 就地截断保留尾部，超过 30 天清理 ---"
-        echo "FNMUSIC_LOG_MAX_MB=$(dq "${LOG_MAX_MB}")"
-        echo "FNMUSIC_LOG_MAX_DAYS=$(dq "${LOG_MAX_DAYS}")"
-        echo "FNMUSIC_LOG_SCAN_INTERVAL=$(dq "3600")"
+        echo "FNMUSIC_LOG_MAX_MB=$(dq "$(pick_env FNMUSIC_LOG_MAX_MB "" "${LOG_MAX_MB}")")"
+        echo "FNMUSIC_LOG_MAX_DAYS=$(dq "$(pick_env FNMUSIC_LOG_MAX_DAYS "" "${LOG_MAX_DAYS}")")"
+        echo "FNMUSIC_LOG_SCAN_INTERVAL=$(dq "$(pick_env FNMUSIC_LOG_SCAN_INTERVAL "" 3600)")"
+        # 用户手工加的、不属于本应用托管清单的自定义键：原样保留在尾部
+        if [ -n "${ENV_SRC}" ] && [ -n "${OLD_ENV_KEYS}" ]; then
+            echo "# --- 以下为用户自定义键（自动保留） ---"
+            local k v
+            while IFS= read -r k; do
+                [ -n "${k}" ] || continue
+                case "${k}" in
+                    FNMUSIC_HOME|FNMUSIC_VERSION|FNMUSIC_MODE|FNMUSIC_NETEASE_ENABLED|\
+                    FNMUSIC_MUSICBOX_URL|FNMUSIC_NETEASE_QUALITY|FNMUSIC_NETEASE_SEARCH_LIMIT|\
+                    FNMUSIC_ONLINE_LIMIT|FNMUSIC_NETEASE_WAIT_S|FNMUSIC_LATE_PAGE_WAIT_S|\
+                    FNMUSIC_SEARCH_TIMEOUT|FNMUSIC_SEARCH_CACHE_TTL|FNMUSIC_SEARCH_EMPTY_TTL|\
+                    FNMUSIC_LOGIN_CACHE_TTL|FNMUSIC_MUSICBOX_BIND|FNMUSIC_FREE_ONLY_ON_LOGOUT|\
+                    FNMUSIC_LOGIN_STATE_TTL|FNMUSIC_LOGIN_CHECK_INTERVAL|FNMUSIC_VIP_WARN_DAYS|\
+                    FNMUSIC_DAILY_ENABLED|FNMUSIC_DAILY_LIMIT|FNMUSIC_NETEASE_CHANNELS|\
+                    FNMUSIC_NETEASE_CHANNEL_LIMIT|FNMUSIC_NETEASE_CATEGORY|FNMUSIC_NETEASE_CHANNEL_ORDER|\
+                    FNMUSIC_PLAYLIST_TRACK_LIMIT|FNMUSIC_PLAYLIST_CACHE_DIR|FNMUSIC_DOWNLOAD_DIR|\
+                    FNMUSIC_DOWNLOAD_ON_FAVORITE|FNMUSIC_FAV_SYNC_LIKE|FNMUSIC_QUALITY_POLICY|\
+                    FNMUSIC_QUALITY_FIXED|FNMUSIC_QUALITY_WIFI|FNMUSIC_QUALITY_CELLULAR|\
+                    FNMUSIC_QUALITY_DB_RESCAN|FNMUSIC_PUSHPLUS_ENABLED|FNMUSIC_PUSHPLUS_TOKEN|\
+                    FNMUSIC_PUSHPLUS_TOPIC|FNMUSIC_PUSHPLUS_TEMPLATE|FNMUSIC_PUSHPLUS_URL|\
+                    FNMUSIC_CACHE_DIR|FNMUSIC_FAV_DIR|FNMUSIC_PLAY_HISTORY_DIR|FNMUSIC_RECOMMEND_DIR|\
+                    FNMUSIC_UPSTREAM_SOCK|FNMUSIC_LIBRARY_DIR|FNMUSIC_MUSIC_DB|FNMUSIC_PIP_INDEX|\
+                    FNMUSIC_LOG_MAX_MB|FNMUSIC_LOG_MAX_DAYS|FNMUSIC_LOG_SCAN_INTERVAL)
+                        continue ;;
+                    FNMUSIC_MUSICDL_*|FNMUSIC_LX_*|FNMUSIC_LLM_*)
+                        continue ;;  # 已废弃的 v1.x 遗留键不再保留
+                esac
+                v="$(old_val "${k}")"
+                echo "${k}=$(dq "${v}")"
+            done <<< "${OLD_ENV_KEYS}"
+        fi
     } > "${tmp}" || {
         lib_fail "写入 ${tmp} 失败"
         rm -f "${tmp}"
@@ -174,7 +235,7 @@ write_env_file() {
         rm -f "${tmp}"
         return 1
     }
-    lib_log ".env 已写入（token 已脱敏，不落日志）"
+    lib_log ".env 已写入（全部既有设置已保留，token 不落日志）"
     return 0
 }
 
@@ -187,7 +248,9 @@ build_venvs() {
     py="$(lib_check_python)" || return 1
     lib_log "使用 Python: ${py} ($(py_ver "${py}"))"
 
-    local idx="${WIZ_PIP_INDEX}"
+    # pip 镜像源以【已合并的 .env】为准（可能是用户保留的旧值）
+    local idx
+    idx="$(lib_read_env_value FNMUSIC_PIP_INDEX "https://pypi.tuna.tsinghua.edu.cn/simple")"
     local name req
     for name in proxy musicbox; do
         local venv="${RUN_DIR}/.venv-${name}"

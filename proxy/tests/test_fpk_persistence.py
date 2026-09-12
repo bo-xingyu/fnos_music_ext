@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import time
 import os
 import re
 import shutil
@@ -233,3 +234,214 @@ def test_uninstall_log_records_preservation(installable):
     log = (installable / "logs" / "uninstall.log").read_text(encoding="utf-8")
     assert "保留运行数据" in log, "日志必须明确说明保留了什么，便于事后排查"
     assert r.returncode == 0, r.stderr.decode()[:300]
+
+
+# ---------------------------------------------------------------------------
+# v2.4 回归：.env 设置持久化
+#
+# 真机事故：write_env_file 每次执行都把 .env 整表重写成硬编码默认值（只特殊
+# 保留了 PushPlus token）。于是「应用设置」保存一次、或应用升级一次，用户在
+# 管理页改过的歌单口径 / 收藏归档目录 / 音质策略等全部被冲回默认。
+# 修复后规则：
+#   * 升级（FNMUSICEXT_PRESERVE_ENV=true）：旧值一律保留，只补齐缺失键；
+#   * 应用设置保存 / 安装：向导键用向导值，其余键保留旧值；
+#   * 卸载+重装：从 .env.preserved 快照恢复全部旧值。
+# ---------------------------------------------------------------------------
+
+import tempfile
+
+
+def _fake_layout(tmp_path: Path, env_text: str = "") -> tuple:
+    """搭一个最小 fpk 目录布局：APPDEST 载荷 + PKGVAR。"""
+    appdest = tmp_path / "target"
+    pkgvar = tmp_path / "pkgvar"
+    for sub in ("bin", "proxy", "musicbox-service"):
+        (appdest / sub).mkdir(parents=True)
+    # setup.sh 需要 APPDEST/bin 下的库与脚本本身
+    shutil.copy(LIB, appdest / "bin" / "fnmusic-lib.sh")
+    shutil.copy(SETUP, appdest / "bin" / "setup.sh")
+    (appdest / "VERSION").write_text("9.9.9", encoding="utf-8")
+    (pkgvar / "logs").mkdir(parents=True)
+    run_dir = pkgvar / "app"
+    run_dir.mkdir()
+    if env_text:
+        (run_dir / ".env").write_text(env_text, encoding="utf-8")
+    return appdest, pkgvar
+
+
+def _run_setup(appdest, pkgvar, extra_env: dict | None = None) -> subprocess.CompletedProcess:
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "TRIM_APPDEST": str(appdest),
+        "TRIM_PKGVAR": str(pkgvar),
+        "TRIM_USERNAME": "",
+        "FNMUSICEXT_REBUILD_VENV": "false",
+        **(extra_env or {}),
+    }
+    return subprocess.run(
+        [bash, str(appdest / "bin" / "setup.sh")],
+        capture_output=True, timeout=120, env=env,
+    )
+
+
+USER_ENV = """# 旧配置（用户在管理页保存过的）
+FNMUSIC_HOME='/vol1/@appdata/fnmusicext/app'
+FNMUSIC_VERSION='2.3.0'
+FNMUSIC_NETEASE_CHANNELS='mine,nrec,toplist,category,newalbum,fm'
+FNMUSIC_NETEASE_CHANNEL_LIMIT='20'
+FNMUSIC_NETEASE_CATEGORY='摇滚'
+FNMUSIC_NETEASE_CHANNEL_ORDER='toplist,mine,daily,category,nrec,newalbum,fm'
+FNMUSIC_PLAYLIST_TRACK_LIMIT='500'
+FNMUSIC_DOWNLOAD_DIR='/vol1/1000/music/网易云归档'
+FNMUSIC_DOWNLOAD_ON_FAVORITE='false'
+FNMUSIC_FAV_SYNC_LIKE='false'
+FNMUSIC_QUALITY_POLICY='fixed'
+FNMUSIC_QUALITY_FIXED='hires'
+FNMUSIC_NETEASE_QUALITY='exhigh'
+FNMUSIC_PUSHPLUS_TOKEN='old_secret_token_value'
+FNMUSIC_LOG_MAX_DAYS='90'
+FNMUSIC_MUSIC_DB='/custom/music.db'
+MY_CUSTOM_KEY='keep-me'
+"""
+
+
+def _env_dict(path: Path) -> dict:
+    from proxy import env_merge as _em  # noqa: PLC0415
+    kv, _ = _em.parse_env_file(str(path))
+    return dict(kv)
+
+
+def test_setup_upgrade_preserves_all_user_settings(tmp_path):
+    """升级（PRESERVE_ENV=true）：向导值一个都不该覆盖旧设置。"""
+    appdest, pkgvar = _fake_layout(tmp_path, USER_ENV)
+    r = _run_setup(appdest, pkgvar, {
+        "FNMUSICEXT_PRESERVE_ENV": "true",
+        # 模拟升级时框架塞进来的旧向导默认值——必须被旧值压住
+        "wizard_netease_quality": "lossless",
+        "wizard_daily_limit": "20",
+        "wizard_pushplus_token": "",
+    })
+    assert r.returncode == 0, r.stderr.decode()[:800]
+    env = _env_dict(pkgvar / "app" / ".env")
+    assert env["FNMUSIC_NETEASE_CHANNELS"] == "mine,nrec,toplist,category,newalbum,fm"
+    assert env["FNMUSIC_NETEASE_CHANNEL_LIMIT"] == "20"
+    assert env["FNMUSIC_NETEASE_CATEGORY"] == "摇滚"
+    assert env["FNMUSIC_NETEASE_CHANNEL_ORDER"] == "toplist,mine,daily,category,nrec,newalbum,fm"
+    assert env["FNMUSIC_PLAYLIST_TRACK_LIMIT"] == "500"
+    assert env["FNMUSIC_DOWNLOAD_DIR"] == "/vol1/1000/music/网易云归档"
+    assert env["FNMUSIC_DOWNLOAD_ON_FAVORITE"] == "false"
+    assert env["FNMUSIC_FAV_SYNC_LIKE"] == "false"
+    assert env["FNMUSIC_QUALITY_POLICY"] == "fixed"
+    assert env["FNMUSIC_QUALITY_FIXED"] == "hires"
+    assert env["FNMUSIC_NETEASE_QUALITY"] == "exhigh", "升级绝不能把音质冲回 lossless"
+    assert env["FNMUSIC_PUSHPLUS_TOKEN"] == "old_secret_token_value"
+    assert env["FNMUSIC_LOG_MAX_DAYS"] == "90"
+    assert env["FNMUSIC_MUSIC_DB"] == "/custom/music.db"
+    assert env["MY_CUSTOM_KEY"] == "keep-me", "用户自定义键必须原样保留"
+    # 结构键必须更新为新布局
+    assert env["FNMUSIC_VERSION"] == "9.9.9"
+
+
+def test_setup_config_save_uses_wizard_but_keeps_rest(tmp_path):
+    """应用设置保存：向导键采用向导值，非向导键保留旧值。"""
+    appdest, pkgvar = _fake_layout(tmp_path, USER_ENV)
+    r = _run_setup(appdest, pkgvar, {
+        "wizard_netease_quality": "standard",
+        "wizard_pushplus_token": "brand_new_token_123",
+    })
+    assert r.returncode == 0, r.stderr.decode()[:800]
+    env = _env_dict(pkgvar / "app" / ".env")
+    assert env["FNMUSIC_NETEASE_QUALITY"] == "standard", "用户在向导里改的音质要生效"
+    assert env["FNMUSIC_PUSHPLUS_TOKEN"] == "brand_new_token_123"
+    # 不在向导里的键：全部保持
+    assert env["FNMUSIC_NETEASE_CHANNELS"] == "mine,nrec,toplist,category,newalbum,fm"
+    assert env["FNMUSIC_DOWNLOAD_DIR"] == "/vol1/1000/music/网易云归档"
+    assert env["FNMUSIC_QUALITY_FIXED"] == "hires"
+
+
+def test_setup_config_save_empty_token_keeps_old(tmp_path):
+    """向导 token 留空 = 不修改，不能把已保存的 token 冲掉。"""
+    appdest, pkgvar = _fake_layout(tmp_path, USER_ENV)
+    r = _run_setup(appdest, pkgvar, {"wizard_pushplus_token": ""})
+    assert r.returncode == 0, r.stderr.decode()[:800]
+    env = _env_dict(pkgvar / "app" / ".env")
+    assert env["FNMUSIC_PUSHPLUS_TOKEN"] == "old_secret_token_value"
+
+
+def test_setup_fresh_install_fills_defaults_and_new_keys(tmp_path):
+    """全新安装：无旧 .env，全部按向导/默认生成，含新增的 CHANNEL_ORDER。"""
+    appdest, pkgvar = _fake_layout(tmp_path, env_text="")
+    r = _run_setup(appdest, pkgvar, {"wizard_netease_quality": "exhigh"})
+    assert r.returncode == 0, r.stderr.decode()[:800]
+    env = _env_dict(pkgvar / "app" / ".env")
+    assert env["FNMUSIC_NETEASE_QUALITY"] == "exhigh"
+    assert env["FNMUSIC_NETEASE_CHANNELS"] == "mine,toplist,category"
+    assert env["FNMUSIC_NETEASE_CHANNEL_ORDER"] == "daily,mine,nrec,toplist,category,newalbum,fm"
+    assert env["FNMUSIC_DOWNLOAD_DIR"] == ""
+
+
+def test_setup_reinstall_restores_from_preserved_snapshot(tmp_path):
+    """卸载+重装：RUN_DIR/.env 没了，但 .env.preserved 快照里的设置要恢复。"""
+    appdest, pkgvar = _fake_layout(tmp_path, env_text="")
+    (pkgvar / ".env.preserved").write_text(USER_ENV, encoding="utf-8")
+    r = _run_setup(appdest, pkgvar, {"wizard_netease_quality": "lossless"})
+    assert r.returncode == 0, r.stderr.decode()[:800]
+    env = _env_dict(pkgvar / "app" / ".env")
+    # 向导值（用户重装时刚填的）优先，其余从快照恢复
+    assert env["FNMUSIC_NETEASE_QUALITY"] == "lossless"
+    assert env["FNMUSIC_NETEASE_CHANNELS"] == "mine,nrec,toplist,category,newalbum,fm"
+    assert env["FNMUSIC_DOWNLOAD_DIR"] == "/vol1/1000/music/网易云归档"
+    assert env["FNMUSIC_PUSHPLUS_TOKEN"] == "old_secret_token_value"
+    assert env["MY_CUSTOM_KEY"] == "keep-me"
+
+
+# ---------------------------------------------------------------------------
+# v2.4 回归：重启窗口内 status 必须继续报 running（防「保存即闪退」）
+#
+# 真机现象：管理页保存配置触发 stop→start，几秒到几十秒的窗口里
+# cmd/main status 返回 3（未运行），飞牛桌面随即回收本应用已打开的窗口，
+# 用户看到的就是「保存一次、应用闪退一次」。
+# ---------------------------------------------------------------------------
+
+STATUS = REPO / "fpk" / "payload" / "bin" / "status.sh"
+RESTART = REPO / "fpk" / "payload" / "bin" / "restart_services.sh"
+
+
+def _run_status(pkgvar) -> subprocess.CompletedProcess:
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "TRIM_APPDEST": str(pkgvar.parent / "target"),
+        "TRIM_PKGVAR": str(pkgvar),
+    }
+    return subprocess.run([bash, str(STATUS)], capture_output=True, timeout=60, env=env)
+
+
+def test_status_reports_running_while_restart_marker_fresh(tmp_path):
+    pkgvar = tmp_path / "pkgvar"
+    pkgvar.mkdir()
+    (pkgvar / "logs").mkdir()
+    # 没有代理进程、没有 socket —— 本该报「未运行」
+    r = _run_status(pkgvar)
+    assert r.returncode == 3, "无标记时必须如实报未运行"
+
+    # 打上 fresh 标记：必须报 running，让桌面别收走窗口
+    (pkgvar / "restart.inprogress").write_text(str(int(time.time())) + "\n", encoding="utf-8")
+    r = _run_status(pkgvar)
+    assert r.returncode == 0, "重启窗口内必须报 running，否则桌面会闪退回收窗口"
+
+    # 标记过期（比如 restart 脚本被 kill -9 后留下的死标记）：恢复如实上报
+    stale = int(time.time()) - 3600
+    (pkgvar / "restart.inprogress").write_text(str(stale) + "\n", encoding="utf-8")
+    import os as _os
+    _os.utime(pkgvar / "restart.inprogress", (stale, stale))
+    r = _run_status(pkgvar)
+    assert r.returncode == 3, "死标记超时后不能永远谎报 running"
+
+
+def test_restart_services_clears_marker_on_exit(tmp_path):
+    """restart_services.sh 无论成败都要收掉标记（trap EXIT）。"""
+    src = RESTART.read_text(encoding="utf-8")
+    assert "lib_restart_marker_begin" in src
+    assert "trap 'lib_restart_marker_end' EXIT INT TERM" in src, (
+        "必须用 trap 兜底清理标记，否则一次 kill 就留下永久谎报 running 的死标记"
+    )

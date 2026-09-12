@@ -16,6 +16,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 main() {
     lib_log "=== restart_services 开始（保留 ui 进程）==="
+    # 打重启标记：窗口内 status.sh 继续报 running，飞牛桌面不会把
+    # 正在保存配置的用户的应用窗口收走（闪退）。无论成功失败都要收掉标记。
+    lib_restart_marker_begin
+    trap 'lib_restart_marker_end' EXIT INT TERM
 
     # 1. 停代理：它持有 /var/run/trim_music.socket
     lib_stop_pid "proxy" "${PROXY_PID}" 15

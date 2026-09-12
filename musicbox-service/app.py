@@ -650,7 +650,11 @@ def playlists_user(uid: int = Query(0), limit: int = Query(100, ge=1, le=200)):
         return gate
     if not uid:
         try:
-            uid = int(auth_detail().get("user_id") or 0)
+            # ⚠️ 必须用 import 时改名过的 ne_auth_detail()：这里曾误写成裸的
+            # auth_detail()（import 语句是 `auth_detail as ne_auth_detail`），
+            # NameError 被 except 吞掉后 uid 恒为 0 → 返回 uid_unavailable，
+            # 「我的歌单（自建+收藏）」从此一颗都出不来。
+            uid = int(ne_auth_detail().get("user_id") or 0)
         except Exception as exc:  # noqa: BLE001
             logger.warning("resolve uid failed: %s: %s", type(exc).__name__, exc)
             uid = 0
@@ -844,7 +848,7 @@ def channels_selftest():
 
     def _probe_user_playlists():
         # uid 必须解析成真实账号 id，传 0 上游只会给出无意义结果
-        uid = int((auth_detail() or {}).get("user_id") or 0)
+        uid = int((ne_auth_detail() or {}).get("user_id") or 0)
         if not uid:
             raise RuntimeError("uid_unavailable: 无法确定当前登录账号 id")
         return ne_user_playlists(uid)

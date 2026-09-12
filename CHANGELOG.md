@@ -3,6 +3,78 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.4.0] - 2026-09-12
+
+修复真机实测反馈的五个问题。核心主题：**设置必须持久、歌单必须能出来且顺序固定、
+保存配置不能闪退、开转码本地音乐必须能播**。
+
+### 1. 升级/保存设置后配置全部丢失（严重）
+
+`fpk/payload/bin/setup.sh` 的 `write_env_file` 每次执行都把 `.env` **整表重写**成
+硬编码默认值——只特殊保留了 PushPlus token。于是每次应用升级（upgrade_callback）、
+每次「应用设置」保存（config_callback），用户在管理页改过的**全部**设置都被冲掉：
+歌单口径、收藏归档目录（保存音乐目录）、每口径上限、音质策略、日志保留……
+
+修复：整表重写改为**三源合并取值**（`pick_env`）——向导值、既有 `.env` 值、默认值，
+按场景决定优先级：
+
+- **升级**（`upgrade_callback` 以 `FNMUSICEXT_PRESERVE_ENV=true` 调 setup）：
+  既有值一律保留，向导值只用于补齐缺失键；
+- **应用设置保存 / 安装**：向导覆盖的键用向导值（用户刚填的），其余键保留旧值；
+- **卸载+重装**：从 `${PKGVAR}/.env.preserved` 快照恢复全部旧值（原先只恢复 token）；
+- 用户手工加的**自定义键**一律原样保留；v1.x 废弃键（musicdl/lxmusic/LLM）不再带回。
+
+### 2. 「我的歌单（自建+收藏）」不同步（两处 NameError）
+
+- `musicbox-service/app.py`：v2.2.0 把 import 改成 `auth_detail as ne_auth_detail` 时
+  漏改两处调用点，`NameError` 被外层 `except` 吞掉 → uid 恒为 0 → `/playlists/user`
+  恒返回 `uid_unavailable`。
+- `proxy/app.py` `_netease_logged_in()`：误调用不存在的 `musicbox_client()`，
+  `NameError` 被自身 `except` 吞掉 → 代理**永远认为未登录** → mine/nrec/fm 这些
+  需登录口径在代理侧就全部不注入。
+
+两处均修复并补回归测试。排行榜/分类/新碟解析链路对照上游 NEMbox 0.5.3 源码逐一
+核验过形状一致（`fetch_toplists` 返回 `(name, id)` 对、`trackIds` 兼容 dict 列表）。
+
+### 3. 歌单顺序不固定 → 大类顺序可自定义
+
+原先每条注入歌单的 `createdAt/updatedAt` 都是 `int(time.time())`——同一秒的一堆
+相同时间戳，客户端非稳定排序下**每次刷新顺序都变**。现在注入头部统一盖
+**互不相同且递减**的时间戳（`stamp_display_order`），客户端无论升序/降序排都得到
+确定顺序；注册表 `ts` 同步，详情页与列表页语义一致。
+
+新增 `FNMUSIC_NETEASE_CHANNEL_ORDER`（管理页「歌单大类顺序」输入框）：各大类
+（含每日推荐）在飞牛歌单列表里的先后可自定义，漏写的按默认序排最后。
+
+### 4. 管理页保存配置后 fpk 应用闪退
+
+保存配置触发 stop→start，几秒到几十秒的窗口里 `cmd/main status` 返回 3（未运行），
+飞牛桌面据此回收本应用已打开的窗口——用户看到的就是「保存一次、闪退一次」。
+
+修复：新增**重启标记** `${PKGVAR}/restart.inprogress`。`restart_services.sh` /
+`config_callback` 在重启窗口内打标记（trap EXIT 兜底清理），`status.sh` 看到
+fresh 标记（≤300s，防 kill -9 留死标记）就继续报 running，窗口不再被收走。
+
+### 5. 启用扩展后开转码，本地音乐播放不了
+
+本地曲目转码链路（`/track/transcode` → `/track/hls/...`）经代理转发时有两处不透明：
+
+- **Host 头被剥掉**：`copy_incoming_headers` 排除了 `host`，httpx 于是发
+  `Host: unix`。官方后端在转码/HLS 链路里按请求 Host 拼绝对地址（m3u8 分片 URL），
+  拼出来的地址客户端连不上。不开转码的 `/track/stream` 用相对路径，所以平时看不出来。
+  现在原样透传 Host。
+- **30s 共享读超时**：官方后端处理 `/track/transcode` 要等 ffmpeg 产出首个 HLS
+  分片才应答，大文件（DSD/APE/FLAC）+ 慢磁盘时 30s 不够，超时把「能播」变 500。
+  现在播放链路（stream/hls/transcode）的本地转发读超时放宽到
+  `FNMUSIC_PLAYBACK_FORWARD_TIMEOUT_S`（默认 300s），且上游超时/传输错误
+  改答 504/502 而不是裸 500。
+
+### 测试
+
+新增 24 个回归用例：.env 三源合并持久化（真实执行 setup.sh）、uid 解析与
+channels 自检、大类顺序与稳定时间戳、重启标记、Host 透传与本地转码全链路。
+全套 667 passed, 1 skipped。
+
 ## [2.3.0] - 2026-09-12
 
 按飞牛的「音质偏好」（WiFi 用原始/标准、流量用原始/标准）**动态调整给网易云的音质档位**。

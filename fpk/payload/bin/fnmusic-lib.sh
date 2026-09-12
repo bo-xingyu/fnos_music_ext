@@ -472,3 +472,32 @@ lib_probe_proxy() {
         *) return 1 ;;
     esac
 }
+
+
+# ------------------------------------------------------------------------------
+# 重启标记：管理页保存配置后的「停代理 → 起代理」窗口里，应用状态会短暂变为
+# 未运行。飞牛桌面据此回收应用窗口/网关路由，用户看到的就是「保存即闪退」。
+# 有 fresh 标记时 status.sh 应继续报 running，窗口不再被收走。
+# ------------------------------------------------------------------------------
+
+RESTART_MARKER="${PKGVAR}/restart.inprogress"
+# 标记最大有效期（秒）：restart 脚本被 kill -9 留下死标记时，最多谎报这么久
+RESTART_MARKER_MAX_AGE="${FNMUSICEXT_RESTART_MARKER_MAX_AGE:-300}"
+
+lib_restart_marker_begin() {
+    mkdir -p "${PKGVAR}" 2>/dev/null || true
+    printf '%s\n' "$(date +%s)" > "${RESTART_MARKER}" 2>/dev/null || true
+}
+
+lib_restart_marker_end() {
+    rm -f "${RESTART_MARKER}" 2>/dev/null || true
+}
+
+lib_restart_in_progress() {
+    [ -f "${RESTART_MARKER}" ] || return 1
+    local mtime now age
+    mtime="$(stat -c %Y "${RESTART_MARKER}" 2>/dev/null || echo 0)"
+    now="$(date +%s)"
+    age=$(( now - mtime ))
+    [ "${age}" -ge 0 ] && [ "${age}" -le "${RESTART_MARKER_MAX_AGE}" ]
+}

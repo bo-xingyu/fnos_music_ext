@@ -46,6 +46,10 @@ CHANNELS: dict[str, dict[str, Any]] = {
 }
 DEFAULT_CHANNELS = "mine,toplist,category"
 
+# 大类展示顺序（v2.4）：飞牛歌单列表里各口径的先后由它决定，管理页可改。
+# 默认值同时是兜底序：未列出的口径按此顺序追加在末尾。
+DEFAULT_CHANNEL_ORDER = "daily,mine,nrec,toplist,category,newalbum,fm"
+
 _PREFIX_BY_CHANNEL = {"mine": "", "nrec": "推荐", "toplist": "榜",
                       "category": "", "newalbum": "新碟", "fm": "电台"}
 
@@ -54,12 +58,39 @@ def _flag(name: str, default: str) -> bool:
     return str(os.environ.get(name, default) or default).strip().lower() in ("1", "true", "yes", "on")
 
 
+def channel_order() -> tuple[str, ...]:
+    """全部口径的展示顺序（含 daily）。
+
+    解析 ``FNMUSIC_NETEASE_CHANNEL_ORDER``（逗号分隔的口径 key）：
+    按用户给的顺序排，漏掉的口径按默认序追加在末尾，未知 key 忽略。
+    任何解析异常都回落到默认序——顺序配置坏了不能让歌单列表整个消失。
+    """
+    raw = (os.environ.get("FNMUSIC_NETEASE_CHANNEL_ORDER") or "").strip()
+    ordered: list[str] = []
+    if raw:
+        for part in raw.replace(";", ",").split(","):
+            key = part.strip().lower()
+            if key in CHANNELS and key not in ordered:
+                ordered.append(key)
+    for key in DEFAULT_CHANNEL_ORDER.split(","):
+        if key not in ordered:
+            ordered.append(key)
+    return tuple(ordered)
+
+
+def rank_of(channel: str) -> int:
+    try:
+        return channel_order().index(channel)
+    except ValueError:
+        return len(CHANNELS)
+
+
 def channels_enabled() -> tuple[str, ...]:
     """管理页勾选的口径。除 daily 外都在这里生效；daily 由 recommend.py 单独控制。
 
-    一律按 CHANNEL_KEYS 的**规范顺序**输出，而不是用户勾选的先后顺序：
-    飞牛歌单列表里的顺序必须稳定，不能因为用户先勾了排行榜就跑到我的歌单前面去。
-    这也与管理页 `_as_channels` 校验器的排序保持一致，两边看同一份顺序。
+    输出按 ``channel_order()`` 的**用户自定义顺序**排列（默认即规范顺序）——
+    飞牛歌单列表里的顺序由此决定，且必须稳定：不能因为用户先勾了排行榜
+    就跑到我的歌单前面去。
     """
     raw = (os.environ.get("FNMUSIC_NETEASE_CHANNELS") or "").strip()
     if not raw:
@@ -68,7 +99,7 @@ def channels_enabled() -> tuple[str, ...]:
         # 所以空值只可能是手工改出来的；此时回落到默认比让所有歌单凭空消失更合理。
         raw = DEFAULT_CHANNELS
     picked = {str(part).strip().lower() for part in raw.split(",")}
-    return tuple(k for k in CHANNELS if k != "daily" and k in picked)
+    return tuple(k for k in channel_order() if k != "daily" and k in picked)
 
 
 def channel_limit() -> int:
@@ -378,6 +409,38 @@ async def collect_records(client, logged_in: bool) -> tuple[list[dict], set[str]
     if not logged_in:
         complete = False
     return uniq, seen, complete
+
+
+def stamp_display_order(items: list[dict]) -> list[dict]:
+    """给最终注入顺序里的条目盖上**互不相同且单调递减**的 createdAt/updatedAt。
+
+    飞牛客户端会按 updatedAt 对歌单列表排序，而原先每条记录的时间都是
+    ``int(time.time())`` —— 同一秒内的一堆完全相同的时间戳，遇上客户端的
+    非稳定排序就是每次刷新都换一个顺序（用户看到的「顺序不固定」）。
+    现在按注入位置依次减一秒：客户端无论按 updatedAt 升序还是降序排，
+    得到的都是**确定**的顺序（降序=注入序，升序=严格反序），不再随机。
+
+    就地修改并返回同一列表。注册表里的 ts 同步更新：playlist/detail 与
+    batch-detail 回显的 createdAt/updatedAt 取的就是它，两处必须一致，
+    否则详情页与列表页的顺序语义打架。
+    """
+    now = int(time.time())
+    reg = load_registry()
+    dirty = False
+    for i, it in enumerate(items):
+        ts = now - i
+        it["createdAt"] = ts
+        it["updatedAt"] = ts
+        guid = str(it.get("guid") or "")
+        entry = reg.get(guid)
+        if guid and isinstance(entry, dict) and entry.get("ts") != ts:
+            entry["ts"] = ts
+            dirty = True
+    if dirty:
+        global _registry_cache
+        _registry_cache = reg
+        save_registry()
+    return items
 
 
 # ---------------------------------------------------------------------------

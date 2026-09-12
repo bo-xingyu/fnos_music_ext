@@ -41,6 +41,10 @@ need "setup.sh" || exit 1
 need "start.sh" || exit 1
 need "stop.sh" || exit 1
 
+# 配置回调阶段应用必然已安装，可以安全 source 共享库（用重启标记防桌面闪退）
+# shellcheck source=../payload/bin/fnmusic-lib.sh
+. "${BIN}/fnmusic-lib.sh"
+
 log_file="${PKGVAR}/logs/config.log"
 mkdir -p "$(dirname "${log_file}")" 2>/dev/null
 {
@@ -54,8 +58,12 @@ if ! FNMUSICEXT_REBUILD_VENV=false bash "${BIN}/setup.sh" >> "${log_file}" 2>&1;
     exit 1
 fi
 
-# 重启以加载新配置（配置里的 PushPlus token 等只在进程启动时读取）
+# 重启以加载新配置（配置里的 PushPlus token 等只在进程启动时读取）。
+# 打重启标记：stop→start 窗口内 status 继续报 running，
+# 飞牛桌面不会因此回收本应用已打开的窗口（「保存即闪退」）。
 bash "${BIN}/stop.sh" >> "${log_file}" 2>&1
+lib_restart_marker_begin
+trap 'lib_restart_marker_end' EXIT INT TERM
 if bash "${BIN}/start.sh" >> "${log_file}" 2>&1; then
     echo "[fnmusic-ext] 配置已更新并重启生效。"
     exit 0

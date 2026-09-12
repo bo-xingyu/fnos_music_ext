@@ -37,6 +37,8 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_NETEASE_CHANNELS", "mine,toplist,category"),
     ("FNMUSIC_NETEASE_CHANNEL_LIMIT", "8"),
     ("FNMUSIC_NETEASE_CATEGORY", "华语"),
+    # 歌单大类展示顺序（v2.4）：列表里各口径的先后，管理页可改
+    ("FNMUSIC_NETEASE_CHANNEL_ORDER", "daily,mine,nrec,toplist,category,newalbum,fm"),
     ("FNMUSIC_PLAYLIST_TRACK_LIMIT", "300"),
     ("FNMUSIC_PLAYLIST_CACHE_DIR", ""),
     # --- 收藏归档与红心同步（v2.2 新增）---

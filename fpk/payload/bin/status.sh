@@ -14,6 +14,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${SCRIPT_DIR}/fnmusic-lib.sh"
 
 main() {
+    # 重启窗口（管理页保存配置触发的 stop→start）不算停机：
+    # 飞牛桌面看到「未运行」会立刻回收应用窗口，用户表现为「保存即闪退」。
+    if lib_restart_in_progress; then
+        echo "running: 配置重启进行中（最多 ${RESTART_MARKER_MAX_AGE}s），窗口保持可用" >&2
+        exit 0
+    fi
+
     if ! lib_pid_alive "${PROXY_PID}"; then
         rm -f "${PROXY_PID}" 2>/dev/null
         echo "not running: 代理进程不存在" >&2

@@ -235,6 +235,22 @@ curl -s http://127.0.0.1:8770/api/v1/auth/detail
 | `FNMUSIC_DAILY_ENABLED` | `true` | 是否抓取网易云官方「每日推荐」（需登录） |
 | `FNMUSIC_DAILY_LIMIT` | `20` | 每日推荐曲目数 |
 
+### 更多口径歌单（v2.2+）
+
+| 配置项 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `FNMUSIC_NETEASE_CHANNELS` | `mine,toplist,category` | 注入哪些口径（mine=我的歌单 nrec=推荐歌单 toplist=排行榜 category=分类歌单 newalbum=新碟上架 fm=私人FM） |
+| `FNMUSIC_NETEASE_CHANNEL_ORDER` | `daily,mine,nrec,toplist,category,newalbum,fm` | 各大类在飞牛歌单列表里的展示顺序（v2.4，管理页可改；没列出的排最后） |
+| `FNMUSIC_NETEASE_CHANNEL_LIMIT` | `8` | 每个口径最多注入几个歌单 |
+| `FNMUSIC_NETEASE_CATEGORY` | `华语` | 分类歌单的分类名 |
+| `FNMUSIC_PLAYLIST_TRACK_LIMIT` | `300` | 点开歌单时最多解析多少首 |
+
+### 播放链路（v2.4）
+
+| 配置项 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `FNMUSIC_PLAYBACK_FORWARD_TIMEOUT_S` | `300` | 本地曲目 stream/HLS/转码请求转发给官方后端的读超时（秒）。转码要等 ffmpeg 产出首分片，默认共享 30s 不够 |
+
 ### PushPlus 推送提醒
 
 | 配置项 | 默认值 | 说明 |

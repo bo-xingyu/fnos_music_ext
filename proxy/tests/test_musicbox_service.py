@@ -1780,3 +1780,41 @@ def test_best_quality_survives_eapi_explosion(monkeypatch):
         "上游没回 level 时回落到请求档位，不能因为字段缺失就丢掉这条直链"
     )
     assert calls["weapi"] == 1, "eapi 炸了应走 weapi 降级"
+
+
+# ---------------------------------------------------------------------------
+# 回归：/api/v1/playlists/user 的 uid 自动解析（v2.4 修复）
+#
+# v2.2.0 把 import 改成 `auth_detail as ne_auth_detail` 时漏改了两处调用点，
+# NameError 被外层 except 吞掉 → uid 恒为 0 → 恒返回 uid_unavailable，
+# 用户表现为「我的歌单（自建+收藏）一颗都不同步」。这里同时覆盖两个入口：
+# /playlists/user 端点与 channels/selftest 的 user_playlists 探针。
+# ---------------------------------------------------------------------------
+
+def test_playlists_user_resolves_uid_from_auth_detail(monkeypatch):
+    """uid 缺省时必须能从登录态详情解析出账号 id。"""
+    monkeypatch.setattr(mb_app, "ne_check_is_logged_in", lambda: True)
+    monkeypatch.setattr(mb_app, "ne_auth_detail",
+                        lambda: {"logged_in": True, "user_id": "10086", "nickname": "u"})
+    monkeypatch.setattr(mb_app, "ne_user_playlists",
+                        lambda uid, offset=0, limit=50:
+                        [{"playlist_id": uid, "name": "我的歌单", "cover_url": "",
+                          "track_count": 3, "subscribed": False}])
+    with TestClient(app) as client:
+        data = client.get("/api/v1/playlists/user", params={"limit": 100}).json()
+    assert data["ok"] is True, f"不该再报 uid_unavailable: {data}"
+    assert data["uid"] == 10086
+    assert data["data"][0]["playlist_id"] == 10086
+
+
+def test_channels_selftest_user_playlists_probe(monkeypatch):
+    monkeypatch.setattr(mb_app, "ne_check_is_logged_in", lambda: True)
+    monkeypatch.setattr(mb_app, "ne_auth_detail",
+                        lambda: {"logged_in": True, "user_id": "10086"})
+    monkeypatch.setattr(mb_app, "ne_user_playlists",
+                        lambda uid, offset=0, limit=50: [{"playlist_id": uid, "name": "x"}])
+    with TestClient(app) as client:
+        data = client.get("/api/v1/channels/selftest").json()
+    probe = data["data"]["user_playlists"]
+    assert probe.get("ok") is True, f"探针不该因 NameError 失败: {probe}"
+    assert probe["count"] == 1
