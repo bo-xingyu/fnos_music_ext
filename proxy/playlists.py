@@ -21,6 +21,7 @@ guid 规范（都在 ``online:playlist:`` 命名空间下，与曲目 guid ``onl
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -625,23 +626,40 @@ async def fetch_channel_records(client, channel: str, logged_in: bool) -> list[d
 async def collect_records(client, logged_in: bool) -> tuple[list[dict], set[str], bool]:
     """按勾选顺序汇总全部口径。任一口径异常只影响它自己。
 
+    各口径**并发**拉取（原先逐个 await，歌单列表页要等所有口径的跨洋往返
+    串行加完）。NEMbox 侧仍有全局锁，上游调用本身不会真并发，但 HTTP
+    与解析开销得以重叠，列表页尾延迟从「各口径之和」降到「最慢一个」。
+
     返回 ``(清单, guid 集合, complete)``。``complete`` 表示「这份清单可信到足以据此
     清理注册表」：未登录或有口径抛异常时为 False —— 那种情况下清单必然不完整，
     若仍拿它去做 forget_stale，会把暂时没取到的条目（连同名字与封面）一并抹掉，
     用户只是掉线一次就得重新等所有歌单刷新。
     """
-    records: list[dict] = []
-    complete = True
-    for ch in channels_enabled():
+    enabled = channels_enabled()
+    todo: list[str] = []
+    for ch in enabled:
         spec = CHANNELS.get(ch) or {}
         if spec.get("needs_login") and not logged_in:
             # 需登录的口径缺席是**正常**的，不代表清单不可信
             continue
+        todo.append(ch)
+
+    async def _fetch_one(channel: str) -> "list[dict] | None":
         try:
-            records.extend(await fetch_channel_records(client, ch, logged_in))
+            return await fetch_channel_records(client, channel, logged_in)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("channel %s failed: %s: %s", ch, type(exc).__name__, exc)
+            logger.warning("channel %s failed: %s: %s", channel, type(exc).__name__, exc)
+            return None
+
+    results = await asyncio.gather(*[_fetch_one(ch) for ch in todo]) if todo else []
+
+    records: list[dict] = []
+    complete = True
+    for channel, rows in zip(todo, results):
+        if rows is None:
             complete = False
+        else:
+            records.extend(rows)
     # guid 去重（不同口径可能给出同一个网易云歌单，例如账户歌单同时也在推荐里）
     seen: set[str] = set()
     uniq: list[dict] = []
@@ -767,8 +785,14 @@ async def resolve_track_items(
         items.append(item)
         song_ids.append(sid)
     if items and enrich is not None:
-        await enrich(client, items)
-        items = [it for it in items if str(it.get("id") or "") in set(song_ids)]
+        # 只补**缺封面**的条目：musicbox 的歌单曲目端点返回的 song_info 已带
+        # album_pic_url（map_netease_song 会直读），全都有封面时这次 enrich
+        # 纯属浪费——上游要做 songs_detail + songs_url 两次往返，正是
+        # 「打开歌单/榜单 5~8 秒」的主要构成之一。
+        missing = [it for it in items if not str(it.get("cover_url") or "").strip()]
+        if missing:
+            await enrich(client, missing)
+            items = [it for it in items if str(it.get("id") or "") in set(song_ids)]
 
     # 实际可播数量回填注册表，让列表上的曲目数是真实值而不是上游的 trackCount
     reg = lookup(guid)

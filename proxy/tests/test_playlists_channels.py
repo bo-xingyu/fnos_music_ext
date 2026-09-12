@@ -294,6 +294,86 @@ async def test_resolve_track_items_tolerates_upstream_failure(registry_dir):
                                        netease_items.map_netease_song, None) == []
 
 
+@pytest.mark.anyio
+async def test_resolve_track_items_skips_enrich_when_covers_present(registry_dir):
+    """v2.7：曲目自带封面（song_info 的 album_pic_url）时不再走 enrich。
+
+    enrich 在上游要做 songs_detail + songs_url 两次跨洋往返，是
+    「打开歌单/榜单 5~8 秒」的主要构成之一；封面齐全时跳过它。
+    """
+    from proxy import netease_items
+
+    rows = [{"song_id": i, "song_name": f"歌{i}", "artist": "A", "album_name": "",
+             "duration": 200, "quality": "HD 320k", "album_pic_url": f"https://p1.music.126.net/{i}.jpg"}
+            for i in range(1, 4)]
+    c = _FakeClient({"/api/v1/playlist/11/tracks": {"ok": True, "data": rows}})
+    calls = {"enrich": 0}
+
+    async def enrich_spy(client, items):
+        calls["enrich"] += 1
+
+    items = await pl.resolve_track_items(c, "online:playlist:ne:11",
+                                        netease_items.map_netease_song, enrich_spy)
+    assert len(items) == 3
+    assert calls["enrich"] == 0, "封面齐全时不应再打 enrich（上游两次往返）"
+    assert all(str(it.get("cover_url") or "").endswith(".jpg") for it in items)
+
+    # 只要有一条缺封面，仍必须补齐（只补缺的那部分）
+    rows[1]["album_pic_url"] = ""
+    c2 = _FakeClient({"/api/v1/playlist/11/tracks": {"ok": True, "data": rows}})
+    items2 = await pl.resolve_track_items(c2, "online:playlist:ne:11",
+                                         netease_items.map_netease_song, enrich_spy)
+    assert calls["enrich"] == 1
+    assert len(items2) == 3
+
+
+@pytest.mark.anyio
+async def test_channel_records_cache_hit_and_stale_refresh(monkeypatch):
+    """v2.7 口径清单短缓存：TTL 内零上游；过期先回旧值再后台刷新。"""
+    import asyncio
+    import time as _time
+
+    from proxy import app as proxy_app
+
+    calls = {"n": 0}
+
+    async def fake_collect(client, logged_in):
+        calls["n"] += 1
+        return ([{"guid": "online:playlist:ne:1", "name": "榜｜飙升榜", "channel": "toplist"}],
+                {"online:playlist:ne:1"}, True)
+
+    async def fake_logged_in():
+        return True
+
+    monkeypatch.setattr(pl, "collect_records", fake_collect)
+    monkeypatch.setattr(proxy_app, "_netease_logged_in", fake_logged_in)
+
+    class _Client:
+        pass
+
+    recs, keep, complete = await proxy_app._channel_playlist_records(_Client())
+    assert calls["n"] == 1
+    assert complete is True
+
+    # TTL 内命中缓存：不再拉上游
+    recs2, _, _ = await proxy_app._channel_playlist_records(_Client())
+    assert calls["n"] == 1
+    assert recs2 == recs
+
+    # 过期：先返回旧值（列表页要快），后台单飞刷新
+    key = proxy_app._channel_recs_cache_key()
+    proxy_app._channel_recs_cache[key]["ts"] = (
+        _time.time() - proxy_app._CHANNEL_LIST_CACHE_TTL - 1)
+    recs3, _, _ = await proxy_app._channel_playlist_records(_Client())
+    assert calls["n"] == 1, "过期路径必须先返回旧值"
+    assert recs3 == recs
+    for _ in range(50):
+        if calls["n"] >= 2:
+            break
+        await asyncio.sleep(0.02)
+    assert calls["n"] == 2, "后台刷新必须真正执行"
+
+
 # ===========================================================================
 # v2.4：歌单大类顺序自定义 + 稳定时间戳
 # ===========================================================================

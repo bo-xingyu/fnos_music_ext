@@ -371,10 +371,13 @@ async def test_resolve_netease_url_uses_dynamic_quality(monkeypatch):
     assert seen[0] == "standard", "流量场景必须按策略要低档，而不是固定 lossless"
 
     seen.clear()
+    from proxy.app import _URL_CACHE  # v2.7 直链短缓存：换档位验证前先清，避免命中旧链
+    _URL_CACHE.clear()
     await resolve_netease_url(client, "1", _fake_request(headers={"networkType": "wifi"}))
     assert seen[0] == "hires"
 
     seen.clear()
+    _URL_CACHE.clear()
     await resolve_netease_url(client, "1")
     assert seen[0] == "hires", "不传 request 时按 WiFi 档，行为与旧版一致"
     await client.aclose()

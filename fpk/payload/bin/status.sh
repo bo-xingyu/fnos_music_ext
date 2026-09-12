@@ -28,7 +28,7 @@ main() {
     fi
 
     if ! lib_probe_proxy; then
-        echo "not running: 代理进程存在但未接管 ${TARGET_SOCK}" >&2
+        echo "not running: 代理进程存在但未接管 ${TARGET_SOCK}（官方后端可能重启过；看门狗会自动恢复）" >&2
         exit 3
     fi
 

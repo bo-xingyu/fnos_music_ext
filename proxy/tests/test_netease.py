@@ -1065,15 +1065,17 @@ async def test_resolve_online_lyric_netease(tmp_path, monkeypatch):
     scope = {"type": "http", "app": app}
     req_obj = StarletteRequest(scope)
 
-    # 首次调用：请求远端端点，拿到 lyric（保持原文不合并 tlyric），写入缓存
+    # 首次调用：请求远端端点，拿到 lyric（保持原文不合并 tlyric），写入缓存。
+    # v2.7 起 _online_info 会**并发**拉 info 与 lyric（首播提速），info 端点在本
+    # mock 里是 404，因此 lyric 端点会被补打一次：n==2 是预期，不是回归。
     text1 = await resolve_online_lyric(req_obj, "online:netease:186016")
     assert text1 == "[00:01.00]七里香歌词第一行\n[00:05.00]第二行"
-    assert lyric_calls["n"] == 1
+    assert lyric_calls["n"] == 2
 
     # 二次调用：命中本地缓存，不再请求远端
     text2 = await resolve_online_lyric(req_obj, "online:netease:186016")
     assert text2 == "[00:01.00]七里香歌词第一行\n[00:05.00]第二行"
-    assert lyric_calls["n"] == 1
+    assert lyric_calls["n"] == 2
 
     # 空歌词：不写缓存返回 ""
     text_empty = await resolve_online_lyric(req_obj, "online:netease:empty_song")

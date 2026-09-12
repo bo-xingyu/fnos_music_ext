@@ -700,6 +700,82 @@ def test_stream_cache_hit_never_touches_source(monkeypatch):
     assert not any(f.endswith(".part") for f in files)
 
 
+def test_stream_url_cache_reuse_and_stale_retry(monkeypatch):
+    """v2.7 播放直链短缓存：有效期内复用（不重取链）；缓存直链被 CDN 拒绝时
+    丢弃缓存、强制重取，拿到**不同**的新链才重试一次。"""
+    guid = "online:netease:334455"
+    audio = b"URL_CACHE_AUDIO_CONTENT" * 60
+    state = {"url": "http://cdn.test/old.mp3", "stale": False,
+             "resolve_calls": 0, "cdn_old_hits": 0}
+
+    def _musicbox(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/auth/detail":
+            return httpx.Response(
+                200, json={"ok": True, "data": {"logged_in": True, "nickname": "测试账号"}}
+            )
+        if path == "/api/v1/song/334455/info":
+            return httpx.Response(200, json={"ok": True, "data": _netease_song_info("334455")})
+        if path == "/api/v1/song/334455/lyric":
+            return httpx.Response(200, json={"ok": True, "data": {"lyric": "", "tlyric": ""}})
+        if path == "/api/v1/song/334455/url":
+            state["resolve_calls"] += 1
+            return httpx.Response(
+                200, json={"ok": True, "data": {"code": 200, "url": state["url"]}}
+            )
+        return httpx.Response(404, json={"ok": False})
+
+    def _cdn(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/old.mp3":
+            state["cdn_old_hits"] += 1
+            if state["stale"]:
+                return httpx.Response(403, text="expired url")
+        return httpx.Response(200, content=audio, headers={"Content-Type": "audio/mpeg"})
+
+    from proxy import netease_auth
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(500)), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_musicbox), base_url="http://127.0.0.1:8770"
+    )
+    netease_auth.invalidate_state()
+
+    orig_init = httpx.AsyncClient.__init__
+
+    def _mock_init(self, *args, **kwargs):
+        if "base_url" not in kwargs and not kwargs.get("transport"):
+            kwargs["transport"] = httpx.MockTransport(_cdn)
+        orig_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", _mock_init)
+
+    with TestClient(app) as client:
+        # 第一次播放（带非 0 起点的 Range，避免落盘缓存干扰验证）
+        resp = client.get(f"/music/api/v1/track/stream?guid={guid}",
+                          headers={"Range": "bytes=100-"})
+        assert resp.status_code == 200
+        assert resp.content == audio
+        assert state["resolve_calls"] == 1
+
+        # 第二次播放：直链仍在缓存有效期内，不应再取链
+        resp2 = client.get(f"/music/api/v1/track/stream?guid={guid}",
+                           headers={"Range": "bytes=100-"})
+        assert resp2.status_code == 200
+        assert state["resolve_calls"] == 1, "缓存有效期内复用直链，不重取"
+
+        # 模拟直链过期：musicbox 开始发新链，旧链 CDN 一律 403
+        state["url"] = "http://cdn.test/new.mp3"
+        state["stale"] = True
+        resp3 = client.get(f"/music/api/v1/track/stream?guid={guid}",
+                           headers={"Range": "bytes=100-"})
+        assert resp3.status_code == 200
+        assert resp3.content == audio, "缓存直链失效后必须重取新链并重试成功"
+        assert state["resolve_calls"] == 2
+        assert state["cdn_old_hits"] >= 1
+
+
 def test_stream_online_guid_range_0_1_safari_probe_no_cache(monkeypatch):
     """Safari 的 Range bytes=0-1 探测不产生任何缓存文件。"""
     probe_content = b"\x00\x01"
@@ -1926,3 +2002,76 @@ def test_merge_online_tracks_filters_unplayable_defense():
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# v2.7：tee 背压缓冲 + 客户端断开检测
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_tee_backpressure_and_client_gone_completion(monkeypatch):
+    """tee 内存安全三件事：
+
+    1. **背压**：队列上限 64 块（约 4MB）。消费端只取 1 块且不断开时，
+       下载端必须被卡住（不能把整首歌都堆进内存）；
+    2. **断开检测**：消费端断开后，下载端转「只写盘」模式继续下完；
+    3. **缓存完整**：断开场景下文件最终仍完整落盘曲库（下次播放直接秒开）。
+    """
+    import asyncio
+
+    from proxy.app import stream_tee_response
+
+    chunk_size = 65536
+    total_chunks = 200                      # ~12.5MB，远超 4MB 缓冲上限
+    produced = {"n": 0}
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        async def _gen():
+            for _ in range(total_chunks):
+                produced["n"] += 1
+                yield b"A" * chunk_size
+
+        return httpx.Response(
+            200,
+            content=_gen(),
+            headers={"Content-Type": "audio/mpeg",
+                     "Content-Length": str(total_chunks * chunk_size)},
+        )
+
+    cdn = httpx.AsyncClient(transport=httpx.MockTransport(_handler),
+                            base_url="http://cdn.test")
+    req = cdn.build_request("GET", "http://cdn.test/song.mp3")
+    resp = await cdn.send(req, stream=True)
+
+    response = stream_tee_response(
+        resp,
+        guid="online:netease:999001",
+        range_header=None,
+        client_to_close=cdn,
+        resolved_ext="mp3",
+        pre_info={"id": "netease:999001", "source": "netease", "title": "回声",
+                  "artist": "测试歌手", "album": "", "duration_s": 200,
+                  "ext": "mp3", "file_size": 0, "cover_url": "", "lyric": ""},
+    )
+
+    body = response.body_iterator
+    first = await body.__anext__()
+    assert first
+
+    # 1) 背压：消费端停在 1 块，下载端最多再拉满 64 块缓冲就必须暂停
+    await asyncio.sleep(0.3)
+    assert produced["n"] < total_chunks, (
+        f"无背压：已拉 {produced['n']} 块（上限应为 ~65 块）"
+    )
+
+    # 2) 客户端断开 → 下载端转入只写盘模式
+    await body.aclose()
+
+    # 3) 文件最终完整落盘（含 content-length 校验通过才会 rename 进曲库）
+    cache_file = os.path.join(CONF["library_dir"], "测试歌手 - 回声.mp3")
+    for _ in range(200):
+        if os.path.exists(cache_file):
+            break
+        await asyncio.sleep(0.05)
+    assert os.path.exists(cache_file), "断开后文件仍应完整落盘曲库"
+    assert os.path.getsize(cache_file) == total_chunks * chunk_size

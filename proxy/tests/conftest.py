@@ -44,11 +44,18 @@ def _reset_online_info_caches():
 
     这两份缓存是 2.1.7 为消掉重复上游往返而加的进程级 dict，不清会让
     「同 guid 第二次调用」静默命中上一个用例的数据，排查起来极其迷惑。
+    v2.7 新增的播放直链短缓存与口径清单缓存同理，一并复位。
     """
-    from proxy.app import _ONLINE_COVER_CACHE, _ONLINE_INFO_CACHE
+    from proxy import app as proxy_app
 
-    _ONLINE_INFO_CACHE.clear()
-    _ONLINE_COVER_CACHE.clear()
+    proxy_app._ONLINE_INFO_CACHE.clear()
+    proxy_app._ONLINE_COVER_CACHE.clear()
+    proxy_app._URL_CACHE.clear()
+    proxy_app._channel_recs_cache.clear()
+    for task in list(proxy_app._channel_recs_refresh.values()):
+        if task is not None and not task.done():
+            task.cancel()
+    proxy_app._channel_recs_refresh.clear()
 
 
 @pytest.fixture

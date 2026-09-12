@@ -53,11 +53,12 @@ fpk 走 `cmd/*` 生命周期，打包进去只会增加体积与审核困惑。
 
 | 文件 | 作用 |
 | :--- | :--- |
-| `fnmusic-lib.sh` | 共享函数：路径常量、日志、`TRIM_TEMP_LOGFILE` 错误上报、PID 管理、HTTP 探活、降权执行、后台守护启动 |
+| `fnmusic-lib.sh` | 共享函数：路径常量、日志、`TRIM_TEMP_LOGFILE` 错误上报、PID 管理、HTTP 探活、降权执行、后台守护启动、停机标志 |
 | `setup.sh` | 把载荷 stage 到 `$TRIM_PKGVAR/app`、建 venv 装依赖、按向导值生成 `.env`（0600）。幂等 |
-| `start.sh` | 先起音源服务（降权），再接管 socket 起代理（root） |
-| `stop.sh` | 停管理页面 → 停代理 → 还原 socket → 停音源服务 |
+| `start.sh` | 先起音源服务（降权），再接管 socket 起代理（root）；清理"活着但接管丢失"的僵尸代理；起看门狗 |
+| `stop.sh` | 落主动停机标志 → 停看门狗 → 停管理页面 → 停代理 → 还原 socket → 停音源服务 |
 | `status.sh` | 运行中 exit 0，未运行 exit 3 |
+| `watchdog.sh` | 看门狗（v2.7）：代理死亡 / socket 接管丢失（官方后端重启会重绑 `trim_music.socket`）/ musicbox 死亡时自动调 `start.sh` 幂等恢复；`FNMUSIC_WATCHDOG_INTERVAL_S=0` 关闭 |
 | `restart_services.sh` | 只重启代理与音源服务，**不动管理页面进程**（见下） |
 
 ### 为什么 stage 到 `$TRIM_PKGVAR/app` 而不是就地运行 `$TRIM_APPDEST`
@@ -90,6 +91,7 @@ fpk 走 `cmd/*` 生命周期，打包进去只会增加体积与审核困惑。
 | 生命周期脚本 `cmd/*` | root | 官方文档允许：「只有生命周期脚本确实需要执行特权准备任务时才使用 Root 模式」 |
 | 代理 `proxy/app.py` | root | 必须在 `/var/run` 下创建 bind socket，无法降权 |
 | 管理页面 `proxy/admin_ui.py` | root | 要写入 root 代理读取的 `.env`，并调用需要 root 的重启脚本 |
+| 看门狗 `bin/watchdog.sh` | root | 要调用 `start.sh`（其中的代理必须 root）；纯本地 sleep 循环，不监听任何端口 |
 | 音源服务 `musicbox-service` | **`$TRIM_USERNAME`（专用包用户）** | 仅监听 unix/TCP 私有端点、读写自有数据目录，完全满足官方「长期运行且对外提供访问的进程应尽量非 root」 |
 
 管理页面虽然以 root 跑，但**对外不开放任何端口**：它只监听 `${TRIM_APPDEST}/ui.sock`，

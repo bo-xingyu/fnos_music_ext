@@ -107,8 +107,13 @@ verify_official() {
 
 main() {
     lib_log "=== stop 开始 ==="
-    # 0. 先停管理页面：它可能会调用 restart_services.sh，先断掉这条路径，
-    #    避免停机过程中页面又发起一次重启造成竞争
+    # 0. 先落「主动停机」标志并停看门狗：看门狗的职责是把死掉的服务拉起来，
+    #    主动停机时必须让它先闭嘴，否则刚停完 30s 内又被原样拉回来。
+    #    标志由下一次 start.sh 清除（看门狗发起的 start 见到标志会直接放弃）。
+    lib_stopped_flag_mark
+    lib_stop_pid "watchdog" "${WATCHDOG_PID}" 5
+    # 0.5 再停管理页面：它可能会调用 restart_services.sh，先断掉这条路径，
+    #     避免停机过程中页面又发起一次重启造成竞争
     lib_stop_pid "ui" "${UI_PID}" 10
     # pidfile 可能因启动竞态丢失，按 socket 路径精确兜底清理，杜绝孤儿进程
     lib_kill_stale_by_sock "${UI_SOCK}"

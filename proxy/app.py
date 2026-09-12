@@ -1262,6 +1262,48 @@ async def _enrich_netease_items(client: httpx.AsyncClient, items: list[dict]) ->
 
 
 
+# ---------------------------------------------------------------------------
+# 播放直链短缓存（v2.7）：网易云 CDN 直链自获取起约有 20 分钟有效期，
+# 同一首歌短时间内重复播放（上一首/下一首切回、seek 重连、多端同曲）时
+# 完全可以复用，省掉 resolve 的两次上游往返，也减少与歌单预热在
+# musicbox 全局锁上的争抢。默认 600s，0 = 关闭。
+# ---------------------------------------------------------------------------
+_URL_CACHE_TTL = _float("FNMUSIC_URL_CACHE_TTL", 600.0)
+_URL_CACHE_MAX = int(os.environ.get("FNMUSIC_URL_CACHE_MAX", "1000") or 1000)
+_URL_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def _url_cache_get(song_id: str, level: str) -> str | None:
+    if _URL_CACHE_TTL <= 0:
+        return None
+    hit = _URL_CACHE.get(f"{song_id}:{level}")
+    if hit and (time.time() - hit[0]) < _URL_CACHE_TTL:
+        return hit[1]
+    return None
+
+
+def _url_cache_put(song_id: str, level: str, url: str) -> None:
+    if _URL_CACHE_TTL <= 0 or not url:
+        return
+    key = f"{song_id}:{level}"
+    _URL_CACHE[key] = (time.time(), url)
+    if len(_URL_CACHE) > _URL_CACHE_MAX:
+        for k in sorted(_URL_CACHE, key=lambda kk: _URL_CACHE[kk][0])[: max(1, _URL_CACHE_MAX // 2)]:
+            _URL_CACHE.pop(k, None)
+
+
+def _url_cache_drop_song(song_id: str) -> None:
+    prefix = f"{song_id}:"
+    for k in [k for k in _URL_CACHE if k.startswith(prefix)]:
+        _URL_CACHE.pop(k, None)
+
+
+def invalidate_url_cache() -> int:
+    n = len(_URL_CACHE)
+    _URL_CACHE.clear()
+    return n
+
+
 async def resolve_netease_url(client: httpx.AsyncClient, song_id: str,
                               request: Request | None = None) -> str | None:
     """取播放直链。音质档位**按本次请求动态决定**（见 proxy/quality.py）。
@@ -1280,6 +1322,12 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str,
     if "exhigh" not in qualities:
         qualities.append("exhigh")
 
+    # 短缓存命中：直链还在有效期内，直接复用（省一次 musicbox + 网易云往返）
+    for q in qualities:
+        cached = _url_cache_get(song_id, q)
+        if cached:
+            return cached
+
     for q in qualities:
         try:
             r = await client.get(f"/api/v1/song/{song_id}/url", params={"quality": q}, timeout=10.0)
@@ -1291,6 +1339,7 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str,
                         code = inner.get("code")
                         url = inner.get("url")
                         if code == 200 and url:
+                            _url_cache_put(song_id, q, str(url))
                             return str(url)
         except Exception as e:
             logger.warning("resolve_netease_url error for %s (quality=%s): %s: %s",
@@ -1681,9 +1730,17 @@ async def ext_cache_invalidate():
 
     netease_auth.invalidate_state()
     purged_info = invalidate_online_info_cache()
+    purged_urls = invalidate_url_cache()
+    purged_channel_lists = len(_channel_recs_cache)
+    _channel_recs_cache.clear()
+    for task in list(_channel_recs_refresh.values()):
+        if task is not None and not task.done():
+            task.cancel()
+    _channel_recs_refresh.clear()
     logger.info(
-        "cache invalidated: search=%d daily_tasks=%d daily_files=%d info=%d login_state=reset",
-        dropped_search, daily_tasks, purged_daily, purged_info,
+        "cache invalidated: search=%d daily_tasks=%d daily_files=%d info=%d urls=%d channel_lists=%d login_state=reset",
+        dropped_search, daily_tasks, purged_daily, purged_info, purged_urls,
+        purged_channel_lists,
     )
     return {
         "ok": True,
@@ -1692,6 +1749,8 @@ async def ext_cache_invalidate():
             "daily_tasks": daily_tasks,
             "daily_cache_files": purged_daily,
             "online_info_entries": purged_info,
+            "play_urls": purged_urls,
+            "channel_lists": purged_channel_lists,
             "login_state": True,
         },
     }
@@ -2076,18 +2135,49 @@ def stream_tee_response(
         if pre_info is None and coro_factory is not None:
             info_task = asyncio.create_task(coro_factory())
 
-        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        # 背压缓冲（v2.7）：原先队列无界——NAS 从 CDN 下载通常远快于客户端消费，
+        # 慢客户端一首无损能整个堆在内存里；快速切歌时多个被放弃的流各占
+        # 一整首歌的内存，叠加后足以把代理进程推入 OOM（应用「异常退出」的
+        # 候选根因之一）。现在入队满 64 块（约 4MB）就暂停拉取，TCP 背压自然
+        # 传导给 CDN；客户端断开时转「只写盘」模式把文件下完（保住缓存），
+        # 不再往一个没人消费的队列里堆数据。
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
+        client_gone = asyncio.Event()
+
+        async def _enqueue(chunk: "bytes | None") -> bool:
+            """入队；客户端已断开时返回 False（调用方应停止入队）。"""
+            if client_gone.is_set():
+                return False
+            try:
+                queue.put_nowait(chunk)
+                return True
+            except asyncio.QueueFull:
+                put_fut: asyncio.Future = asyncio.ensure_future(queue.put(chunk))
+                gone_fut: asyncio.Future = asyncio.ensure_future(client_gone.wait())
+                done, _pending = await asyncio.wait(
+                    {put_fut, gone_fut}, return_when=asyncio.FIRST_COMPLETED)
+                if put_fut.done() and not put_fut.cancelled():
+                    gone_fut.cancel()
+                    return True
+                put_fut.cancel()
+                return False
 
         async def _downloader():
             written = 0
             part_file = None
+            abandoned = False
             try:
                 part_file = open(part_path, "wb")
                 async for chunk in resp.aiter_bytes():
-                    if chunk:
-                        part_file.write(chunk)
-                        written += len(chunk)
-                        await queue.put(chunk)
+                    if not chunk:
+                        continue
+                    part_file.write(chunk)
+                    written += len(chunk)
+                    if not abandoned and not await _enqueue(chunk):
+                        abandoned = True
+                        logger.info(
+                            "tee client gone for %s, continuing disk-only download for cache",
+                            guid)
             except Exception as e:
                 logger.warning("tee download failed for %s: %s", guid, e)
             finally:
@@ -2099,6 +2189,12 @@ def stream_tee_response(
                 await resp.aclose()
                 if client_to_close:
                     await client_to_close.aclose()
+                if not abandoned:
+                    # 正常路径：通知消费端下载结束（客户端已断开时无须通知）
+                    try:
+                        await _enqueue(None)
+                    except Exception:
+                        pass
                 info: dict | None = pre_info
                 if info is None and info_task:
                     try:
@@ -2131,16 +2227,19 @@ def stream_tee_response(
                         os.remove(part_path)
                     except Exception:
                         pass
-                await queue.put(None)
 
         dl_task = asyncio.create_task(_downloader())
 
         async def stream_tee() -> AsyncGenerator[bytes, None]:
-            while True:
-                chunk = await queue.get()
-                if chunk is None:
-                    break
-                yield chunk
+            try:
+                while True:
+                    chunk = await queue.get()
+                    if chunk is None:
+                        break
+                    yield chunk
+            finally:
+                # 客户端断开/取消：通知下载端停止入队（它会转入只写盘模式）
+                client_gone.set()
 
         return StreamingResponse(stream_tee(), status_code=status_code, headers=out_headers)
 
@@ -2210,19 +2309,35 @@ async def stream_track(request: Request):
     if range_header:
         req_headers["Range"] = range_header
 
-    stream_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-    try:
-        stream_req = stream_client.build_request("GET", play_url, headers=req_headers)
-        resp = await stream_client.send(stream_req, stream=True)
-        content_type = (resp.headers.get("content-type") or "").lower()
-        if resp.status_code >= 400 or "text/html" in content_type:
-            await resp.aclose()
+    async def _open_cdn(url: str) -> tuple[httpx.Response | None, httpx.AsyncClient | None]:
+        """连网易云 CDN 取流。失败返回 (None, None)（客户端已自行关闭）。"""
+        stream_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        try:
+            stream_req = stream_client.build_request("GET", url, headers=req_headers)
+            resp = await stream_client.send(stream_req, stream=True)
+            content_type = (resp.headers.get("content-type") or "").lower()
+            if resp.status_code >= 400 or "text/html" in content_type:
+                await resp.aclose()
+                await stream_client.aclose()
+                return None, None
+            return resp, stream_client
+        except Exception as e:
+            logger.warning("Failed to stream netease url for %s: %s", guid, e)
             await stream_client.aclose()
+            return None, None
+
+    resp, stream_client = await _open_cdn(play_url)
+    if resp is None:
+        # 直链失效兜底：命中的可能是短缓存里的旧链（CDN 已过期/403）。
+        # 丢弃该歌曲的全部缓存直链、强制重取一次；拿到**不同的**新链才重试。
+        _url_cache_drop_song(song_id)
+        fresh_url = await resolve_netease_url(musicbox_client, song_id, request)
+        if fresh_url and fresh_url != play_url:
+            logger.info("netease url stale for %s, retrying with fresh url", guid)
+            play_url = fresh_url
+            resp, stream_client = await _open_cdn(play_url)
+        if resp is None:
             return _online_unavailable()
-    except Exception as e:
-        logger.warning("Failed to stream netease url for %s: %s", guid, e)
-        await stream_client.aclose()
-        return _online_unavailable()
 
     return stream_tee_response(
         resp,
@@ -2419,7 +2534,14 @@ async def _online_info(request: Request, guid: str) -> dict | None:
 
     musicbox_client = get_musicbox_client(request.app)
     try:
-        r = await musicbox_client.get(f"/api/v1/song/{song_id}/info", timeout=10.0)
+        # info 与 lyric 并发拉取（原先串行，首播一首歌要付两次跨洋往返的加和）
+        r, lr = await asyncio.gather(
+            musicbox_client.get(f"/api/v1/song/{song_id}/info", timeout=10.0),
+            musicbox_client.get(f"/api/v1/song/{song_id}/lyric", timeout=10.0),
+            return_exceptions=True,
+        )
+        if isinstance(r, Exception):
+            raise r
         if r.status_code != 200:
             return None
         res_data = r.json()
@@ -2460,17 +2582,20 @@ async def _online_info(request: Request, guid: str) -> dict | None:
         file_size = int(size_obj.get("size", 0) or 0) if isinstance(size_obj, dict) else 0
 
         lyric_text = ""
-        try:
-            lr = await musicbox_client.get(f"/api/v1/song/{song_id}/lyric", timeout=10.0)
-            if lr.status_code == 200:
-                l_res = lr.json()
-                if isinstance(l_res, dict) and l_res.get("ok") is not False:
-                    l_data = l_res.get("data")
-                    if isinstance(l_data, dict):
-                        lyric_text = str(l_data.get("lyric") or "").strip()
-        except Exception as l_err:
+        if isinstance(lr, Exception):
             logger.warning("musicbox lyric fetch in _online_info failed for %s: %s: %s",
-                         guid, type(l_err).__name__, l_err)
+                           guid, type(lr).__name__, lr)
+        else:
+            try:
+                if lr.status_code == 200:
+                    l_res = lr.json()
+                    if isinstance(l_res, dict) and l_res.get("ok") is not False:
+                        l_data = l_res.get("data")
+                        if isinstance(l_data, dict):
+                            lyric_text = str(l_data.get("lyric") or "").strip()
+            except Exception as l_err:
+                logger.warning("musicbox lyric parse in _online_info failed for %s: %s: %s",
+                               guid, type(l_err).__name__, l_err)
 
         record = {
             "id": f"{NETEASE_SOURCE}:{song_id}",
@@ -3104,10 +3229,72 @@ async def _netease_logged_in() -> bool:
         return False
 
 
-async def _channel_playlist_records(client) -> tuple[list[dict], set[str], bool]:
-    """按管理页勾选的口径拉取要注入的伪歌单清单。"""
+# ---------------------------------------------------------------------------
+# 口径清单短缓存（v2.7）：playlist_list / preview 共用。
+#
+# 每次打开飞牛歌单列表都要拉一遍全部启用口径（toplists / category / mine…），
+# 各自一次跨洋往返，快慢取决于网易云当时的抖动——这正是「榜单打开速度不稳定」
+# 的来源。清单内容（榜单名/封面/曲目数）本身变化极慢，缓存 + 过期后台刷新
+# （stale-while-revalidate）后：TTL 内的打开零上游往返，过期后的打开也先用
+# 上一份立即返回。0 = 关闭（回到每次实拉）。
+# ---------------------------------------------------------------------------
+
+_CHANNEL_LIST_CACHE_TTL = _float("FNMUSIC_CHANNEL_LIST_CACHE_TTL", 300.0)
+_channel_recs_cache: dict[tuple, dict] = {}
+_channel_recs_refresh: "dict[tuple, asyncio.Task]" = {}
+
+
+def _channel_recs_cache_key() -> tuple:
+    return (playlists.channels_enabled(), playlists.category_name(), playlists.channel_limit())
+
+
+async def _collect_channel_records(client, key: tuple):
     logged_in = await _netease_logged_in()
-    return await playlists.collect_records(client, logged_in)
+    recs, keep, complete = await playlists.collect_records(client, logged_in)
+    _channel_recs_cache[key] = {
+        "ts": time.time(),
+        "records": recs,
+        "keep": keep,
+        "complete": complete,
+    }
+    return recs, keep, complete
+
+
+def _schedule_channel_recs_refresh(client, key: tuple) -> None:
+    """后台单飞刷新某个 key 的口径清单（stale-while-revalidate 的后台半边）。
+
+    ``client`` 是进程级共享的 musicbox client（app.state），后台任务用它很安全。
+    """
+    existing = _channel_recs_refresh.get(key)
+    if existing is not None and not existing.done():
+        return
+
+    async def _job() -> None:
+        try:
+            await _collect_channel_records(client, key)
+        except Exception as exc:  # noqa: BLE001 - 刷新失败保留旧缓存
+            logger.warning("口径清单后台刷新失败: %s: %s", type(exc).__name__, exc)
+        finally:
+            _channel_recs_refresh.pop(key, None)
+
+    _channel_recs_refresh[key] = asyncio.create_task(_job())
+
+
+async def _channel_playlist_records(client) -> tuple[list[dict], set[str], bool]:
+    """按管理页勾选的口径拉取要注入的伪歌单清单（带短缓存 + 后台刷新）。"""
+    if _CHANNEL_LIST_CACHE_TTL <= 0:
+        logged_in = await _netease_logged_in()
+        return await playlists.collect_records(client, logged_in)
+
+    key = _channel_recs_cache_key()
+    hit = _channel_recs_cache.get(key)
+    if hit is not None:
+        if (time.time() - hit["ts"]) < _CHANNEL_LIST_CACHE_TTL:
+            return hit["records"], hit["keep"], hit["complete"]
+        # 过期：先返回旧值（列表页要快），后台单飞刷新
+        _schedule_channel_recs_refresh(client, key)
+        return hit["records"], hit["keep"], hit["complete"]
+    return await _collect_channel_records(client, key)
 
 
 # ---------------------------------------------------------------------------
@@ -3130,12 +3317,21 @@ def _playlist_warm_cooldown() -> float:
 
 
 async def _warm_playlist_caches(fastapi_app: FastAPI) -> dict:
-    """后台刷新全部在列伪歌单的曲目缓存。串行 + 每个之间歇 0.3s，对上游友好。"""
+    """后台刷新全部在列伪歌单的曲目缓存。串行 + 每个之间歇 1s，对上游友好。"""
     global _PLAYLIST_WARMING
     if _PLAYLIST_WARMING:
         return {"started": False, "reason": "already_running"}
     _PLAYLIST_WARMING = True
-    guids = playlists.registry_channel_guids()
+    enabled = set(playlists.channels_enabled())
+    guids = []
+    for g in playlists.registry_channel_guids():
+        # 只预热当前启用口径的歌单：注册表里可能还留着历史口径的条目
+        # （complete=False 时按设计不清注册表），预热它们既浪费上游配额，
+        # 又会在 musicbox 的全局锁上与用户播放争抢。
+        ch = str(playlists.lookup(g).get("channel") or "")
+        if ch and ch not in enabled:
+            continue
+        guids.append(g)
     try:
         client = get_musicbox_client(fastapi_app)
         refreshed = 0
@@ -3147,7 +3343,7 @@ async def _warm_playlist_caches(fastapi_app: FastAPI) -> dict:
                     refreshed += 1
             except Exception as exc:  # noqa: BLE001 - 单个失败不挡后面
                 logger.warning("预热歌单 %s 失败: %s: %s", guid, type(exc).__name__, exc)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(1.0)
         logger.info("歌单缓存预热完成：%d/%d 个成功", refreshed, len(guids))
         return {"started": True, "refreshed": refreshed, "total": len(guids)}
     finally:

@@ -45,7 +45,15 @@ def has_lossless(raw: dict) -> bool:
 
 
 def map_netease_song(raw: dict) -> dict | None:
-    """把一条 musicbox song_info 转成扩展内部条目；缺 id 时返回 None。"""
+    """把一条 musicbox song_info 转成扩展内部条目；缺 id 时返回 None。
+
+    musicbox 的搜索 / 每日推荐 / 歌单曲目 / 私人FM 返回的都是 ``_song_info_from_raw``
+    归一化后的 song_info，其中**已经带有** ``album_pic_url`` 封面与 ``has_sq`` /
+    ``has_hr`` 无损标记。原先这里一律丢弃（``cover_url=""``、仅看 quality 字符串），
+    迫使调用方再走一次 ``/api/v1/songs/detail`` 补封面——那在上游要多做
+    songs_detail + songs_url 两次跨洋往返，正是「打开歌单/榜单慢」的主要构成之一。
+    能直读的就直读，enrich 只补真正缺的字段。
+    """
     if not isinstance(raw, dict):
         return None
     sid = song_id_of(raw)
@@ -57,6 +65,7 @@ def map_netease_song(raw: dict) -> dict | None:
     if duration > 10_000:
         duration /= 1000.0
 
+    lossless = has_lossless(raw) or bool(raw.get("has_sq")) or bool(raw.get("has_hr"))
     return {
         "id": f"{SOURCE_NAME}:{sid}",
         "source": SOURCE_NAME,
@@ -64,8 +73,8 @@ def map_netease_song(raw: dict) -> dict | None:
         "artist": str(raw.get("artist") or ""),
         "album": str(raw.get("album_name") or raw.get("album") or ""),
         "duration_s": duration,
-        "ext": "flac" if has_lossless(raw) else "mp3",
-        "cover_url": "",
+        "ext": "flac" if lossless else "mp3",
+        "cover_url": str(raw.get("album_pic_url") or raw.get("cover_url") or ""),
         "lyric": "",
     }
 

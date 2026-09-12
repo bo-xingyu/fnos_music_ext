@@ -46,6 +46,16 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_PLAYLIST_REFRESH_AT", "04:30"),
     ("FNMUSIC_PLAYLIST_TRACK_LIMIT", "300"),
     ("FNMUSIC_PLAYLIST_CACHE_DIR", ""),
+    # --- 稳定性与提速（v2.7）---
+    # 看门狗轮询间隔（秒）：代理死亡 / 接管丢失（官方后端重启抢走 socket）时
+    # 自动恢复；0 = 关闭。2026-09-12「应用异常退出」事故的自愈手段。
+    ("FNMUSIC_WATCHDOG_INTERVAL_S", "30"),
+    # 播放直链短缓存（秒）：网易云 CDN 直链约有 20 分钟有效期，复用可省去
+    # 重复取链的跨洋往返；0 = 关闭
+    ("FNMUSIC_URL_CACHE_TTL", "600"),
+    # 口径清单短缓存（秒）：歌单列表页在 TTL 内零上游往返，过期后先返回旧值
+    # 并后台刷新（stale-while-revalidate）；0 = 关闭
+    ("FNMUSIC_CHANNEL_LIST_CACHE_TTL", "300"),
     # --- 收藏归档与红心同步（v2.2 新增）---
     # 归档目录默认留空 = 关闭自动下载：这是往用户自己的磁盘写文件，
     # 绝不能替他决定写到哪儿，必须他在管理页里显式填。
@@ -85,7 +95,8 @@ NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOGIN_",
                 # 因此不会凭空给老用户的 .env 塞进没定义的项。
                 "FNMUSIC_NETEASE_CHANNEL", "FNMUSIC_NETEASE_CATEGOR",
                 "FNMUSIC_NETEASE_PLAYLIST_", "FNMUSIC_PLAYLIST_", "FNMUSIC_DOWNLOAD_", "FNMUSIC_FAV_",
-                "FNMUSIC_QUALITY_")
+                "FNMUSIC_QUALITY_", "FNMUSIC_WATCHDOG_", "FNMUSIC_URL_CACHE_",
+                "FNMUSIC_CHANNEL_LIST_")
 
 # v2.0 已废弃的配置项：升级合并时从 .env 中清理，避免残留误导。
 # 只删「确定已无代码读取」的键；FNMUSIC_MODE / BASE_IMAGE / PIP_INDEX 等 docker 相关项保留。

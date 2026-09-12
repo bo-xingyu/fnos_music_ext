@@ -877,6 +877,26 @@ async def api_diag(request: Request):
         proxy_socket["mode"] = None
     proxy_socket["upstream_exists"] = os.path.exists(UPSTREAM_SOCK)
 
+    # 看门狗与主动停机标志（v2.7）：诊断「应用异常退出」类问题的第一现场。
+    # 看门狗活着 = 接管丢失/进程死亡会在一个轮询周期内自愈；
+    # stopped.flag 存在 = 应用处于主动停机状态（用户在应用中心点过停止）。
+    var_dir = os.environ.get("FNMUSIC_ADMIN_VAR_DIR", "")
+    watchdog = {"var_dir": var_dir, "pid": None, "alive": False,
+                "stopped_flag": False, "restart_marker": False}
+    if var_dir:
+        wd_pid_file = os.path.join(var_dir, "watchdog.pid")
+        try:
+            with open(wd_pid_file, encoding="utf-8") as f:
+                wd_pid = int((f.read().strip().splitlines() or ["0"])[0] or 0)
+            watchdog["pid"] = wd_pid
+            if wd_pid > 0:
+                os.kill(wd_pid, 0)
+                watchdog["alive"] = True
+        except (OSError, ValueError):
+            pass
+        watchdog["stopped_flag"] = os.path.exists(os.path.join(var_dir, "stopped.flag"))
+        watchdog["restart_marker"] = os.path.exists(os.path.join(var_dir, "restart.inprogress"))
+
     ui_socket = os.environ.get("FNMUSIC_ADMIN_UI_SOCK", "")
     return {
         "ok": True,
@@ -894,6 +914,7 @@ async def api_diag(request: Request):
             "x_forwarded_prefix": request.headers.get("x-forwarded-prefix"),
         },
         "proxy_socket": proxy_socket,
+        "watchdog": watchdog,
         "quality": quality_probe,
         "musicbox": {
             "url": MUSICBOX_URL,
@@ -2060,6 +2081,12 @@ function runDiag(auto){
       out.push("-- socket 接管 --");
       out.push("  "+d.proxy_socket.path+" 存在="+d.proxy_socket.exists+" 权限="+d.proxy_socket.mode);
       out.push("  upstream("+d.proxy_socket.upstream_exists+")");
+      var wd=d.watchdog||{};
+      out.push("  看门狗: 运行中="+((wd.alive)?("是(pid="+wd.pid+")"):"否")+
+              "   主动停机标志="+(wd.stopped_flag?"存在":"无")+
+              "   配置重启标记="+(wd.restart_marker?"存在":"无"));
+      out.push("  （看门狗负责在代理死亡/接管丢失时自动恢复；官方后端重启会重绑");
+      out.push("   trim_music.socket，那正是「应用异常退出」的典型来源）");
       out.push("");
       out.push("-- 音质策略与「跟随飞牛」发现情况 --");
       var qy=d.quality||{};

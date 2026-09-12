@@ -51,6 +51,34 @@ def test_map_netease_song_lossy_is_mp3():
     assert item["ext"] == "mp3"
 
 
+def test_map_netease_song_reads_pic_url_and_sq_hr():
+    """v2.7：musicbox song_info 已带 album_pic_url / has_sq / has_hr，必须直读，
+    免得歌单/榜单打开还要再走一次 songs/detail 补封面（上游两次跨洋往返）。"""
+    item = netease_items.map_netease_song({
+        "song_id": "228908",
+        "song_name": "晴天",
+        "artist": "周杰伦",
+        "album_name": "叶惠美",
+        "duration": 269,
+        "quality": "HD 320k",          # quality 字符串看不出无损
+        "has_sq": True,                 # 但 song_info 带了无损标记
+        "album_pic_url": "https://p1.music.126.net/abc.jpg",
+    })
+    assert item["ext"] == "flac", "has_sq 必须能推出无损扩展名"
+    assert item["cover_url"] == "https://p1.music.126.net/abc.jpg"
+
+    hr_item = netease_items.map_netease_song({
+        "song_id": "2", "song_name": "t", "quality": "", "has_hr": True,
+    })
+    assert hr_item["ext"] == "flac"
+
+    no_cover = netease_items.map_netease_song({
+        "song_id": "3", "song_name": "t", "quality": "HD 320k", "album_pic_url": "",
+    })
+    assert no_cover["cover_url"] == ""
+    assert no_cover["ext"] == "mp3"
+
+
 def test_map_netease_song_requires_id():
     assert netease_items.map_netease_song({"song_name": "无 id"}) is None
     assert netease_items.map_netease_song({}) is None

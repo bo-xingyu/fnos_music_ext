@@ -501,3 +501,41 @@ lib_restart_in_progress() {
     age=$(( now - mtime ))
     [ "${age}" -ge 0 ] && [ "${age}" -le "${RESTART_MARKER_MAX_AGE}" ]
 }
+
+# ------------------------------------------------------------------------------
+# 主动停机标志（v2.7）：stop.sh 落盘、start.sh 清除（看门狗发起的恢复除外）。
+#
+# 看门狗（watchdog.sh）的职责是把「死掉的代理 / 丢失的 socket 接管」自动拉起来，
+# 因此它必须能区分「服务出故障了」和「用户/系统主动停机」。没有这个标志，
+# 用户在应用中心点「停止」后，看门狗会在 30s 内把服务原样拉回来——
+# 表现为「停不掉的应用」。标志落在 PKGVAR（跨卸载重装持久），所以
+# start.sh 只在【非看门狗】调用时清除它。
+# ------------------------------------------------------------------------------
+
+STOPPED_FLAG="${PKGVAR}/stopped.flag"
+
+lib_stopped_flag_set() {
+    [ -f "${STOPPED_FLAG}" ]
+}
+
+lib_stopped_flag_mark() {
+    mkdir -p "${PKGVAR}" 2>/dev/null || true
+    printf '%s\n' "$(date +%s)" > "${STOPPED_FLAG}" 2>/dev/null || true
+}
+
+lib_stopped_flag_clear() {
+    rm -f "${STOPPED_FLAG}" 2>/dev/null || true
+}
+
+# 看门狗 PID 与轮询间隔。间隔从 .env 读（FNMUSIC_WATCHDOG_INTERVAL_S），
+# 0 或负数 = 关闭看门狗。
+WATCHDOG_PID="${PKGVAR}/watchdog.pid"
+
+lib_watchdog_interval() {
+    local v
+    v="$(lib_read_env_value FNMUSIC_WATCHDOG_INTERVAL_S 30)"
+    case "${v}" in
+        ''|*[!0-9]*) echo 30 ;;
+        *) echo "${v}" ;;
+    esac
+}

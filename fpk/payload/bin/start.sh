@@ -66,6 +66,16 @@ start_proxy() {
         lib_log "代理已在运行且接管正常 (pid=$(head -n 1 "${PROXY_PID}"))"
         return 0
     fi
+    if lib_pid_alive "${PROXY_PID}"; then
+        # 进程活着但接管丢失：官方 trim-music 重启时重绑了 trim_music.socket，
+        # 原路径已不是我们的监听（2026-09-12「异常退出」事故的形态）。
+        # 必须先停掉这个"僵尸代理"再重新接管，否则它会永远占着
+        # trim_music_upstream.socket，新的代理也接不上。
+        lib_warn "代理进程存活但 socket 接管已丢失，先停止旧代理再重新接管"
+        lib_stop_pid "proxy" "${PROXY_PID}" 15
+    fi
+    # pidfile 丢失但进程仍在监听我们的 socket 时，按路径精确清理，杜绝孤儿
+    lib_kill_stale_by_sock "${TARGET_SOCK}"
     # 一律用 bash 显式解释执行：tar 包内脚本是 644（无执行位），且社区实测部分
     # 文件系统上 chmod +x 可能不生效，靠 -x 判断会把可运行的脚本误判为缺失。
     if [ ! -f "${RUN_DIR}/proxy/run_proxy.sh" ]; then
@@ -205,8 +215,37 @@ start_ui() {
     return 0
 }
 
+start_watchdog() {
+    # 看门狗（v2.7）：代理死亡 / 接管丢失时自动恢复。详见 watchdog.sh 头注。
+    # 必须以 root 运行（它要调 start.sh，其中的代理以 root 起）。
+    if [ "$(lib_watchdog_interval)" -le 0 ]; then
+        lib_log "看门狗已按 FNMUSIC_WATCHDOG_INTERVAL_S=0 关闭"
+        return 0
+    fi
+    if lib_pid_alive "${WATCHDOG_PID}"; then
+        return 0
+    fi
+    lib_log "启动看门狗（interval=$(lib_watchdog_interval)s）"
+    lib_spawn "${WATCHDOG_PID}" "${LOG_DIR}/watchdog.log" --as-root \
+        env PATH="${PYTHON_BIN}:${PATH}" bash "${SCRIPT_DIR}/watchdog.sh"
+    return 0
+}
+
 main() {
     lib_log "=== start 开始 ==="
+
+    # 主动停机标志：生命周期入口（应用中心启动/安装/升级/配置保存）到达这里时
+    # 一律清除；只有看门狗发起的恢复（FNMUSICEXT_WATCHDOG=1）在标志存在时
+    # 必须立刻放弃——那是用户刚点了「停止」，绝不能被起死回生。
+    if lib_stopped_flag_set; then
+        if [ "${FNMUSICEXT_WATCHDOG:-0}" = "1" ]; then
+            lib_log "start 由看门狗发起，但应用处于主动停机状态，放弃启动"
+            return 0
+        fi
+        lib_log "清除主动停机标志（应用中心启动）"
+        lib_stopped_flag_clear
+    fi
+
     mkdir -p "${LOG_DIR}" "${PKGVAR}" 2>/dev/null
 
     # 启动前轮转一次日志：此时还没有进程持有日志 fd，rename 是安全的
@@ -220,6 +259,8 @@ main() {
     }
     # 管理页面失败不致命：主功能（在线播放）不依赖它
     start_ui
+    # 看门狗失败同样不致命：它只影响故障自愈速度
+    start_watchdog
     lib_log "=== start 完成 ==="
     return 0
 }
