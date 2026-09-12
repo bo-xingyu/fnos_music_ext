@@ -1828,7 +1828,15 @@ async def ext_playlists_preview():
     items.sort(key=lambda it: stamped_order.index(it["channel"])
                if it["channel"] in stamped_order else len(stamped_order))
     items = playlists.apply_explicit_order(items)
-    cached = playlists.cached_track_guids()
+    # 缓存统计只看**当前在列**的歌单（不含每日推荐，它的曲目按用户+日期另存）：
+    # 旧的 cached 数的是注册表里「有缓存文件」的全部条目，注册表可能留着历史
+    # 口径的死条目，出现过「缓存：59/34」这种分子大于分母的自相矛盾显示。
+    # 注意此处 items 还没写 is_daily 键，按 channel 判断。
+    current_items = [it for it in items if str(it.get("channel") or "") != "daily"]
+    cached_count = sum(
+        1 for it in current_items
+        if playlists.load_cached_tracks(str(it.get("guid") or "")) is not None
+    )
     return {
         "ok": True,
         "data": {
@@ -1836,8 +1844,8 @@ async def ext_playlists_preview():
             "logged_in": logged_in,
             "manual_order": list(playlists.explicit_order_tokens()),
             "cache": {
-                "cached": len(cached),
-                "total": len(items),
+                "cached": cached_count,
+                "total": len(current_items),
                 "ttl_s": playlists.tracks_cache_ttl(),
                 "refresh_at": playlists.refresh_time_of_day(),
                 "warming": _PLAYLIST_WARMING,
@@ -1848,11 +1856,24 @@ async def ext_playlists_preview():
 
 @app.post("/_ext/playlists/warm")
 async def ext_playlists_warm():
-    """立即后台预热全部歌单曲目缓存（管理页按钮，不受冷却限制）。"""
-    if not _schedule_playlist_warm(app, force=True):
+    """立即后台预热当前在列歌单的曲目缓存（管理页按钮，不受冷却限制）。
+
+    只预热**当前口径实际注入**的歌单——注册表里的历史死条目（旧分类/旧上限
+    遗留）不再被全量拉取；清单完整时顺带 forget_stale 清理死条目及其缓存，
+    让注册表、缓存计数与飞牛里看到的歌单一一对应。
+    """
+    client = get_musicbox_client(app)
+    try:
+        recs, keep, complete = await _channel_playlist_records(client)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("预热按钮：拉取当前歌单清单失败: %s: %s", type(exc).__name__, exc)
+        recs, keep, complete = [], set(), False
+    if complete and keep:
+        playlists.forget_stale(keep)
+    guids = [str(r.get("guid") or "") for r in recs if r.get("guid")]
+    if not _schedule_playlist_warm(app, force=True, guids=guids):
         return {"ok": True, "data": {"started": False, "reason": "already_running"}}
-    return {"ok": True, "data": {"started": True,
-                                 "total": len(playlists.registry_channel_guids())}}
+    return {"ok": True, "data": {"started": True, "total": len(guids)}}
 
 
 @app.get("/music/api/v1/search/track")
@@ -3316,24 +3337,35 @@ def _playlist_warm_cooldown() -> float:
     return float(playlists.tracks_cache_ttl())
 
 
-async def _warm_playlist_caches(fastapi_app: FastAPI) -> dict:
-    """后台刷新全部在列伪歌单的曲目缓存。串行 + 每个之间歇 1s，对上游友好。"""
+async def _warm_playlist_caches(fastapi_app: FastAPI, guids: "list[str] | None" = None) -> dict:
+    """后台刷新歌单曲目缓存。串行 + 每个之间歇 1s，对上游友好。
+
+    ``guids=None``（定时刷新/预热按钮）时**现场拉取当前口径的歌单清单**再预热，
+    绝不能直接用注册表全部条目——注册表里可能留着历史口径/旧分类的死条目
+    （complete=False 时按设计不清），每天把它们全量拉一遍纯属浪费上游配额
+    （真机上出现过注册表 59 条、当前在列仅 34 条，07:15 定时刷新白刷 25 个）。
+    顺带在清单完整时 forget_stale，把死条目连同其曲目缓存一起清掉。
+    ``guids`` 由调用方给出（playlist_list 已拿到当前清单）时直接用，不重复拉。
+    """
     global _PLAYLIST_WARMING
     if _PLAYLIST_WARMING:
         return {"started": False, "reason": "already_running"}
     _PLAYLIST_WARMING = True
-    enabled = set(playlists.channels_enabled())
-    guids = []
-    for g in playlists.registry_channel_guids():
-        # 只预热当前启用口径的歌单：注册表里可能还留着历史口径的条目
-        # （complete=False 时按设计不清注册表），预热它们既浪费上游配额，
-        # 又会在 musicbox 的全局锁上与用户播放争抢。
-        ch = str(playlists.lookup(g).get("channel") or "")
-        if ch and ch not in enabled:
-            continue
-        guids.append(g)
     try:
         client = get_musicbox_client(fastapi_app)
+        if guids is None:
+            try:
+                # 走 _collect_channel_records 而不是裸 collect_records：
+                # 顺带把口径清单 SWR 缓存也刷新成最新一届，次日早晨的列表页直接命中
+                recs, keep, complete = await _collect_channel_records(
+                    client, _channel_recs_cache_key())
+            except Exception as exc:  # noqa: BLE001 - 清单拉不到就别预热了
+                logger.warning("预热前拉取当前歌单清单失败: %s: %s", type(exc).__name__, exc)
+                recs, keep, complete = [], set(), False
+            if complete and keep:
+                playlists.forget_stale(keep)
+            guids = [str(r.get("guid") or "") for r in recs if r.get("guid")]
+
         refreshed = 0
         for guid in guids:
             try:
@@ -3350,8 +3382,13 @@ async def _warm_playlist_caches(fastapi_app: FastAPI) -> dict:
         _PLAYLIST_WARMING = False
 
 
-def _schedule_playlist_warm(fastapi_app: FastAPI, *, force: bool = False) -> bool:
-    """安排一次后台预热。返回是否真的安排了（已在跑/冷却期内则 False）。"""
+def _schedule_playlist_warm(fastapi_app: FastAPI, *, force: bool = False,
+                            guids: "list[str] | None" = None) -> bool:
+    """安排一次后台预热。返回是否真的安排了（已在跑/冷却期内则 False）。
+
+    ``guids``：已知当前在列歌单时直接传入（省一次清单拉取）；
+    缺省由预热任务自己现场拉当前清单（见 _warm_playlist_caches）。
+    """
     global _LAST_AUTO_WARM_AT
     if _PLAYLIST_WARMING:
         return False
@@ -3361,7 +3398,7 @@ def _schedule_playlist_warm(fastapi_app: FastAPI, *, force: bool = False) -> boo
         _LAST_AUTO_WARM_AT = time.time()
 
     async def _job() -> None:
-        await _warm_playlist_caches(fastapi_app)
+        await _warm_playlist_caches(fastapi_app, guids=guids)
 
     asyncio.create_task(_job())
     return True
@@ -3586,9 +3623,12 @@ async def playlist_list(request: Request):
 
     # 列表注入完成后安排一次后台预热（冷却期 = 缓存 TTL）：用户打开飞牛音乐
     # 看一眼歌单列表，几秒后所有歌单的曲目缓存就都在本地了——之后点开
-    # 任何一个都是秒开，而不要求先挨个点一遍。
+    # 任何一个都是秒开，而不要求先挨个点一遍。清单用刚拿到的这一届，
+    # 不再让预热任务重复拉一遍（也绝不会碰到注册表里的历史死条目）。
     if head:
-        _schedule_playlist_warm(request.app)
+        _schedule_playlist_warm(
+            request.app,
+            guids=[str(r.get("guid") or "") for r in channel_recs if r.get("guid")])
 
     data["list"] = head + official
     data["total"] = len(head) + len(official)

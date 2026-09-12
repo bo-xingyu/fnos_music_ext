@@ -438,15 +438,6 @@ def drop_tracks_cache(guid: str | None) -> None:
         pass
 
 
-def cached_track_guids() -> list[str]:
-    """当前注册表里、且曲目缓存已存在的伪歌单 guid（预热/状态展示用）。"""
-    out: list[str] = []
-    for g in registry_channel_guids():
-        if load_cached_tracks(g) is not None:
-            out.append(g)
-    return out
-
-
 def registry_channel_guids() -> list[str]:
     """注册表里当前在列的非每日推荐伪歌单 guid。"""
     reg = load_registry()

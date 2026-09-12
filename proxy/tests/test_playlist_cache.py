@@ -41,6 +41,10 @@ def musicbox_handler(request: httpx.Request) -> httpx.Response:
                                          "data": {"logged_in": True, "nickname": "u"}})
     if path == "/healthz":
         return httpx.Response(200, json={"ok": True})
+    if path == "/api/v1/playlists/toplists":
+        # 当前口径在列的排行榜（guid 与 GUID 一致，注册表与当前清单对齐）
+        return httpx.Response(200, json={"ok": True, "data": [
+            {"playlist_id": 424242, "name": "测试榜", "cover_url": "", "track_count": 1}]})
     if path == f"/api/v1/playlist/424242/tracks":
         return httpx.Response(200, json=_mb_tracks(os.environ.get("_MB_SONG", "晴天")))
     if path == "/api/v1/songs/detail":
@@ -166,20 +170,31 @@ def test_refresh_failure_keeps_old_cache(wired, monkeypatch):
 
 
 def test_warm_endpoint_refreshes_all_registry_playlists(wired):
+    """预热按钮只刷**当前在列**歌单；注册表里的历史死条目既不刷、也被清掉。"""
+    # 注册表塞两条：一条当前在列（GUID），一条历史遗留（旧分类的歌单）
+    stale = "online:playlist:ne:777777"
     pl.remember(pl.build_record(GUID, "榜｜测试榜", "", 1, "toplist"))
+    pl.remember(pl.build_record(stale, "华语｜历史死条目", "", 1, "category"))
+    pl.store_cached_tracks(stale, [{"id": "netease:1", "source": "netease",
+                                    "title": "x", "artist": "a", "album": "",
+                                    "duration_s": 1, "ext": "mp3",
+                                    "cover_url": "", "lyric": ""}])
     pl.save_registry()
     with TestClient(app) as client:
         r = client.post("/_ext/playlists/warm")
         assert r.status_code == 200
         assert r.json()["data"]["started"] is True
-        assert r.json()["data"]["total"] == 1
+        assert r.json()["data"]["total"] == 1, "只应预热当前在列的那 1 个歌单"
 
         deadline = time.time() + 5
         while time.time() < deadline:
             if pl.load_cached_tracks(GUID) is not None:
                 break
             time.sleep(0.1)
-    assert pl.load_cached_tracks(GUID) is not None, "预热应把注册表里的歌单都写进缓存"
+    assert pl.load_cached_tracks(GUID) is not None, "预热应把当前在列歌单写进缓存"
+    # 历史死条目被 forget_stale 清理：注册表不再有它，曲目缓存也一并删掉
+    assert pl.lookup(stale) == {}, "清单完整时历史死条目应从注册表清掉"
+    assert pl.load_cached_tracks(stale) is None, "死条目的曲目缓存应一并删除"
 
     # 重复触发：已在跑/刚跑完时幂等，不炸
     with TestClient(app) as client:
@@ -188,10 +203,26 @@ def test_warm_endpoint_refreshes_all_registry_playlists(wired):
 
 
 def test_preview_reports_cache_stats(wired):
+    """preview 的缓存统计：分子只数当前在列歌单，绝不能出现 cached > total。"""
+    # 先打开一次让 GUID 有缓存；再往注册表塞一个有缓存的历史死条目
+    with TestClient(app) as client:
+        _open_playlist(client)
+    stale = "online:playlist:ne:888888"
+    pl.remember(pl.build_record(GUID, "榜｜测试榜", "", 1, "toplist"))
+    pl.remember(pl.build_record(stale, "华语｜历史死条目", "", 1, "category"))
+    pl.store_cached_tracks(stale, [{"id": "netease:1", "source": "netease",
+                                    "title": "x", "artist": "a", "album": "",
+                                    "duration_s": 1, "ext": "mp3",
+                                    "cover_url": "", "lyric": ""}])
+    pl.save_registry()
+
     with TestClient(app) as client:
         r = client.get("/_ext/playlists/preview")
         assert r.status_code == 200
         cache = r.json()["data"]["cache"]
         assert cache["ttl_s"] == 3600
         assert cache["refresh_at"] == "04:30"
-        assert "cached" in cache and "total" in cache
+        # 当前在列只有 toplist 里的 GUID 一个（daily 未登录不注入，也不计入 total）
+        assert cache["total"] == 1
+        assert cache["cached"] == 1, "当前在列且已缓存的歌单"
+        assert cache["cached"] <= cache["total"], "分子绝不能大于分母"
