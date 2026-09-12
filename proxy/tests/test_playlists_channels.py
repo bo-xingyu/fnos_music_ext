@@ -476,3 +476,118 @@ def test_playlist_list_follows_custom_channel_order(registry_dir, monkeypatch):
         daily_entry = [x for x in b["data"]["list"]
                        if _rec.is_daily_playlist_guid(str(x.get("guid")))]
         assert daily_entry and daily_entry[0]["createdAt"] == lst[1]["createdAt"]
+
+
+# ===========================================================================
+# v2.5：手动歌单顺序（token 列表，实时读 .env）
+# ===========================================================================
+
+
+def test_explicit_order_tokens_from_live_env(tmp_path, monkeypatch):
+    """手动顺序必须实时读 ${FNMUSIC_HOME}/.env——用户在管理页保存后，
+    下一次 playlist/list 就是新顺序，不等代理重启。"""
+    monkeypatch.setenv("FNMUSIC_HOME", str(tmp_path))
+    pl._reset_live_env_cache_for_test()
+
+    # 没写 .env 时回落进程环境变量
+    monkeypatch.setenv("FNMUSIC_NETEASE_PLAYLIST_ORDER", "daily, online:playlist:ne:7")
+    assert pl.explicit_order_tokens() == ("daily", "online:playlist:ne:7")
+
+    # 写入 .env 后立即以文件为准（含空值——用户清空就是清空，不能回落旧环境变量）
+    (tmp_path / ".env").write_text(
+        "FNMUSIC_NETEASE_PLAYLIST_ORDER='toplist,online:playlist:ne:1,daily'\n",
+        encoding="utf-8")
+    assert pl.explicit_order_tokens() == ("toplist", "online:playlist:ne:1", "daily")
+
+    # 文件内容变化（mtime/size 指纹变化）后自动重读
+    (tmp_path / ".env").write_text("FNMUSIC_NETEASE_PLAYLIST_ORDER=''\n", encoding="utf-8")
+    assert pl.explicit_order_tokens() == (), "清空 .env 里的顺序 = 回到大类顺序"
+    pl._reset_live_env_cache_for_test()
+
+
+def test_apply_explicit_order_overrides_and_appends():
+    items = [
+        {"guid": "online:playlist:daily:20260912:u1", "name": "每日推荐"},
+        {"guid": "online:playlist:ne:11", "name": "我的自建单"},
+        {"guid": "online:playlist:ne:12", "name": "收藏的单"},
+        {"guid": "online:playlist:ne:19723756", "name": "飙升榜"},
+        {"guid": "online:playlist:nefm", "name": "私人FM"},
+    ]
+    # 手动顺序：飙升榜 → 每日推荐 → 我的自建单；没排到的（收藏的单/私人FM）按原相对顺序跟在后面
+    ordered = pl.apply_explicit_order_with(
+        items, ("online:playlist:ne:19723756", "daily", "online:playlist:ne:11"))
+    assert [it["name"] for it in ordered] == \
+        ["飙升榜", "每日推荐", "我的自建单", "收藏的单", "私人FM"]
+
+    # 空 token 列表 = 原样返回（大类顺序继续生效）
+    assert pl.apply_explicit_order_with(items, ()) == items
+
+    # 全部未知 token = 不影响顺序（防止手滑把整个列表打乱）
+    assert [it["name"] for it in pl.apply_explicit_order_with(
+        items, ("bogus", "online:playlist:ne:999"))] == \
+        [it["name"] for it in items]
+
+
+def test_playlist_list_applies_manual_order(registry_dir, monkeypatch):
+    """playlist_list 注入顺序被手动 token 列表整体覆盖（每日推荐可被排到后面）。"""
+    import httpx as _hx
+    from fastapi.testclient import TestClient as _TC
+    from proxy import netease_auth as _na
+    from proxy.app import app as _app
+
+    monkeypatch.setenv("FNMUSIC_HOME", str(registry_dir.parent))  # 无 .env → 回落环境变量
+    pl._reset_live_env_cache_for_test()
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS", "mine,toplist")
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNEL_ORDER", "toplist,daily,mine")
+    monkeypatch.setenv("FNMUSIC_DAILY_ENABLED", "true")
+    monkeypatch.setenv("FNMUSIC_NETEASE_PLAYLIST_ORDER",
+                       "online:playlist:ne:11,daily,online:playlist:ne:19723756")
+    _app.state.upstream_client = _hx.AsyncClient(
+        transport=_hx.MockTransport(_upstream_handler), base_url="http://unix")
+    _app.state.musicbox_client = _hx.AsyncClient(
+        transport=_hx.MockTransport(_mb_handler_logged_in()), base_url="http://127.0.0.1:8770")
+    _na.invalidate_state()
+
+    with _TC(_app) as client:
+        body = client.get("/music/api/v1/playlist/list").json()
+    lst = body["data"]["list"]
+    names = [it["name"] for it in lst]
+    # 手动顺序：我的自建单 → 每日推荐 → 飙升榜 → 本地歌单
+    assert names[0].startswith("网易云·我的自建单"), names
+    from proxy import recommend as _rec
+    assert _rec.is_daily_playlist_guid(lst[1]["guid"]), names
+    assert names[2].startswith("榜｜"), names
+    assert lst[-1]["guid"] == "localpl"
+    # 展示时间戳仍然严格递增（顺序=注入顺序）
+    head_ts = [it["updatedAt"] for it in lst[:-1]]
+    assert head_ts == sorted(head_ts) and len(set(head_ts)) == len(head_ts)
+
+
+def test_playlists_preview_endpoint(registry_dir, monkeypatch):
+    """管理页「歌单顺序」卡片的数据源：清单与顺序和 playlist_list 同源。"""
+    import httpx as _hx
+    from fastapi.testclient import TestClient as _TC
+    from proxy import netease_auth as _na
+    from proxy.app import app as _app
+
+    monkeypatch.setenv("FNMUSIC_HOME", str(registry_dir.parent))
+    pl._reset_live_env_cache_for_test()
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS", "mine,toplist")
+    monkeypatch.setenv("FNMUSIC_NETEASE_PLAYLIST_ORDER", "daily,online:playlist:ne:19723756")
+    _app.state.upstream_client = _hx.AsyncClient(
+        transport=_hx.MockTransport(_upstream_handler), base_url="http://unix")
+    _app.state.musicbox_client = _hx.AsyncClient(
+        transport=_hx.MockTransport(_mb_handler_logged_in()), base_url="http://127.0.0.1:8770")
+    _na.invalidate_state()
+
+    with _TC(_app) as client:
+        r = client.get("/_ext/playlists/preview")
+    assert r.status_code == 200
+    data = r.json()["data"]
+    names = [it["name"] for it in data["items"]]
+    assert names[0].startswith("每日推荐"), names
+    assert names[1].startswith("榜｜"), names
+    assert any(n.startswith("网易云·") for n in names), names
+    assert data["items"][0]["is_daily"] is True
+    assert data["manual_order"] == ["daily", "online:playlist:ne:19723756"]
+    assert data["logged_in"] is True

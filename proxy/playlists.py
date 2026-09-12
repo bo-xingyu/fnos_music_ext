@@ -27,6 +27,11 @@ import os
 import time
 from typing import Any, Awaitable, Callable
 
+try:
+    from . import env_merge as _env_merge
+except ImportError:  # uvicorn --app-dir proxy（顶层模块形态）
+    import env_merge as _env_merge  # type: ignore
+
 logger = logging.getLogger("fnmusic_proxy")
 
 NETEASE_PLAYLIST_PREFIX = "online:playlist:ne:"
@@ -89,6 +94,93 @@ def rank_of(channel: str) -> int:
         return channel_order().index(channel)
     except ValueError:
         return len(CHANNELS)
+
+
+# ---------------------------------------------------------------------------
+# 手动歌单顺序（v2.5）：管理页逐个拖排，token 列表存 .env
+#
+# token 形态：``daily``（每日推荐，guid 含日期与用户 id 不能直接写死）或
+# ``online:playlist:...`` 完整 guid。空 = 不启用手动顺序，按大类顺序排。
+#
+# 这个值必须**实时从 .env 读**而不是进程环境变量：用户在管理页排完序点保存，
+# 期望下一次刷新飞牛歌单列表就是新顺序，等代理重启太慢。
+# ---------------------------------------------------------------------------
+
+_LIVE_ENV_CACHE: "tuple[tuple[int, int], dict[str, str]] | None" = None
+
+
+def _live_env() -> dict[str, str]:
+    """读取 ``${FNMUSIC_HOME}/.env``（带 mtime+size 指纹缓存，文件变了自动重读）。"""
+    global _LIVE_ENV_CACHE
+    home = os.environ.get("FNMUSIC_HOME") or ""
+    path = os.path.join(home, ".env") if home else ""
+    try:
+        stat = os.stat(path) if path else None
+    except OSError:
+        stat = None
+    fp = (stat.st_mtime_ns, stat.st_size) if stat else ()
+    if _LIVE_ENV_CACHE is not None and _LIVE_ENV_CACHE[0] == fp:
+        return _LIVE_ENV_CACHE[1]
+    kv: dict[str, str] = {}
+    if stat:
+        try:
+            pairs, _others = _env_merge.parse_env_file(path)
+            kv = dict(pairs)
+        except Exception as exc:  # noqa: BLE001 - .env 坏了就当没有，回落环境变量
+            logger.warning("live env read failed (%s): %s", path, exc)
+    _LIVE_ENV_CACHE = (fp, kv)
+    return kv
+
+
+def _reset_live_env_cache_for_test() -> None:
+    global _LIVE_ENV_CACHE
+    _LIVE_ENV_CACHE = None
+
+
+def explicit_order_tokens() -> tuple[str, ...]:
+    """手动顺序 token 列表（保序去重；任何解析问题都安全回落为空）。"""
+    kv = _live_env()
+    if "FNMUSIC_NETEASE_PLAYLIST_ORDER" in kv:
+        raw = kv["FNMUSIC_NETEASE_PLAYLIST_ORDER"]
+    else:
+        raw = os.environ.get("FNMUSIC_NETEASE_PLAYLIST_ORDER", "")
+    out: list[str] = []
+    for part in str(raw or "").replace(";", ",").split(","):
+        t = part.strip()
+        if t and t not in out:
+            out.append(t)
+    return tuple(out)
+
+
+def _token_matches(token: str, guid: str) -> bool:
+    if token == "daily":
+        return guid.startswith(DAILY_NS)
+    return token == guid
+
+
+def apply_explicit_order_with(items: list[dict], tokens: tuple[str, ...]) -> list[dict]:
+    """``apply_explicit_order`` 的可注入版本（测试与 preview 共用排序逻辑）。"""
+    if not tokens:
+        return items
+
+    def _key(it: dict) -> tuple[int, int]:
+        guid = str(it.get("guid") or "")
+        for idx, tok in enumerate(tokens):
+            if _token_matches(tok, guid):
+                return (0, idx)
+        return (1, 0)
+
+    return sorted(items, key=_key)
+
+
+def apply_explicit_order(items: list[dict]) -> list[dict]:
+    """按手动顺序重排注入条目；没排到的（新出现的歌单）按原相对顺序跟在后面。
+
+    输入应已按大类顺序排好——手动顺序是对它的**整体覆盖**：凡出现在 token
+    列表里的条目按 token 顺序提前，其余保持原有相对顺序排在后面。
+    稳定排序保证同 token / 未匹配条目的先后不乱。
+    """
+    return apply_explicit_order_with(items, explicit_order_tokens())
 
 
 def channels_enabled() -> tuple[str, ...]:

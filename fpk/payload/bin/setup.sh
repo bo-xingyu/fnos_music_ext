@@ -159,6 +159,8 @@ write_env_file() {
         echo "FNMUSIC_NETEASE_CATEGORY=$(dq "$(pick_env FNMUSIC_NETEASE_CATEGORY "" 华语)")"
         echo "# 歌单口径展示顺序（大类固定排序，管理页可改）"
         echo "FNMUSIC_NETEASE_CHANNEL_ORDER=$(dq "$(pick_env FNMUSIC_NETEASE_CHANNEL_ORDER "" daily,mine,nrec,toplist,category,newalbum,fm)")"
+        # 手动歌单顺序（v2.5）：管理页「歌单顺序」卡片保存的 token 列表；空=按大类
+        echo "FNMUSIC_NETEASE_PLAYLIST_ORDER=$(dq "$(pick_env FNMUSIC_NETEASE_PLAYLIST_ORDER "" "")")"
         echo "FNMUSIC_PLAYLIST_TRACK_LIMIT=$(dq "$(pick_env FNMUSIC_PLAYLIST_TRACK_LIMIT "" 300)")"
         # 放 PKGVAR 而不是 RUN_DIR：RUN_DIR 在「卸载+重装」时整个被删，
         # 注册表存着歌单名字与封面，丢了就会退化成"网易云歌单 12345"+无封面。
@@ -208,6 +210,7 @@ write_env_file() {
                     FNMUSIC_LOGIN_STATE_TTL|FNMUSIC_LOGIN_CHECK_INTERVAL|FNMUSIC_VIP_WARN_DAYS|\
                     FNMUSIC_DAILY_ENABLED|FNMUSIC_DAILY_LIMIT|FNMUSIC_NETEASE_CHANNELS|\
                     FNMUSIC_NETEASE_CHANNEL_LIMIT|FNMUSIC_NETEASE_CATEGORY|FNMUSIC_NETEASE_CHANNEL_ORDER|\
+                    FNMUSIC_NETEASE_PLAYLIST_ORDER|\
                     FNMUSIC_PLAYLIST_TRACK_LIMIT|FNMUSIC_PLAYLIST_CACHE_DIR|FNMUSIC_DOWNLOAD_DIR|\
                     FNMUSIC_DOWNLOAD_ON_FAVORITE|FNMUSIC_FAV_SYNC_LIKE|FNMUSIC_QUALITY_POLICY|\
                     FNMUSIC_QUALITY_FIXED|FNMUSIC_QUALITY_WIFI|FNMUSIC_QUALITY_CELLULAR|\

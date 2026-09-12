@@ -1224,3 +1224,31 @@ def test_admin_ui_importable_as_top_level_module(tmp_path):
     assert out["pkg"] == "download", "顶层模式下应拿到平铺导入的 download 模块"
     assert out["ok"] == str(d)
     assert out["empty"] == ""
+
+
+# ---------------------------------------------------------------------------
+# v2.5：手动歌单顺序字段
+# ---------------------------------------------------------------------------
+
+def test_playlist_order_validator():
+    """token 只认 daily 与 online:playlist:… guid，其余一律拒绝（防注入）。"""
+    v = admin_ui._as_playlist_order
+    assert v("") == ""
+    assert v("daily") == "daily"
+    assert v("daily,online:playlist:ne:11") == "daily,online:playlist:ne:11"
+    assert v(" daily ; online:playlist:nealbum:99 , daily ") == \
+        "daily,online:playlist:nealbum:99", "分号兼容、去重、保序"
+    for bad in ("bogus", "online:netease:1", "online:playlist:ne:1;rm -rf /",
+                "../../etc/passwd", "daily, evil"):
+        with pytest.raises(ValueError):
+            v(bad)
+
+
+def test_playlist_order_saved_without_restart(env):
+    """「歌单顺序」卡片单独保存：只提交该字段，其余配置与 token 原样保留。"""
+    with TestClient(admin_ui.app) as c:
+        r = post_cfg(c, {"netease_playlist_order": "daily,online:playlist:ne:11"})
+        assert r.status_code == 200
+    assert read_env(env)["FNMUSIC_NETEASE_PLAYLIST_ORDER"] == "daily,online:playlist:ne:11"
+    assert read_env(env)["FNMUSIC_PUSHPLUS_TOKEN"] == FAKE_TOKEN, "别的字段不能被冲掉"
+    assert read_env(env)["FNMUSIC_NETEASE_QUALITY"] == "exhigh"

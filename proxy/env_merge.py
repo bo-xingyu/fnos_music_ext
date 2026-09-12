@@ -39,6 +39,8 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_NETEASE_CATEGORY", "华语"),
     # 歌单大类展示顺序（v2.4）：列表里各口径的先后，管理页可改
     ("FNMUSIC_NETEASE_CHANNEL_ORDER", "daily,mine,nrec,toplist,category,newalbum,fm"),
+    # 手动歌单顺序（v2.5）：管理页逐个拖排的 token 列表；空=按大类顺序
+    ("FNMUSIC_NETEASE_PLAYLIST_ORDER", ""),
     ("FNMUSIC_PLAYLIST_TRACK_LIMIT", "300"),
     ("FNMUSIC_PLAYLIST_CACHE_DIR", ""),
     # --- 收藏归档与红心同步（v2.2 新增）---
@@ -79,7 +81,7 @@ NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOGIN_",
                 # 加前缀只是允许这些键被自动补齐，键本身仍必须在 NEW_DEFAULTS 里列出，
                 # 因此不会凭空给老用户的 .env 塞进没定义的项。
                 "FNMUSIC_NETEASE_CHANNEL", "FNMUSIC_NETEASE_CATEGOR",
-                "FNMUSIC_PLAYLIST_", "FNMUSIC_DOWNLOAD_", "FNMUSIC_FAV_",
+                "FNMUSIC_NETEASE_PLAYLIST_", "FNMUSIC_PLAYLIST_", "FNMUSIC_DOWNLOAD_", "FNMUSIC_FAV_",
                 "FNMUSIC_QUALITY_")
 
 # v2.0 已废弃的配置项：升级合并时从 .env 中清理，避免残留误导。

@@ -180,6 +180,25 @@ def _as_channel_order(v: Any) -> str:
     return ",".join(picked)
 
 
+def _as_playlist_order(v: Any) -> str:
+    """手动歌单顺序（v2.5）：逗号分隔 token。
+
+    token 只允许 ``daily``（每日推荐的稳定别名，其真实 guid 含日期与用户 id）
+    或 ``online:playlist:...`` 形式的完整 guid。空 = 不启用手动顺序（按大类排）。
+    值来自管理页「歌单顺序」卡片，由前端按当前清单拼好，这里只做防注入校验。
+    """
+    tokens: list[str] = []
+    for part in str(v or "").replace(";", ",").split(","):
+        t = part.strip()
+        if not t:
+            continue
+        if t != "daily" and not re.fullmatch(r"online:playlist:[A-Za-z0-9_.:\-]+", t):
+            raise ValueError(f"顺序项必须是 daily 或 online:playlist:… 的 guid，收到 {t[:60]!r}")
+        if t not in tokens:
+            tokens.append(t)
+    return ",".join(tokens)
+
+
 def _as_path(v: Any) -> str:
     """归档目录：必须是已存在的可写绝对路径，且不能是系统目录。
 
@@ -239,6 +258,7 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     "netease_channel_limit": ("FNMUSIC_NETEASE_CHANNEL_LIMIT", _int_range(1, 50), False),
     "netease_category": ("FNMUSIC_NETEASE_CATEGORY", _free_text(32), False),
     "netease_channel_order": ("FNMUSIC_NETEASE_CHANNEL_ORDER", _as_channel_order, False),
+    "netease_playlist_order": ("FNMUSIC_NETEASE_PLAYLIST_ORDER", _as_playlist_order, False),
     "playlist_track_limit": ("FNMUSIC_PLAYLIST_TRACK_LIMIT", _int_range(1, 1000), False),
     # --- 收藏归档与红心同步 ---
     "download_dir": ("FNMUSIC_DOWNLOAD_DIR", _as_path, True),
@@ -279,6 +299,7 @@ DEFAULTS = {
     "netease_channel_limit": "8",
     "netease_category": "华语",
     "netease_channel_order": "daily,mine,nrec,toplist,category,newalbum,fm",
+    "netease_playlist_order": "",
     "playlist_track_limit": "300",
     "download_dir": "",
     "download_on_favorite": "true",
@@ -1156,6 +1177,43 @@ async def api_config_post(request: Request):
     return result
 
 
+@app.get("/api/playlists")
+async def api_playlists(request: Request):
+    """当前注入飞牛的歌单清单（真实名称 + 当前顺序），供「歌单顺序」卡片。
+
+    数据来自代理进程的 ``/_ext/playlists/preview``：那份清单与飞牛歌单列表
+    实际注入**同源同序**（大类顺序 → 手动顺序覆盖），所以网页上看到的顺序
+    就是飞牛里的顺序。代理不可达时如实报错，不编造清单。
+    """
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=PROXY_SOCK),
+            base_url="http://unix",
+            timeout=45.0,  # 首次要打网易云拉各口径清单，给足余量
+        ) as client:
+            r = await client.get("/_ext/playlists/preview")
+    except Exception as exc:  # noqa: BLE001
+        return _err(502, f"读取歌单清单失败（代理未运行？）：{type(exc).__name__}: {exc}")
+    if r.status_code != 200:
+        return _err(502, f"代理返回 HTTP {r.status_code}")
+    try:
+        body = r.json()
+    except Exception:  # noqa: BLE001
+        return _err(502, "代理返回的不是 JSON")
+    if not body.get("ok"):
+        return _err(502, f"代理预览失败：{str(body.get('error') or '')[:160]}")
+    data = body.get("data") or {}
+    cfg = read_config_masked()
+    saved = str((cfg.get("values") or {}).get("netease_playlist_order") or "")
+    data["saved_order"] = saved
+    data["saved_order_tokens"] = [t for t in saved.split(",") if t.strip()]
+    return {"ok": True, **data}
+
+
 async def restart_services() -> tuple[bool, str]:
     """调用生命周期脚本重启代理与音源服务（不含本页面的 ui 进程）。"""
     script = RESTART_SCRIPT
@@ -1360,6 +1418,12 @@ input:focus,select:focus{outline:2px solid var(--accbg);border-color:var(--acc)}
 .btn.pri:hover{opacity:.9;color:#fff}
 .btn:disabled{opacity:.5;cursor:not-allowed}
 .acts{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px}
+.plrow{display:flex;align-items:center;gap:10px;padding:7px 10px;border:1px solid var(--line);
+  border-radius:8px;margin-bottom:6px;background:var(--card)}
+.plrow .plpos{color:var(--mut);font-size:12px;min-width:22px;text-align:right;font-weight:600}
+.plrow .plname{font-size:13px;font-weight:600;flex:1;word-break:break-all}
+.plrow .plbtns{display:flex;gap:4px}
+.plrow .plbtns .btn{padding:3px 10px;font-size:13px;line-height:1.4}
 .msg{margin-top:12px;padding:10px 12px;border-radius:8px;font-size:13px;display:none;white-space:pre-wrap}
 .msg.ok{display:block;background:var(--okbg);color:var(--ok)}
 .msg.err{display:block;background:var(--errbg);color:var(--err)}
@@ -1626,6 +1690,20 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
       </div>
       <div class="msg" id="cfgMsg"></div>
     </form>
+  </div>
+
+  <div class="card">
+    <h2>歌单顺序（手动排序）</h2>
+    <div class="sub">点「读取当前歌单」拉取当前实际注入飞牛的网易云歌单（真实名称，顺序与飞牛里显示一致），
+      用 ▲▼ 调整后保存。保存后<b>立即生效、无需重启</b>；新出现的歌单会排在手动排过的之后。
+      「恢复默认」清除手动顺序，回到按大类（每日推荐/我的歌单/排行榜…）排列。</div>
+    <div class="acts">
+      <button class="btn" id="plLoadBtn" type="button">读取当前歌单</button>
+      <button class="btn pri" id="plSaveBtn" type="button">保存顺序</button>
+      <button class="btn" id="plResetBtn" type="button">恢复默认（按大类）</button>
+    </div>
+    <div class="msg" id="plMsg"></div>
+    <div id="plList"></div>
   </div>
 
   <div class="card">
@@ -2014,6 +2092,70 @@ function runDiag(auto){
   });
 }
 $("#diagBtn").onclick=function(){ DIAG_DONE=false; runDiag(false) };
+
+// ---------------- 歌单顺序（手动排序） ----------------
+var PL_ITEMS=[];
+var PL_CH_LABELS={daily:"每日推荐",mine:"我的歌单",nrec:"推荐歌单",toplist:"排行榜",
+  category:"分类歌单",newalbum:"新碟上架",fm:"私人FM"};
+function plLabel(ch){ return PL_CH_LABELS[ch]||ch||"" }
+function plToken(it){ return it.channel==="daily" ? "daily" : it.guid }
+function renderPl(){
+  var box=$("#plList");
+  if(!PL_ITEMS.length){
+    box.innerHTML='<div class="sub" style="margin:0">（暂无歌单——需已登录且至少启用一个歌单口径）</div>';
+    return;
+  }
+  box.innerHTML=PL_ITEMS.map(function(it,i){
+    return '<div class="plrow">'+
+      '<span class="plpos">'+(i+1)+'</span>'+
+      '<span class="plname">'+esc(it.name)+'</span>'+
+      '<span class="pill warn" style="margin:0">'+esc(plLabel(it.channel))+'</span>'+
+      '<span class="plbtns">'+
+        '<button class="btn" type="button" data-i="'+i+'" data-d="-1"'+(i===0?" disabled":"")+'>▲</button>'+
+        '<button class="btn" type="button" data-i="'+i+'" data-d="1"'+(i===PL_ITEMS.length-1?" disabled":"")+'>▼</button>'+
+      '</span></div>';
+  }).join("");
+  Array.prototype.forEach.call(box.querySelectorAll("button[data-i]"),function(b){
+    b.onclick=function(){
+      var i=+b.getAttribute("data-i"),d=+b.getAttribute("data-d"),j=i+d;
+      if(j<0||j>=PL_ITEMS.length) return;
+      var t=PL_ITEMS[i];PL_ITEMS[i]=PL_ITEMS[j];PL_ITEMS[j]=t;
+      renderPl();
+    };
+  });
+}
+function loadPl(){
+  var b=$("#plLoadBtn"); b.disabled=true; b.textContent="读取中…";
+  api("api/playlists").then(function(j){
+    b.disabled=false; b.textContent="读取当前歌单";
+    var m=$("#plMsg"); m.className="msg";
+    if(!j.ok){ m.className="msg err"; m.textContent="读取失败："+(j.error||("HTTP "+(j._status||"?"))); return; }
+    PL_ITEMS=(j.items||[]).filter(function(it){ return it && it.guid });
+    m.textContent = PL_ITEMS.length
+      ? ("共 "+PL_ITEMS.length+" 个歌单"+(j.logged_in?"":"（当前未登录，需登录的口径未列出）")
+         +(j.manual_order&&j.manual_order.length?"；已启用手动顺序":"；当前按大类顺序"))
+      : "暂无歌单（未登录或未启用任何口径）";
+    renderPl();
+  });
+}
+function savePlOrder(val){
+  var b=(val===null)?$("#plResetBtn"):$("#plSaveBtn");
+  b.disabled=true; var orig=b.textContent; b.textContent="保存中…";
+  api("api/config",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({values:{netease_playlist_order:(val==null?"":val)},restart:false})}
+  ).then(function(j){
+    b.disabled=false; b.textContent=orig;
+    var m=$("#plMsg");
+    if(!j.ok){ m.className="msg err"; m.textContent="保存失败："+(j.error||"未知错误"); return; }
+    m.className="msg ok";
+    m.textContent = (val==null||val==="") ? "已恢复默认（按大类）顺序。" : "顺序已保存，立即生效。";
+    setTimeout(loadPl,800);   // 代理实时读 .env，回读确认新顺序
+  });
+}
+$("#plLoadBtn").onclick=loadPl;
+$("#plSaveBtn").onclick=function(){ savePlOrder(PL_ITEMS.map(plToken).join(",")) };
+$("#plResetBtn").onclick=function(){ savePlOrder(null) };
+loadPl();
 Array.prototype.forEach.call($("#logTabs").querySelectorAll("button"),function(b){
   b.onclick=function(){
     Array.prototype.forEach.call($("#logTabs").querySelectorAll("button"),function(x){x.classList.remove("on")});

@@ -1723,6 +1723,55 @@ async def ext_quality_report():
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
 
 
+@app.get("/_ext/playlists/preview")
+async def ext_playlists_preview():
+    """当前注入歌单清单与顺序预览（管理页「歌单顺序」卡片的数据源）。
+
+    顺序与 ``playlist_list`` 实际注入**完全同源**（大类顺序 → 手动顺序覆盖），
+    保证「网页上排什么序，飞牛里就是什么序」。只读：不盖展示时间戳；
+    ``fetch_channel_records`` 顺带刷新注册表属于既有语义，无副作用。
+    """
+    client = get_musicbox_client(app)
+    logged_in = await _netease_logged_in()
+
+    items: list[dict] = []
+    if CONF["netease_enabled"] and CONF["daily_enabled"] and logged_in:
+        # 每日推荐的 guid 含日期与用户 id，预览用固定假 guid，手动顺序里以
+        # token "daily" 与之匹配（apply_explicit_order 的 _token_matches）。
+        items.append({
+            "guid": playlists.DAILY_NS + "preview",
+            "name": dailyrec.daily_playlist_name(dailyrec.today_key()),
+            "channel": "daily",
+            "track_count": 0,
+        })
+    try:
+        channel_recs, _keep, _complete = await _channel_playlist_records(client)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("playlist preview: channel records failed: %s: %s",
+                       type(exc).__name__, exc)
+        channel_recs = []
+    for r in channel_recs:
+        items.append({
+            "guid": str(r.get("guid") or ""),
+            "name": str(r.get("name") or "网易云歌单"),
+            "channel": str(r.get("channel") or ""),
+            "track_count": int(r.get("track_count") or 0),
+        })
+
+    stamped_order = playlists.channel_order()
+    items.sort(key=lambda it: stamped_order.index(it["channel"])
+               if it["channel"] in stamped_order else len(stamped_order))
+    items = playlists.apply_explicit_order(items)
+    return {
+        "ok": True,
+        "data": {
+            "items": [{**it, "is_daily": it["channel"] == "daily"} for it in items],
+            "logged_in": logged_in,
+            "manual_order": list(playlists.explicit_order_tokens()),
+        },
+    }
+
+
 @app.get("/music/api/v1/search/track")
 @app.get("/music/api/v1/search/track/{subpath:path}")
 async def search_track(request: Request):
@@ -3176,7 +3225,10 @@ async def playlist_list(request: Request):
     # 稳定排序：同口径内部保持上游顺序（如「我的歌单」里自建在前、收藏在后）
     head_items.sort(key=lambda pair: stamped_order.index(pair[0])
                     if pair[0] in stamped_order else len(stamped_order))
-    head = playlists.stamp_display_order([it for _ch, it in head_items])
+    # 手动顺序（管理页「歌单顺序」卡片保存的 token 列表）整体覆盖大类顺序；
+    # 没排到的新歌单按大类相对顺序跟在后面。实时读 .env，保存后立即生效。
+    head = playlists.apply_explicit_order([it for _ch, it in head_items])
+    head = playlists.stamp_display_order(head)
 
     data["list"] = head + official
     data["total"] = len(head) + len(official)
