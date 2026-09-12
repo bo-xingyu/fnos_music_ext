@@ -988,15 +988,21 @@ async def forward_to_upstream(
     request: Request,
     client: httpx.AsyncClient,
     timeout: float | None = None,
+    label: str = "",
 ) -> Response:
-    """把请求原样转给官方后端。
+    """把请求原样转给官方后端（流式）。
 
-    ``timeout`` 允许调用方为慢端点放宽读超时（默认沿用客户端的 30s）。
-    转码链路必须放宽：官方后端收到 /track/transcode 后要等 ffmpeg 产出
-    首个 HLS 分片才应答，NAS 磁盘慢或大文件（DSD/APE/FLAC）时 30s 根本
-    不够——超时异常会把「能播」变成 500，用户看到的就是开了转码本地歌
-    全部播放失败。
+    - ``timeout`` 允许调用方为慢端点放宽读超时（默认沿用客户端的 30s）。
+      转码链路必须放宽：官方后端收到 /track/transcode 后要等 ffmpeg 产出
+      首个 HLS 分片才应答，NAS 磁盘慢或大文件（DSD/APE/FLAC）时 30s 根本
+      不够——超时异常会把「能播」变成 500，用户看到的就是开了转码本地歌
+      全部播放失败。
+    - ``label`` 非空时把上游状态码与耗时记进日志（本地转码排障关键：
+      客户端只请求一次 m3u8、失败后直接放弃，不留下任何线索）。
+    - 上游未压缩（我们强制 accept-encoding: identity）时**保留 content-length**，
+      让转发应答与官方直连逐字节等价，不给挑剔的播放器留差异。
     """
+    started = time.monotonic()
     url_path = request.url.path
     if request.url.query:
         url_path = f"{url_path}?{request.url.query}"
@@ -1018,16 +1024,29 @@ async def forward_to_upstream(
     try:
         resp = await client.send(req, stream=True)
     except httpx.TimeoutException as exc:
-        logger.warning("upstream forward timeout %s %s: %s", request.method,
-                       request.url.path, type(exc).__name__)
+        logger.warning("%supstream timeout %s %s: %s", f"[{label}] " if label else "",
+                       request.method, request.url.path, type(exc).__name__)
         return JSONResponse(status_code=504, content={"code": 504, "msg": "upstream timeout",
                                                       "data": None})
     except httpx.HTTPError as exc:
-        logger.warning("upstream forward failed %s %s: %s: %s", request.method,
-                       request.url.path, type(exc).__name__, exc)
+        logger.warning("%supstream forward failed %s %s: %s: %s", f"[{label}] " if label else "",
+                       request.method, request.url.path, type(exc).__name__, exc)
         return JSONResponse(status_code=502, content={"code": 502, "msg": "upstream unavailable",
                                                       "data": None})
-    resp_headers = filter_headers(resp.headers, exclude_keys={"content-length", "content-encoding"})
+    if label:
+        ms = (time.monotonic() - started) * 1000.0
+        line = ("%s %s %s -> %s %.0fms ct=%s",
+                label, request.method, request.url.path, resp.status_code, ms,
+                resp.headers.get("content-type") or "-")
+        if resp.status_code >= 400:
+            logger.warning(*line)
+        else:
+            logger.info(*line)
+    exclude = {"content-encoding"}
+    if resp.headers.get("content-encoding"):
+        # 上游还是压缩了（罕见）：解压后长度必变，content-length 只能丢
+        exclude.add("content-length")
+    resp_headers = filter_headers(resp.headers, exclude_keys=exclude)
 
     async def body_stream() -> AsyncGenerator[bytes, None]:
         try:
@@ -1040,6 +1059,75 @@ async def forward_to_upstream(
         body_stream(),
         status_code=resp.status_code,
         headers=resp_headers,
+    )
+
+
+async def forward_buffered(
+    request: Request,
+    client: httpx.AsyncClient,
+    timeout: float | None = None,
+    label: str = "",
+    body_sniff: int = 0,
+) -> Response:
+    """转发并**整包缓冲**应答（m3u8 / 转码会话这类小应答专用）。
+
+    与流式转发的差别：
+    1. 应答体在日志里留证（状态码、耗时、content-type，以及可选的响应体开头
+       ``body_sniff`` 字节）——本地转码排障全靠它：客户端对 m3u8 只请求一次、
+       失败即放弃，不留证就永远不知道官方后端到底回了什么。
+    2. 原样保留 content-length 回给客户端，与官方直连逐字节等价。
+    """
+    started = time.monotonic()
+    url_path = request.url.path
+    if request.url.query:
+        url_path = f"{url_path}?{request.url.query}"
+
+    headers = copy_incoming_headers(request)
+    body = await request.body()
+
+    extensions = None
+    if timeout is not None:
+        extensions = {"timeout": httpx.Timeout(connect=10.0, read=timeout, write=30.0,
+                                               pool=30.0).as_dict()}
+    req = client.build_request(
+        method=request.method,
+        url=url_path,
+        headers=headers,
+        content=body if body else None,
+        extensions=extensions,
+    )
+    try:
+        resp = await client.send(req)
+    except httpx.TimeoutException as exc:
+        logger.warning("%supstream timeout %s %s: %s", f"[{label}] " if label else "",
+                       request.method, request.url.path, type(exc).__name__)
+        return JSONResponse(status_code=504, content={"code": 504, "msg": "upstream timeout",
+                                                      "data": None})
+    except httpx.HTTPError as exc:
+        logger.warning("%supstream forward failed %s %s: %s: %s", f"[{label}] " if label else "",
+                       request.method, request.url.path, type(exc).__name__, exc)
+        return JSONResponse(status_code=502, content={"code": 502, "msg": "upstream unavailable",
+                                                      "data": None})
+
+    content = resp.content
+    ms = (time.monotonic() - started) * 1000.0
+    sniff = ""
+    if body_sniff:
+        sniff = " body[:%d]=%r" % (body_sniff, content[:body_sniff])
+    log_args = ("%s %s %s -> %s %.0fms %dB ct=%s%s",
+                label or "forward", request.method, request.url.path, resp.status_code, ms,
+                len(content), resp.headers.get("content-type") or "-", sniff)
+    if resp.status_code >= 400:
+        logger.warning(*log_args)
+    else:
+        logger.info(*log_args)
+
+    resp_headers = filter_headers(resp.headers, exclude_keys={"content-encoding", "content-type"})
+    return Response(
+        content=content,
+        status_code=resp.status_code,
+        headers=resp_headers,
+        media_type=resp.headers.get("content-type"),
     )
 
 
@@ -2003,7 +2091,8 @@ async def stream_track(request: Request):
     if not is_online_guid(guid):
         # 本地曲目直通官方后端；播放链路放宽读超时（见 PLAYBACK_FORWARD_TIMEOUT_S）
         return await forward_to_upstream(
-            request, get_upstream_client(request.app), timeout=PLAYBACK_FORWARD_TIMEOUT_S)
+            request, get_upstream_client(request.app),
+            timeout=PLAYBACK_FORWARD_TIMEOUT_S, label="local-stream")
 
     range_header = request.headers.get("range")
     cached = find_cache_file(guid)
@@ -2077,9 +2166,15 @@ async def stream_track(request: Request):
 @app.get("/music/api/v1/track/hls/{guid}/{filename}")
 async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
     if not is_online_guid(guid):
-        # 本地转码的 m3u8 / 分片由官方后端（ffmpeg）产出，首包可能较慢
+        client = get_upstream_client(request.app)
+        if str(filename).lower().endswith(".m3u8"):
+            # m3u8 很小且是排障关键：整包透传 + 日志留证（见 forward_buffered）
+            return await forward_buffered(
+                request, client, timeout=PLAYBACK_FORWARD_TIMEOUT_S,
+                label="hls-playlist", body_sniff=240)
+        # 分片可能很大，流式转发 + 状态码留证
         return await forward_to_upstream(
-            request, get_upstream_client(request.app), timeout=PLAYBACK_FORWARD_TIMEOUT_S)
+            request, client, timeout=PLAYBACK_FORWARD_TIMEOUT_S, label="hls-segment")
 
     info = await _online_info(request, guid)
     duration_s = 0
@@ -2110,8 +2205,9 @@ async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
 async def track_transcode_session(request: Request):
     guid = await extract_guid_from_body(request)
     if not is_online_guid(guid):
-        return await forward_to_upstream(
-            request, get_upstream_client(request.app), timeout=PLAYBACK_FORWARD_TIMEOUT_S)
+        return await forward_buffered(
+            request, get_upstream_client(request.app),
+            timeout=PLAYBACK_FORWARD_TIMEOUT_S, label="transcode-session", body_sniff=160)
     return JSONResponse(content={"code": 0, "msg": "ok", "data": {"guid": guid}})
 
 
@@ -2119,9 +2215,11 @@ async def track_transcode_session(request: Request):
 async def track_transcode(request: Request):
     guid = await extract_guid_from_body(request)
     if not is_online_guid(guid):
-        # 本地转码启动要等 ffmpeg 就绪，30s 共享超时会把它打成 504
-        return await forward_to_upstream(
-            request, get_upstream_client(request.app), timeout=PLAYBACK_FORWARD_TIMEOUT_S)
+        # 本地转码启动要等 ffmpeg 就绪，30s 共享超时会把它打成 504。
+        # 应答整包透传 + 留证：转码会话到底建没建起来，日志里必须看得见。
+        return await forward_buffered(
+            request, get_upstream_client(request.app),
+            timeout=PLAYBACK_FORWARD_TIMEOUT_S, label="transcode-start", body_sniff=240)
     return JSONResponse(
         content={
             "code": 0,
@@ -3061,8 +3159,8 @@ async def playlist_list(request: Request):
         channel_recs = []
 
     # 组装注入头部：每日推荐 + 各口径伪歌单，按管理页配置的「大类顺序」排列。
-    # daily 也参加排序（默认在最前）；随后统一盖上互不相同的时间戳，
-    # 保证客户端无论怎么排都得到同一个顺序（见 stamp_display_order 注释）。
+    # daily 也参加排序（默认在最前）；随后统一盖上互不相同且递增的展示时间戳
+    # （基准远早于本地歌单，客户端升序排序时注入条目整体在前、顺序=注入顺序）。
     stamped_order = playlists.channel_order()
     head_items: list[tuple[str, dict]] = []
     if tracks:
@@ -3110,6 +3208,12 @@ async def playlist_detail(request: Request):
     bundle = await _load_daily_bundle(request, user_guid)
     rec = _playlist_public_fields(bundle.get("playlist") or {})
     rec["trackCount"] = len(bundle.get("tracks") or [])
+    # 时间戳必须与列表页同一份（客户端按它排序）：列表页注入时会把每条的展示
+    # 时间戳写进注册表，这里取注册表的值；取不到（还没请求过列表）才用 bundle 的。
+    reg_ts = playlists.lookup(guid).get("ts")
+    if reg_ts:
+        rec["createdAt"] = int(reg_ts)
+        rec["updatedAt"] = int(reg_ts)
     return JSONResponse(content={"code": 0, "msg": "ok", "data": rec})
 
 
@@ -3170,6 +3274,11 @@ async def playlist_batch_detail(request: Request):
             bundle = await _load_daily_bundle(request, user_guid)
             daily_rec = _playlist_public_fields(bundle.get("playlist") or {})
             daily_rec["trackCount"] = len(bundle.get("tracks") or [])
+            # 与列表页同一份展示时间戳（客户端按它排序），见 playlist_detail 同款注释
+            reg_ts = playlists.lookup(g).get("ts")
+            if reg_ts:
+                daily_rec["createdAt"] = int(reg_ts)
+                daily_rec["updatedAt"] = int(reg_ts)
             out.append(daily_rec)
         else:
             out.append(daily_rec)

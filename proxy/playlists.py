@@ -33,6 +33,12 @@ NETEASE_PLAYLIST_PREFIX = "online:playlist:ne:"
 NETEASE_ALBUM_PREFIX = "online:playlist:nealbum:"
 NETEASE_FM_GUID = "online:playlist:nefm"
 CHANNEL_NS = "online:playlist:"
+DAILY_NS = "online:playlist:daily:"
+
+# 注入歌单的展示时间戳基准。必须不大于任何真实歌单的时间戳（fnOS 2023 年
+# 才发布，正常歌单都是 1.7e9 级；官方自动创建的歌单理论上可能给 0/1 这类
+# 占位值），客户端按时间戳升序排列时注入条目才会排在本地歌单之前。
+_DISPLAY_TS_BASE = 1
 
 # 口径 -> (是否需要登录, 展示名前缀)
 CHANNELS: dict[str, dict[str, Any]] = {
@@ -226,10 +232,30 @@ def lookup(guid: str | None) -> dict:
 
 
 def forget_stale(keep_guids: set[str]) -> int:
-    """清掉本轮列表里已经不再出现的条目（例如取消了某个口径、或歌单被删除）。"""
+    """清掉本轮列表里已经不再出现的条目（例如取消了某个口径、或歌单被删除）。
+
+    每日推荐条目（stamp_display_order 写入、供详情页回显同一份时间戳）按
+    ``seen`` 字段清理：超过 14 天没出现在任何列表里就删——它的 guid 含日期
+    与用户 id，不清理会一天一条地无限累积。
+    """
     reg = load_registry()
-    doomed = [g for g in reg if str(g).startswith(CHANNEL_NS) and g not in keep_guids
-              and not str(g).startswith("online:playlist:daily:")]
+    stale_cutoff = int(time.time()) - 14 * 86400
+    doomed = []
+    for g in reg:
+        gs = str(g)
+        if not gs.startswith(CHANNEL_NS):
+            continue
+        if gs.startswith(DAILY_NS):
+            try:
+                seen = int(reg[g].get("seen") or 0)
+            except (TypeError, ValueError):
+                seen = 0
+            # 没有 seen 的（手工/旧版写入）保守保留；有 seen 且 14 天没出现过的清掉
+            if seen and seen < stale_cutoff:
+                doomed.append(g)
+            continue
+        if g not in keep_guids:
+            doomed.append(g)
     for g in doomed:
         reg.pop(g, None)
     if doomed:
@@ -412,28 +438,51 @@ async def collect_records(client, logged_in: bool) -> tuple[list[dict], set[str]
 
 
 def stamp_display_order(items: list[dict]) -> list[dict]:
-    """给最终注入顺序里的条目盖上**互不相同且单调递减**的 createdAt/updatedAt。
+    """给最终注入顺序里的条目盖上**互不相同且单调递增**的 createdAt/updatedAt。
 
-    飞牛客户端会按 updatedAt 对歌单列表排序，而原先每条记录的时间都是
-    ``int(time.time())`` —— 同一秒内的一堆完全相同的时间戳，遇上客户端的
-    非稳定排序就是每次刷新都换一个顺序（用户看到的「顺序不固定」）。
-    现在按注入位置依次减一秒：客户端无论按 updatedAt 升序还是降序排，
-    得到的都是**确定**的顺序（降序=注入序，升序=严格反序），不再随机。
+    飞牛客户端对歌单列表按时间戳**升序**排列（v2.4.0 真机验证：注入条目用
+    "当前时间递减"的时间戳时，每日推荐（时间戳最大）反而沉到了最底部）。
+    因此注入条目必须从一个**远早于任何真实歌单**的基准开始递增：
+
+      基准(1600000000 = 2020-09) + 位置序号
+
+    fnOS 2023 年才发布，本地歌单的 createdAt 不可能早于 2020，所以注入条目
+    永远排在本地歌单之前，且顺序 = 注入顺序：位置 0（默认是每日推荐）最小、
+    排最前，同口径内部保持上游顺序。客户端无论按 createdAt 还是 updatedAt
+    升序排，得到的都是同一顺序。
 
     就地修改并返回同一列表。注册表里的 ts 同步更新：playlist/detail 与
     batch-detail 回显的 createdAt/updatedAt 取的就是它，两处必须一致，
     否则详情页与列表页的顺序语义打架。
     """
+    base = _DISPLAY_TS_BASE
     now = int(time.time())
     reg = load_registry()
     dirty = False
     for i, it in enumerate(items):
-        ts = now - i
+        ts = base + i
         it["createdAt"] = ts
         it["updatedAt"] = ts
         guid = str(it.get("guid") or "")
+        if not guid:
+            continue
+        if guid.startswith(DAILY_NS):
+            # 每日推荐不在注册表里（归 recommend.py 管），但详情页回显要和
+            # 列表页同一份时间戳，这里补一条；seen 记录真实见到时间，供过期清理。
+            entry = reg.get(guid)
+            if not isinstance(entry, dict):
+                entry = {"name": str(it.get("name") or ""), "cover_url": "",
+                         "track_count": int(it.get("trackCount") or 0), "channel": "daily"}
+                reg[guid] = entry
+            if entry.get("ts") != ts:
+                entry["ts"] = ts
+                dirty = True
+            if entry.get("seen") != now:
+                entry["seen"] = now
+                dirty = True
+            continue
         entry = reg.get(guid)
-        if guid and isinstance(entry, dict) and entry.get("ts") != ts:
+        if isinstance(entry, dict) and entry.get("ts") != ts:
             entry["ts"] = ts
             dirty = True
     if dirty:

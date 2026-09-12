@@ -322,11 +322,13 @@ def test_channels_enabled_follows_custom_order(monkeypatch):
     )
 
 
-def test_stamp_display_order_gives_distinct_descending_timestamps(registry_dir):
-    """每条注入条目拿到互不相同、按位置递减的时间戳。
+def test_stamp_display_order_gives_distinct_ascending_timestamps(registry_dir):
+    """每条注入条目拿到互不相同、按位置递增、且远早于本地歌单的时间戳。
 
-    原先所有条目共用 int(time.time())，客户端的非稳定排序每次刷新都会
-    换一个顺序——这正是「歌单顺序不固定」的根因。
+    v2.4.0 真机验证：飞牛客户端按时间戳**升序**排列歌单列表。所有条目共用
+    int(time.time()) 时（v2.3）顺序随机；用"当前时间递减"时（v2.4.0）每日推荐
+    （时间戳最大）反而沉底。正确做法：从小基准（2020-09）开始递增——
+    注入条目永远排在本地歌单（fnOS 2023 年才发布）之前，顺序=注入顺序。
     """
     items = [
         {"guid": "online:playlist:daily:20260912", "name": "每日推荐"},
@@ -337,14 +339,19 @@ def test_stamp_display_order_gives_distinct_descending_timestamps(registry_dir):
     pl.remember(pl.build_record("online:playlist:ne:1", "a", "", 1, "mine"))
     out = pl.stamp_display_order(items)
     ts = [it["createdAt"] for it in out]
-    assert ts == sorted(ts, reverse=True), "时间戳必须严格递减"
+    assert ts == sorted(ts), "时间戳必须严格递增"
     assert len(set(ts)) == len(ts), "时间戳必须互不相同，否则非稳定排序仍会乱"
     assert all(it["createdAt"] == it["updatedAt"] for it in out)
+    assert max(ts) < 1700000000, "展示时间戳必须早于任何真实 fnOS 歌单（2023+）"
+    # 升序排序（客户端实际行为）应还原注入顺序
+    assert [it["name"] for it in sorted(out, key=lambda x: x["createdAt"])] == \
+        ["每日推荐", "a", "b", "c"]
     # 注册表 ts 同步：详情页回显要与列表页一致
     assert pl.lookup("online:playlist:ne:1")["ts"] == ts[1]
-    # 降序排序（客户端常见行为）应还原注入顺序
-    assert [it["name"] for it in sorted(out, key=lambda x: -x["updatedAt"])] == \
-        ["每日推荐", "a", "b", "c"]
+    # 每日推荐也进注册表（详情页取同一份时间戳），并带真实 seen 供过期清理
+    daily_reg = pl.lookup("online:playlist:daily:20260912")
+    assert daily_reg["ts"] == ts[0]
+    assert daily_reg.get("seen", 0) > 1700000000
 
 
 def test_stamp_display_order_syncs_registry_for_detail_pages(registry_dir):
@@ -355,8 +362,25 @@ def test_stamp_display_order_syncs_registry_for_detail_pages(registry_dir):
         {"guid": "online:playlist:ne:8", "name": "y"},
         {"guid": "online:playlist:ne:9", "name": "x"},
     ])
-    reg = pl.lookup("online:playlist:ne:9")
-    assert reg["ts"] == pl.lookup("online:playlist:ne:8")["ts"] - 1
+    assert pl.lookup("online:playlist:ne:9")["ts"] == pl.lookup("online:playlist:ne:8")["ts"] + 1
+
+
+def test_forget_stale_prunes_old_daily_entries(registry_dir):
+    """每日推荐注册条目按 seen 过期清理（guid 含日期，不清理会无限累积）。"""
+    import time as _time
+    fresh = "online:playlist:daily:20260912:user-a"
+    stale = "online:playlist:daily:20260101:user-a"
+    pl.stamp_display_order([{"guid": fresh, "name": "今日", "trackCount": 3}])
+    pl.remember({"guid": stale, "name": "年初", "track_count": 0, "channel": "daily",
+                 "ts": 1600000000})
+    # remember() 只认标准字段，seen 需要手工补上（模拟 stamp 写入后又过了 15 天）
+    reg = pl.load_registry()
+    reg[stale]["seen"] = int(_time.time()) - 15 * 86400
+    pl.save_registry()
+    n = pl.forget_stale(set())
+    assert n == 1, "只应清掉 14 天没见过的 daily 条目"
+    assert pl.lookup(fresh), "今天刚出现的 daily 条目必须保留"
+    assert not pl.lookup(stale)
 
 
 # ===========================================================================
@@ -403,8 +427,10 @@ def _upstream_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"code": 0, "data": {"guid": "user-ord"}})
     if path.endswith("/playlist/list"):
         return httpx.Response(200, json={"code": 0, "data": {
+            # 本地歌单的真实时间戳是 1.7e9 级（fnOS 2023+），注入条目的展示
+            # 时间戳必须比它更小才能在客户端升序排序里排在前面
             "list": [{"guid": "localpl", "name": "本地单", "coverId": "c",
-                      "createdAt": 1, "updatedAt": 1}], "total": 1}})
+                      "createdAt": 1700000000, "updatedAt": 1700000000}], "total": 1}})
     if "search/track" in path:
         return httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}})
     return httpx.Response(200, json={"code": 0, "data": None})
@@ -433,7 +459,20 @@ def test_playlist_list_follows_custom_channel_order(registry_dir, monkeypatch):
     assert _rec.is_daily_playlist_guid(lst[1]["guid"]), names
     assert names[2].startswith("网易云·"), names
     assert lst[-1]["guid"] == "localpl"
-    # 头部时间戳严格递减：客户端怎么排序都得到同一顺序
+    # 展示时间戳严格递增（客户端升序排序 ⇒ 显示顺序=注入顺序），且全部早于本地歌单
     head_ts = [it["updatedAt"] for it in lst[:-1]]
-    assert head_ts == sorted(head_ts, reverse=True), head_ts
+    assert head_ts == sorted(head_ts), head_ts
     assert len(set(head_ts)) == len(head_ts), "时间戳必须互不相同"
+    assert max(head_ts) < 1700000000, "必须早于真实 fnOS 歌单的创建时间"
+    # 客户端升序排序后，显示顺序应与注入顺序一致：榜 → 日推 → 我的歌单
+    asc = sorted(lst, key=lambda x: x["updatedAt"])
+    assert [it["name"] for it in asc[:3]] == names[:3]
+
+    # 详情页 / 批量详情页回显的时间戳必须与列表页同一份（客户端按它排序）
+    with TestClient(proxy_app) as client2:
+        d = client2.get(f"/music/api/v1/playlist/detail?guid={lst[1]['guid']}").json()
+        assert d["data"]["createdAt"] == lst[1]["createdAt"], "详情页与列表页时间戳必须一致"
+        b = client2.get(f"/music/api/v1/playlist/batch-detail?guids={lst[1]['guid']}").json()
+        daily_entry = [x for x in b["data"]["list"]
+                       if _rec.is_daily_playlist_guid(str(x.get("guid")))]
+        assert daily_entry and daily_entry[0]["createdAt"] == lst[1]["createdAt"]

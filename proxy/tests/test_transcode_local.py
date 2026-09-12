@@ -80,11 +80,15 @@ def test_local_transcode_chain_is_transparent(wired):
                           headers={"Host": "nas.example.com:5667"})
         assert m3u8.status_code == 200
         assert "#EXTM3U" in m3u8.text
+        # 应答必须带准确的 content-length（与官方直连逐字节等价，不给播放器留差异）
+        assert int(m3u8.headers["content-length"]) == len(m3u8.content)
+        assert m3u8.headers["content-type"].startswith("application/vnd.apple.mpegurl")
 
         seg = client.get("/music/api/v1/track/hls/local-1/seg-0.ts",
                          headers={"Host": "nas.example.com:5667"})
         assert seg.status_code == 200
         assert len(seg.content) == 2048
+        assert int(seg.headers["content-length"]) == 2048
 
     reqs = {r["path"]: r for r in SEEN["requests"]}
     assert "/music/api/v1/track/transcode" in reqs
