@@ -3570,15 +3570,21 @@ def _playlist_warm_cooldown() -> float:
     return float(playlists.tracks_cache_ttl())
 
 
-async def _warm_playlist_caches(fastapi_app: FastAPI, guids: "list[str] | None" = None) -> dict:
+async def _warm_playlist_caches(fastapi_app: FastAPI, guids: "list[str] | None" = None,
+                                skip_fresh_s: float = 0.0) -> dict:
     """后台刷新歌单曲目缓存。串行 + 每个之间歇 1s，对上游友好。
 
-    ``guids=None``（定时刷新/预热按钮）时**现场拉取当前口径的歌单清单**再预热，
+    ``guids=None``（定时刷新）时**现场拉取当前口径的歌单清单**再预热，
     绝不能直接用注册表全部条目——注册表里可能留着历史口径/旧分类的死条目
     （complete=False 时按设计不清），每天把它们全量拉一遍纯属浪费上游配额
     （真机上出现过注册表 59 条、当前在列仅 34 条，07:15 定时刷新白刷 25 个）。
     顺带在清单完整时 forget_stale，把死条目连同其曲目缓存一起清掉。
     ``guids`` 由调用方给出（playlist_list 已拿到当前清单）时直接用，不重复拉。
+
+    ``skip_fresh_s``（秒）：**跳过缓存仍新鲜的歌单**（v2.8.2）。定时刷新与
+    自动预热传 入该阈值——15 分钟前刚刷过的缓存内容就是新的，再拉一遍上游
+    纯属浪费（真机现象：07:00 手动预热 33/33，07:15 定时任务又把 33 个全部
+    重刷）。手动按钮传 0（用户按了按钮就是要全量刷新）。
     """
     global _PLAYLIST_WARMING
     if _PLAYLIST_WARMING:
@@ -3600,7 +3606,13 @@ async def _warm_playlist_caches(fastapi_app: FastAPI, guids: "list[str] | None" 
             guids = [str(r.get("guid") or "") for r in recs if r.get("guid")]
 
         refreshed = 0
+        skipped_fresh = 0
         for guid in guids:
+            if skip_fresh_s > 0:
+                hit = playlists.load_cached_tracks(guid)
+                if hit is not None and (time.time() - hit[0]) < skip_fresh_s:
+                    skipped_fresh += 1
+                    continue
             try:
                 items = await _fetch_channel_tracks(client, guid)
                 if items:
@@ -3609,18 +3621,31 @@ async def _warm_playlist_caches(fastapi_app: FastAPI, guids: "list[str] | None" 
             except Exception as exc:  # noqa: BLE001 - 单个失败不挡后面
                 logger.warning("预热歌单 %s 失败: %s: %s", guid, type(exc).__name__, exc)
             await asyncio.sleep(1.0)
-        logger.info("歌单缓存预热完成：%d/%d 个成功", refreshed, len(guids))
-        return {"started": True, "refreshed": refreshed, "total": len(guids)}
+        logger.info("歌单缓存预热完成：刷新 %d、跳过（仍新鲜）%d、共 %d 个",
+                    refreshed, skipped_fresh, len(guids))
+        return {"started": True, "refreshed": refreshed,
+                "skipped_fresh": skipped_fresh, "total": len(guids)}
     finally:
         _PLAYLIST_WARMING = False
 
 
+def _warm_skip_fresh_s() -> float:
+    """定时刷新/自动预热跳过「仍新鲜」缓存的阈值（秒）；0 = 一律刷新。
+
+    默认 3600：一小时内刚刷过的缓存内容就是新的，重拉纯属浪费上游配额。
+    手动按钮不受此限（按下按钮就是明确要求全量刷新）。
+    """
+    return max(0.0, _float("FNMUSIC_WARM_SKIP_FRESH_S", 3600.0))
+
+
 def _schedule_playlist_warm(fastapi_app: FastAPI, *, force: bool = False,
-                            guids: "list[str] | None" = None) -> bool:
+                            guids: "list[str] | None" = None,
+                            skip_fresh_s: float = 0.0) -> bool:
     """安排一次后台预热。返回是否真的安排了（已在跑/冷却期内则 False）。
 
     ``guids``：已知当前在列歌单时直接传入（省一次清单拉取）；
     缺省由预热任务自己现场拉当前清单（见 _warm_playlist_caches）。
+    ``skip_fresh_s``：>0 时跳过缓存仍新鲜的歌单（定时刷新/自动预热用）。
     """
     global _LAST_AUTO_WARM_AT
     if _PLAYLIST_WARMING:
@@ -3631,7 +3656,7 @@ def _schedule_playlist_warm(fastapi_app: FastAPI, *, force: bool = False,
         _LAST_AUTO_WARM_AT = time.time()
 
     async def _job() -> None:
-        await _warm_playlist_caches(fastapi_app, guids=guids)
+        await _warm_playlist_caches(fastapi_app, guids=guids, skip_fresh_s=skip_fresh_s)
 
     asyncio.create_task(_job())
     return True
@@ -3654,7 +3679,8 @@ async def _playlist_refresh_loop(fastapi_app: FastAPI, stop_event: asyncio.Event
         if stop_event.is_set():
             return
         logger.info("定时刷新歌单缓存开始（%s）", playlists.refresh_time_of_day())
-        _schedule_playlist_warm(fastapi_app, force=True)
+        # 只补缺的/过新的：一小时内刚刷过的缓存直接跳过（见 _warm_skip_fresh_s）
+        _schedule_playlist_warm(fastapi_app, force=True, skip_fresh_s=_warm_skip_fresh_s())
         # 等一小会儿让本轮跑起来；下轮循环会重新计算明天的触发时间
         await asyncio.sleep(5.0)
 
@@ -3860,7 +3886,7 @@ async def playlist_list(request: Request):
     # 不再让预热任务重复拉一遍（也绝不会碰到注册表里的历史死条目）。
     if head:
         _schedule_playlist_warm(
-            request.app,
+            request.app, skip_fresh_s=_warm_skip_fresh_s(),
             guids=[str(r.get("guid") or "") for r in channel_recs if r.get("guid")])
 
     data["list"] = head + official

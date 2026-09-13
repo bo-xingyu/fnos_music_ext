@@ -44,6 +44,9 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     # 歌单曲目缓存（v2.6）：stale-while-revalidate + 每日定时刷新
     ("FNMUSIC_PLAYLIST_TRACK_CACHE_TTL", "21600"),
     ("FNMUSIC_PLAYLIST_REFRESH_AT", "04:30"),
+    # 定时刷新/自动预热跳过「仍新鲜」缓存的阈值（秒，v2.8.2）：刚刷过的不
+    # 重拉；手动预热按钮不受此限。0 = 一律刷新
+    ("FNMUSIC_WARM_SKIP_FRESH_S", "3600"),
     ("FNMUSIC_PLAYLIST_TRACK_LIMIT", "300"),
     ("FNMUSIC_PLAYLIST_CACHE_DIR", ""),
     # --- 稳定性与提速（v2.7）---
@@ -106,7 +109,8 @@ NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOGIN_",
                 # 加前缀只是允许这些键被自动补齐，键本身仍必须在 NEW_DEFAULTS 里列出，
                 # 因此不会凭空给老用户的 .env 塞进没定义的项。
                 "FNMUSIC_NETEASE_CHANNEL", "FNMUSIC_NETEASE_CATEGOR",
-                "FNMUSIC_NETEASE_PLAYLIST_", "FNMUSIC_PLAYLIST_", "FNMUSIC_DOWNLOAD_", "FNMUSIC_FAV_",
+                "FNMUSIC_NETEASE_PLAYLIST_", "FNMUSIC_PLAYLIST_", "FNMUSIC_WARM_",
+                "FNMUSIC_DOWNLOAD_", "FNMUSIC_FAV_",
                 "FNMUSIC_QUALITY_", "FNMUSIC_WATCHDOG_", "FNMUSIC_URL_CACHE_",
                 "FNMUSIC_CHANNEL_LIST_", "FNMUSIC_REMOTE_AS_", "FNMUSIC_LOCAL_",
                 "FNMUSIC_COVER_")

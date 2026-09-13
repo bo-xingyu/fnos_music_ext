@@ -226,3 +226,66 @@ def test_preview_reports_cache_stats(wired):
         assert cache["total"] == 1
         assert cache["cached"] == 1, "当前在列且已缓存的歌单"
         assert cache["cached"] <= cache["total"], "分子绝不能大于分母"
+
+
+# ---------------------------------------------------------------------------
+# v2.8.2：预热跳过「仍新鲜」的缓存（定时刷新/自动预热），手动按钮全量
+# ---------------------------------------------------------------------------
+
+
+def _fake_item(name: str = "晴天") -> dict:
+    return {"id": "netease:2706544264", "source": "netease", "title": name,
+            "artist": "周杰伦", "album": "叶惠美", "duration_s": 269,
+            "ext": "flac", "cover_url": "", "lyric": ""}
+
+
+@pytest.mark.anyio
+async def test_warm_skips_fresh_caches_but_refetches_new_and_stale(wired):
+    """定时刷新/自动预热：一小时内刷过的跳过；新出现的（轮换口径）和过期的照常拉。"""
+    import proxy.app as pa
+
+    # GUID 已有「新鲜」缓存（刚写入）
+    pl.store_cached_tracks(GUID, [_fake_item()])
+    # 再造一个「过期」缓存和一个「无缓存」的 guid
+    stale_guid = "online:playlist:ne:515151"
+    fresh2_guid = "online:playlist:ne:616161"
+    pl.store_cached_tracks(stale_guid, [_fake_item("旧歌")])
+    pl.store_cached_tracks(fresh2_guid, [_fake_item("新碟歌")])
+    # 把 stale_guid 与 fresh2 的 ts 分别调到 2 小时前 / 5 分钟前
+    for g, age in ((stale_guid, 7200), (fresh2_guid, 300)):
+        p = pl._tracks_cache_path(g)
+        body = json.loads(open(p, encoding="utf-8").read())
+        body["ts"] = time.time() - age
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(body))
+    new_guid = "online:playlist:ne:717171"      # 无缓存（模拟新碟轮换进来的新歌单）
+
+    with TestClient(app) as client:
+        r = await pa._warm_playlist_caches(app, guids=[GUID, stale_guid, fresh2_guid, new_guid],
+                                           skip_fresh_s=3600.0)
+    assert r["started"] is True
+    assert r["total"] == 4
+    assert r["skipped_fresh"] == 2, "GUID 与 fresh2（5 分钟前）应被跳过"
+    # 新 guid 与过期 guid 各被拉了一次上游（4 - 2 跳过 = 2 次拉取）
+    fetched = sum(n for path, n in CALLS.items() if "/tracks" in path and "424242" not in path)
+    assert CALLS.get("/api/v1/playlist/717171/tracks", 0) == 1, "无缓存的新歌单必须拉"
+    assert CALLS.get("/api/v1/playlist/515151/tracks", 0) == 1, "过期缓存必须重拉"
+    assert CALLS.get("/api/v1/playlist/616161/tracks", 0) == 0, "新鲜缓存不应重拉"
+
+
+@pytest.mark.anyio
+async def test_warm_manual_button_ignores_fresh_threshold(wired):
+    """手动按钮（skip_fresh_s=0）：即使全部新鲜也全量刷新——按了按钮就是要刷新。"""
+    import proxy.app as pa
+
+    pl.store_cached_tracks(GUID, [_fake_item()])
+    with TestClient(app) as client:
+        r = await pa._warm_playlist_caches(app, guids=[GUID], skip_fresh_s=0.0)
+    assert r["started"] is True
+    assert r["skipped_fresh"] == 0
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if CALLS.get("/api/v1/playlist/424242/tracks", 0) >= 1:
+            break
+        time.sleep(0.1)
+    assert CALLS.get("/api/v1/playlist/424242/tracks", 0) == 1, "手动全量刷新必须真拉上游"

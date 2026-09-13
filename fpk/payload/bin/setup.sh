@@ -165,6 +165,9 @@ write_env_file() {
         # 歌单曲目缓存（v2.6）：TTL 秒 + 每日定时刷新时间
         echo "FNMUSIC_PLAYLIST_TRACK_CACHE_TTL=$(dq "$(pick_env FNMUSIC_PLAYLIST_TRACK_CACHE_TTL "" 21600)")"
         echo "FNMUSIC_PLAYLIST_REFRESH_AT=$(dq "$(pick_env FNMUSIC_PLAYLIST_REFRESH_AT "" 04:30)")"
+        # 定时刷新/自动预热跳过「仍新鲜」缓存的阈值（v2.8.2，秒）：1 小时内刚刷过的不重拉；
+        # 手动「预热歌单缓存」按钮不受此限。0 = 一律刷新
+        echo "FNMUSIC_WARM_SKIP_FRESH_S=$(dq "$(pick_env FNMUSIC_WARM_SKIP_FRESH_S "" 3600)")"
         # 看门狗（v2.7）：代理死亡/接管丢失时的自动恢复轮询间隔（秒），0=关闭。
         # 2026-09-12 事故：官方后端重启重绑 socket 后，应用报「异常退出」且无人自愈。
         echo "FNMUSIC_WATCHDOG_INTERVAL_S=$(dq "$(pick_env FNMUSIC_WATCHDOG_INTERVAL_S "" 30)")"
@@ -229,6 +232,7 @@ write_env_file() {
                     FNMUSIC_DAILY_ENABLED|FNMUSIC_DAILY_LIMIT|FNMUSIC_NETEASE_CHANNELS|\
                     FNMUSIC_NETEASE_CHANNEL_LIMIT|FNMUSIC_NETEASE_CATEGORY|FNMUSIC_NETEASE_CHANNEL_ORDER|\
                     FNMUSIC_NETEASE_PLAYLIST_ORDER|FNMUSIC_PLAYLIST_TRACK_CACHE_TTL|FNMUSIC_PLAYLIST_REFRESH_AT|\
+                    FNMUSIC_WARM_SKIP_FRESH_S|\
                     FNMUSIC_WATCHDOG_INTERVAL_S|FNMUSIC_URL_CACHE_TTL|FNMUSIC_CHANNEL_LIST_CACHE_TTL|\
                     FNMUSIC_PLAYLIST_TRACK_LIMIT|FNMUSIC_PLAYLIST_CACHE_DIR|FNMUSIC_DOWNLOAD_DIR|\
                     FNMUSIC_DOWNLOAD_ON_FAVORITE|FNMUSIC_FAV_SYNC_LIKE|FNMUSIC_QUALITY_POLICY|\
