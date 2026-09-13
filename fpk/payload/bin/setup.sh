@@ -185,6 +185,11 @@ write_env_file() {
         echo "FNMUSIC_QUALITY_WIFI=$(dq "$(pick_env FNMUSIC_QUALITY_WIFI "" lossless)")"
         echo "FNMUSIC_QUALITY_CELLULAR=$(dq "$(pick_env FNMUSIC_QUALITY_CELLULAR "" exhigh)")"
         echo "FNMUSIC_QUALITY_DB_RESCAN=$(dq "$(pick_env FNMUSIC_QUALITY_DB_RESCAN "" 300)")"
+        # 远程访问识别（v2.8）：公网客户端 IP 视同流量场景（走省流档）；false=关闭
+        echo "FNMUSIC_REMOTE_AS_CELLULAR=$(dq "$(norm_bool "$(pick_env FNMUSIC_REMOTE_AS_CELLULAR "" true)")")"
+        # 本地曲库优先（v2.8）：在线曲目先匹配本地同名文件，命中且音质类与策略一致时直接读本地
+        echo "FNMUSIC_LOCAL_FIRST=$(dq "$(norm_bool "$(pick_env FNMUSIC_LOCAL_FIRST "" true)")")"
+        echo "FNMUSIC_LOCAL_INDEX_TTL=$(dq "$(pick_env FNMUSIC_LOCAL_INDEX_TTL "" 300)")"
         echo "# --- PushPlus 推送提醒 ---"
         echo "FNMUSIC_PUSHPLUS_ENABLED=$(dq "$(norm_bool "$(pick_env FNMUSIC_PUSHPLUS_ENABLED wizard_pushplus_enabled true)")")"
         echo "FNMUSIC_PUSHPLUS_TOKEN=$(dq "$(pick_env FNMUSIC_PUSHPLUS_TOKEN wizard_pushplus_token "")")"
@@ -225,7 +230,8 @@ write_env_file() {
                     FNMUSIC_PLAYLIST_TRACK_LIMIT|FNMUSIC_PLAYLIST_CACHE_DIR|FNMUSIC_DOWNLOAD_DIR|\
                     FNMUSIC_DOWNLOAD_ON_FAVORITE|FNMUSIC_FAV_SYNC_LIKE|FNMUSIC_QUALITY_POLICY|\
                     FNMUSIC_QUALITY_FIXED|FNMUSIC_QUALITY_WIFI|FNMUSIC_QUALITY_CELLULAR|\
-                    FNMUSIC_QUALITY_DB_RESCAN|FNMUSIC_PUSHPLUS_ENABLED|FNMUSIC_PUSHPLUS_TOKEN|\
+                    FNMUSIC_QUALITY_DB_RESCAN|FNMUSIC_REMOTE_AS_CELLULAR|FNMUSIC_LOCAL_FIRST|\
+                    FNMUSIC_LOCAL_INDEX_TTL|FNMUSIC_PUSHPLUS_ENABLED|FNMUSIC_PUSHPLUS_TOKEN|\
                     FNMUSIC_PUSHPLUS_TOPIC|FNMUSIC_PUSHPLUS_TEMPLATE|FNMUSIC_PUSHPLUS_URL|\
                     FNMUSIC_CACHE_DIR|FNMUSIC_FAV_DIR|FNMUSIC_PLAY_HISTORY_DIR|FNMUSIC_RECOMMEND_DIR|\
                     FNMUSIC_UPSTREAM_SOCK|FNMUSIC_LIBRARY_DIR|FNMUSIC_MUSIC_DB|FNMUSIC_PIP_INDEX|\

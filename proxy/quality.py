@@ -189,6 +189,19 @@ def network_of(request: Any) -> str:
     只依据请求里真实出现的值（含中文「流量 / 无线」），不猜键名也不猜客户端行为。
     注意：中文只可能出现在 **query**（URL 解码后是 UTF-8），不可能出现在 header
     ——HTTP 头是 latin-1，Starlette 的 Headers 装非 latin-1 值会直接 UnicodeEncodeError。
+
+    v2.8 新增：飞牛客户端实测**从不发送**任何网络类型键（真机诊断证据：
+    「暂未观察到任何带音质或网络语义的键」），于是「流量档」从未触发过——
+    移动数据远程访问时也一直按 WiFi 档发 jymaster（Hi-Res 母带），窄管道上
+    起步缓冲好几秒。现在当客户端无显式提示时，从 ``X-Forwarded-For`` /
+    ``X-Real-IP`` 等头里读真实客户端 IP：
+
+    - 出现**公网 IP** = 远程访问（移动数据 / 异地），按 ``FNMUSIC_REMOTE_AS_CELLULAR``
+      （默认开）视同流量场景，走省流档；
+    - 只有**私网 IP** = 局域网直连，返回 ``lan``。
+
+    采信的 IP 与判定结果全部进 report() 证据区——nginx 是否透传这些头在真机上
+    一眼可见，透传不了也知道该换 fixed 策略而不是瞎猜。
     """
     parts: list[str] = []
     for items in (_kv(getattr(request, "query_params", None)),
@@ -198,13 +211,73 @@ def network_of(request: Any) -> str:
             if any(h in low for h in ("network", "net", "cellular", "wifi", "conn")):
                 parts.append(str(val).lower())
     text = " | ".join(parts)
-    if not text:
-        return "unknown"
-    if any(k in text for k in _CELLULAR):
-        return "cellular"
-    if any(k in text for k in _WIFI):
-        return "wifi"
+    if text:
+        if any(k in text for k in _CELLULAR):
+            return "cellular"
+        if any(k in text for k in _WIFI):
+            return "wifi"
+
+    ips = forwarded_client_ips(request)
+    if ips:
+        public = [ip for ip in ips if is_public_ip(ip)]
+        _record_client_ip_evidence(ips, bool(public))
+        if public and remote_as_cellular():
+            return "cellular"
+        return "lan"
     return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# 客户端 IP 线索（v2.8）：远程访问识别
+# ---------------------------------------------------------------------------
+
+_IP_HEADER_KEYS = ("x-forwarded-for", "x-real-ip", "x-client-ip", "cf-connecting-ip")
+
+
+def forwarded_client_ips(request: Any) -> list[str]:
+    """从代理链头里取出候选客户端 IP（不去重、保持出现顺序）。"""
+    ips: list[str] = []
+    for key, val in _kv(getattr(request, "headers", None)):
+        low = str(key).lower()
+        if low == "x-forwarded-for":
+            ips.extend(p.strip() for p in str(val).split(",") if p.strip())
+        elif low in _IP_HEADER_KEYS[1:]:
+            v = str(val).strip()
+            if v:
+                ips.append(v)
+    return ips
+
+
+def is_public_ip(raw: str) -> bool:
+    """该 IP 是否公网地址（解析失败按非公网处理，宁缺毋滥）。"""
+    import ipaddress
+
+    try:
+        addr = ipaddress.ip_address(str(raw).strip())
+    except ValueError:
+        return False
+    if addr.version == 6 and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    return not (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_unspecified or addr.is_multicast)
+
+
+def remote_as_cellular() -> bool:
+    """远程访问（公网客户端 IP）是否按流量场景处理。默认开，可关。"""
+    return str(os.environ.get("FNMUSIC_REMOTE_AS_CELLULAR", "true") or "true") \
+        .strip().lower() in ("true", "1", "yes", "on")
+
+
+def _record_client_ip_evidence(ips: list[str], has_public: bool) -> None:
+    rec = _OBSERVED.setdefault("client_ips", {"lan": 0, "remote": 0, "samples": []})
+    if has_public:
+        rec["remote"] = int(rec.get("remote", 0)) + 1
+    else:
+        rec["lan"] = int(rec.get("lan", 0)) + 1
+    sample = str(ips[0])[:64] if ips else ""
+    if sample and sample not in (rec.get("samples") or []):
+        rec.setdefault("samples", []).insert(0, sample)
+        del rec["samples"][6:]
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +441,8 @@ def report(db_path: str = "") -> dict[str, Any]:
             for k, v in sorted(hints.items(), key=lambda kv: -(kv[1].get("count") or 0))[:12]
         },
         "observed_paths_with_hints": dict(sorted(_OBSERVED["paths"].items(),
-                                                key=lambda kv: -kv[1])[:8]),
+                                                 key=lambda kv: -kv[1])[:8]),
+        "client_ips": _client_ip_report(),
         "db_scan": ({
             "available": True,
             "hits": len(scan.get("hits") or []),
@@ -379,6 +453,16 @@ def report(db_path: str = "") -> dict[str, Any]:
     }
 
 
+def _client_ip_report() -> dict[str, Any]:
+    """客户端 IP 证据（远程访问识别的判定依据，诊断页展示）。"""
+    rec = _OBSERVED.get("client_ips")
+    if not rec:
+        return {"lan": 0, "remote": 0, "samples": [],
+                "note": "未观察到 X-Forwarded-For / X-Real-IP（可能 nginx 未透传，远程识别不可用）"}
+    return {"lan": int(rec.get("lan", 0)), "remote": int(rec.get("remote", 0)),
+            "samples": list(rec.get("samples") or [])[:6]}
+
+
 def reset_for_test() -> None:
     """测试钩子：清空观察记录，避免用例之间互相污染。"""
     _OBSERVED["paths"].clear()
@@ -386,3 +470,4 @@ def reset_for_test() -> None:
     _OBSERVED["db"] = None
     _OBSERVED["db_path"] = ""
     _OBSERVED["db_scanned_at"] = 0.0
+    _OBSERVED.pop("client_ips", None)

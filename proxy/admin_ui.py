@@ -2103,6 +2103,12 @@ function runDiag(auto){
         var hits=qy.observed_client_hints||{};
         var hk=Object.keys(hits);
         out.push("  客户端音质/网络线索 : "+(hk.length?hk.length+" 种":"暂未观察到任何带音质或网络语义的键"));
+        var cip=qy.client_ips||{};
+        out.push("  客户端 IP 线索(XFF) : 局域网="+(cip.lan||0)+" 次  远程(公网)="+(cip.remote||0)+" 次"+
+                ((cip.samples&&cip.samples.length)
+                  ?("  例: "+cip.samples.slice(0,3).join(" | "))
+                  :"（未观察到 X-Forwarded-For——可能 nginx 未透传，远程识别不可用，建议用固定音质策略）"));
+        out.push("  （远程(公网)访问默认按流量场景走省流档，可用 FNMUSIC_REMOTE_AS_CELLULAR=false 关闭）");
         hk.slice(0,8).forEach(function(k){
           out.push("     "+k+"  x"+hits[k].count+"  样例="+JSON.stringify(hits[k].samples));
         });

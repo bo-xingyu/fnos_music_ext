@@ -133,6 +133,60 @@ def test_network_detection_reads_chinese_only_from_query():
     with pytest.raises(UnicodeEncodeError):
         _fake_request(headers={"network": "流量"})
     assert q.network_of(_fake_request(query={"networkType": "流量"})) == "cellular"
+
+
+# --------------------------------------------------------------------- v2.8 远程访问识别
+
+
+def test_remote_public_ip_treated_as_cellular():
+    """公网客户端 IP（XFF/X-Real-IP）= 远程访问 → 按流量场景处理。
+
+    飞牛客户端从不发送网络类型键，不识别的话 by_network 的流量档永远不触发，
+    移动数据远程访问时一直被喂 Hi-Res 母带——这正是真机 7~8s 起步的根因。
+    """
+    q.reset_for_test()
+    assert q.network_of(_fake_request(
+        headers={"x-forwarded-for": "114.114.114.9"})) == "cellular"
+    assert q.network_of(_fake_request(
+        headers={"x-real-ip": "8.8.8.8"})) == "cellular"
+    # XFF 链里带公网就算（最后一跳内网不影响判定）
+    assert q.network_of(_fake_request(
+        headers={"x-forwarded-for": "114.114.114.9, 192.168.1.10"})) == "cellular"
+    # 证据必须留痕（诊断页展示）
+    rep = q.report()
+    assert rep["client_ips"]["remote"] >= 3
+
+
+def test_lan_private_ip_stays_lan():
+    q.reset_for_test()
+    assert q.network_of(_fake_request(
+        headers={"x-forwarded-for": "192.168.1.50"})) == "lan"
+    assert q.network_of(_fake_request(
+        headers={"x-real-ip": "127.0.0.1"})) == "lan"
+    assert q.network_of(_fake_request(
+        headers={"x-forwarded-for": "fe80::1"})) == "lan"
+    assert q.report()["client_ips"]["remote"] == 0
+
+
+def test_remote_detection_disabled_by_env(monkeypatch):
+    monkeypatch.setenv("FNMUSIC_REMOTE_AS_CELLULAR", "false")
+    q.reset_for_test()
+    assert q.network_of(_fake_request(
+        headers={"x-forwarded-for": "114.114.114.9"})) == "lan"
+
+
+def test_by_network_policy_uses_cellular_tier_for_remote(monkeypatch):
+    """远程（公网 IP）播放必须落到 cellular 档，而不是默认 WiFi 档。"""
+    monkeypatch.setenv("FNMUSIC_QUALITY_POLICY", "by_network")
+    monkeypatch.setenv("FNMUSIC_QUALITY_WIFI", "jymaster")
+    monkeypatch.setenv("FNMUSIC_QUALITY_CELLULAR", "exhigh")
+    q.reset_for_test()
+    d = q.resolve(_fake_request(headers={"x-forwarded-for": "114.114.114.9"}), db_path="")
+    assert d["level"] == "exhigh"
+    assert d["network"] == "cellular"
+    d2 = q.resolve(_fake_request(headers={"x-forwarded-for": "192.168.1.50"}), db_path="")
+    assert d2["level"] == "jymaster"
+    assert d2["network"] == "lan"
     assert q.network_of(_fake_request(query={"net": "无线"})) == "wifi"
 
 

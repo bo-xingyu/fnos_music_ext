@@ -1696,3 +1696,35 @@ async def test_static_cover_falls_back_to_redirect_when_fetch_fails(monkeypatch)
                   params={"coverId": "online:netease:186016"}, follow_redirects=False)
     assert r.status_code == 302
     assert r.headers["location"] == PIC
+
+
+@pytest.mark.anyio
+async def test_static_cover_disk_cache_fetches_cdn_once(monkeypatch):
+    """v2.8 封面字节磁盘缓存：同一 URL 一生只从 CDN 抓一次，之后读本地。
+
+    此前只缓存 URL 不缓存字节——换设备/客户端清缓存/多端同时打开列表，
+    NAS 要对同一批图反复跑 CDN 往返，直接拖慢歌单列表渲染。
+    """
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=_mb_request({"186016": _SONG_RAW}, []), base_url="http://127.0.0.1:8770")
+
+    img = b"\xff\xd8\xff\xe0COVERBYTES_V28"
+    calls = []
+
+    async def fake_fetch(url):
+        calls.append(url)
+        return img, "image/jpeg"
+
+    monkeypatch.setattr(P, "_fetch_cover_bytes", fake_fetch)
+    with TestClient(app) as c:
+        r1 = c.get("/music/api/v1/static/cover",
+                   params={"coverId": "online:netease:186016"}, follow_redirects=False)
+        assert r1.status_code == 200
+        assert r1.content == img
+        # 第二次请求（模拟另一台设备 / 客户端清了缓存）：必须命中磁盘，零 CDN 往返
+        r2 = c.get("/music/api/v1/static/cover",
+                   params={"coverId": "online:netease:186016"}, follow_redirects=False)
+        assert r2.status_code == 200
+        assert r2.content == img
+        assert r2.headers["content-type"].startswith("image/")
+    assert calls == [PIC], "同一封面 URL 只允许出网一次"

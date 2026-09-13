@@ -38,6 +38,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 try:
     from . import netease_auth
     from . import netease_items
+    from . import local_library
     from . import playlists
     from . import download as downloader
     from . import quality
@@ -47,6 +48,7 @@ try:
 except ImportError:  # uvicorn --app-dir proxy
     import netease_auth  # type: ignore
     import netease_items  # type: ignore
+    import local_library  # type: ignore
     import playlists  # type: ignore
     import download as downloader  # type: ignore
     import quality  # type: ignore
@@ -2280,6 +2282,7 @@ def stream_tee_response(
 @app.get("/music/api/v1/track/stream")
 @app.get("/music/api/v1/track/stream/{subpath:path}")
 async def stream_track(request: Request):
+    started = time.monotonic()
     guid = extract_guid(request)
     if not is_online_guid(guid):
         # 本地曲目直通官方后端；播放链路放宽读超时（见 PLAYBACK_FORWARD_TIMEOUT_S）
@@ -2287,11 +2290,17 @@ async def stream_track(request: Request):
             request, get_upstream_client(request.app),
             timeout=PLAYBACK_FORWARD_TIMEOUT_S, label="local-stream")
 
+    def _log_play(source: str) -> None:
+        """播放起步留证：来源 + 总耗时。真机上「点开到出声几秒」从此可量化。"""
+        logger.info("play-start %s %s %.0fms", source, guid,
+                    (time.monotonic() - started) * 1000.0)
+
     range_header = request.headers.get("range")
     cached = find_cache_file(guid)
     if cached:
         cached = promote_cache_hit(guid, cached)
         ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
+        _log_play("tee-cache")
         return serve_file_with_range(cached, range_header, media_type_for_ext(ext))
 
     src = source_from_online_guid(guid)
@@ -2318,7 +2327,48 @@ async def stream_track(request: Request):
     play_url = None if isinstance(play_url_res, Exception) else play_url_res
     info = None if isinstance(info_res, Exception) else info_res
 
+    # ------------------------------------------------------------------
+    # 本地曲库优先（v2.8）：NAS 上已有同一首歌时直接读本地文件——零外网、
+    # 起步最快。是否可用本地受音质策略约束（见 local_library 模块头注）：
+    # 策略要 lossless 且本地是无损 → 用本地；策略要 exhigh（省流量）而本地是
+    # Hi-Res → 不用本地，仍按策略去网易云要 320k；本地 320k 而策略要 lossless
+    # → 同样不用本地。网易云取链彻底失败时本地匹配（不论档位）作最后兜底。
+    # ------------------------------------------------------------------
+    local_hit: dict | None = None
+    if local_library.local_first_enabled() and isinstance(info, dict) \
+            and str(info.get("title") or "").strip():
+        decision = quality.resolve(request, db_path=str(CONF.get("music_db") or ""))
+        local_hit = local_library.find_local_match(
+            str(info.get("title") or ""),
+            str(info.get("artist") or ""),
+            str(CONF.get("music_db") or ""),
+        )
+        if local_hit and local_library.serves_request(local_hit, decision.get("level")):
+            try:
+                _log_play(f"local-first(class={local_hit.get('klass')},level={decision.get('level')})")
+                logger.info("local-first hit: %s -> %s", guid, local_hit.get("path"))
+                return serve_file_with_range(
+                    local_hit["path"], range_header,
+                    media_type_for_ext(local_hit.get("ext") or "mp3"))
+            except Exception as exc:  # noqa: BLE001 - 本地文件异常则回落在线链路
+                logger.warning("local-first serve failed for %s: %s: %s",
+                               guid, type(exc).__name__, exc)
+                local_hit = None
+
+    def _serve_local_fallback(reason: str):
+        _log_play(f"local-fallback({reason})")
+        logger.info("local-first fallback (%s): %s -> %s", reason, guid,
+                    (local_hit or {}).get("path"))
+        return serve_file_with_range(
+            local_hit["path"], range_header,
+            media_type_for_ext(local_hit.get("ext") or "mp3"))
+
     if not play_url:
+        if local_hit:
+            try:
+                return _serve_local_fallback("netease resolve failed")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("local fallback serve failed for %s: %s", guid, exc)
         state = netease_auth.current_state()
         if not state.logged_in:
             logger.info("stream 404 for %s: 网易云未登录，该曲目需要账号权益", guid)
@@ -2357,9 +2407,15 @@ async def stream_track(request: Request):
             logger.info("netease url stale for %s, retrying with fresh url", guid)
             play_url = fresh_url
             resp, stream_client = await _open_cdn(play_url)
+        if resp is None and local_hit:
+            try:
+                return _serve_local_fallback("cdn unreachable")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("local fallback serve failed for %s: %s", guid, exc)
         if resp is None:
             return _online_unavailable()
 
+    _log_play("netease")
     return stream_tee_response(
         resp,
         guid=guid,
@@ -2495,6 +2551,81 @@ async def _fetch_cover_bytes(url: str) -> tuple[bytes, str] | None:
     except Exception as e:  # noqa: BLE001
         logger.warning("proxying cover failed for %s: %s: %s", url[:80], type(e).__name__, e)
         return None
+
+
+# ---------------------------------------------------------------------------
+# 封面字节磁盘缓存（v2.8）：同一 URL 只从网易云 CDN 抓一次，之后全部读本地。
+#
+# 此前只缓存了封面 URL（24h），字节每次都现抓——换台设备、客户端清了缓存、
+# 或多端同时打开列表，NAS 就要对同一批图再跑一遍 CDN 往返（每张几百毫秒），
+# 歌单列表的渲染时间被这些串行往返拖长。封面是静态资源，落盘没有任何
+# 过期问题；超过上限按 mtime 淘汰最旧的。
+# ---------------------------------------------------------------------------
+
+_COVER_DISK_MAX_FILES = 800
+
+
+def _cover_cache_dir() -> str:
+    return os.path.join(CONF["cache_dir"], "cover_cache")
+
+
+def _cover_cache_paths(url: str) -> tuple[str, str]:
+    import hashlib
+
+    key = hashlib.sha1(url.encode("utf-8")).hexdigest()
+    d = _cover_cache_dir()
+    return os.path.join(d, f"{key}.bin"), os.path.join(d, f"{key}.json")
+
+
+def _prune_cover_disk_cache() -> None:
+    d = _cover_cache_dir()
+    try:
+        entries = []
+        for name in os.listdir(d):
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                entries.append((os.path.getmtime(p), p))
+    except OSError:
+        return
+    excess = len(entries) - _COVER_DISK_MAX_FILES
+    if excess <= 0:
+        return
+    for _mtime, path in sorted(entries)[:excess]:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+async def _fetch_cover_bytes_cached(url: str) -> tuple[bytes, str] | None:
+    """带磁盘缓存的封面代抓：命中直接读盘，未命中才出网（并落盘）。"""
+    bin_path, meta_path = _cover_cache_paths(url)
+    try:
+        if os.path.isfile(bin_path) and os.path.isfile(meta_path):
+            with open(meta_path, encoding="utf-8") as f:
+                ct = str(json.load(f).get("ct") or "image/jpeg")
+            with open(bin_path, "rb") as f:
+                data = f.read()
+            if data:
+                return data, ct
+    except Exception as exc:  # noqa: BLE001 - 缓存坏了就当没有
+        logger.debug("cover disk cache read failed for %s: %s", url[:80], exc)
+
+    fetched = await _fetch_cover_bytes(url)
+    if fetched:
+        content, ct = fetched
+        try:
+            os.makedirs(_cover_cache_dir(), exist_ok=True)
+            tmp_bin = f"{bin_path}.{uuid4().hex[:8]}.part"
+            with open(tmp_bin, "wb") as f:
+                f.write(content)
+            os.replace(tmp_bin, bin_path)
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump({"ct": ct, "url": url[:200]}, f, ensure_ascii=False)
+            _prune_cover_disk_cache()
+        except Exception as exc:  # noqa: BLE001 - 落盘失败不影响本次应答
+            logger.debug("cover disk cache write failed for %s: %s", url[:80], exc)
+    return fetched
 
 
 async def _online_cover_url(request: Request, guid: str) -> str:
@@ -2738,7 +2869,8 @@ async def static_cover(request: Request, subpath: str = ""):
     # 302 依赖两件我们无法保证的事：客户端能直连 p1.music.126.net，且该 CDN
     # 不校验 Referer/Origin。任一不成立就表现为「列表里没有封面」。
     # 代抓失败时再退回 302，至少保留原来那条能走通的路。
-    fetched = await _fetch_cover_bytes(cover)
+    # v2.8：字节走磁盘缓存——同一 URL 一生只从 CDN 抓一次。
+    fetched = await _fetch_cover_bytes_cached(cover)
     if fetched:
         content, ctype = fetched
         headers["Content-Type"] = ctype
@@ -3754,8 +3886,13 @@ async def playlist_track_list(request: Request):
     if not is_authed and auth_resp is not None:
         return auth_resp
 
+    started = time.monotonic()
+    cache_state = "hit"
     if is_channel:
         try:
+            _hit = playlists.load_cached_tracks(guid)
+            if _hit is None:
+                cache_state = "miss"
             tracks = dailyrec.stamp_playlist_tracks(await _channel_tracks(request, guid))
         except Exception as e:
             logger.warning("channel playlist tracks failed for %s: %s: %s",
@@ -3764,6 +3901,11 @@ async def playlist_track_list(request: Request):
     else:
         bundle = await _load_daily_bundle(request, user_guid)
         tracks = dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
+    # 打开耗时留证：真机上「歌单打开几秒」从此可量化（cache=miss 是上游链路，
+    # cache=hit 仍慢则瓶颈在传输/客户端，两者排障方向完全不同）
+    _ms = (time.monotonic() - started) * 1000.0
+    if _ms > 1000:
+        logger.info("playlist tracks slow open: %.0fms cache=%s %s", _ms, cache_state, guid)
     try:
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):

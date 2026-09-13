@@ -56,6 +56,14 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     # 口径清单短缓存（秒）：歌单列表页在 TTL 内零上游往返，过期后先返回旧值
     # 并后台刷新（stale-while-revalidate）；0 = 关闭
     ("FNMUSIC_CHANNEL_LIST_CACHE_TTL", "300"),
+    # --- 远程访问识别与本地曲库优先（v2.8）---
+    # 公网客户端 IP（X-Forwarded-For）视同流量场景走省流档；false = 关闭。
+    # 飞牛客户端从不发送网络类型键，不识别的话「流量档」永远不会触发。
+    ("FNMUSIC_REMOTE_AS_CELLULAR", "true"),
+    # 在线曲目先匹配本地 music.db 同名文件，命中且音质类与策略一致时直接读本地
+    ("FNMUSIC_LOCAL_FIRST", "true"),
+    # 本地曲库索引的内存缓存时长（秒）
+    ("FNMUSIC_LOCAL_INDEX_TTL", "300"),
     # --- 收藏归档与红心同步（v2.2 新增）---
     # 归档目录默认留空 = 关闭自动下载：这是往用户自己的磁盘写文件，
     # 绝不能替他决定写到哪儿，必须他在管理页里显式填。
@@ -96,7 +104,7 @@ NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOGIN_",
                 "FNMUSIC_NETEASE_CHANNEL", "FNMUSIC_NETEASE_CATEGOR",
                 "FNMUSIC_NETEASE_PLAYLIST_", "FNMUSIC_PLAYLIST_", "FNMUSIC_DOWNLOAD_", "FNMUSIC_FAV_",
                 "FNMUSIC_QUALITY_", "FNMUSIC_WATCHDOG_", "FNMUSIC_URL_CACHE_",
-                "FNMUSIC_CHANNEL_LIST_")
+                "FNMUSIC_CHANNEL_LIST_", "FNMUSIC_REMOTE_AS_", "FNMUSIC_LOCAL_")
 
 # v2.0 已废弃的配置项：升级合并时从 .env 中清理，避免残留误导。
 # 只删「确定已无代码读取」的键；FNMUSIC_MODE / BASE_IMAGE / PIP_INDEX 等 docker 相关项保留。
