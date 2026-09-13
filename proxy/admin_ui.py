@@ -2205,7 +2205,9 @@ function runDiag(auto){
         out.push("  取不到代理侧快照: "+JSON.stringify(ld));
       }else{
         out.push("  开关           : enabled="+ld.enabled+"   数量上限="+ld.limit);
-        out.push("  曲库目录       : "+ld.library_dir+"  存在="+ld.library_dir_exists);
+        out.push("  代理运行身份   : "+ld.proxy_identity);
+        out.push("  曲库目录       : "+ld.library_dir+"  存在="+ld.library_dir_exists+"  可读="+ld.library_readable);
+        if(ld.probe_error) out.push("  ★ 目录探测失败: "+ld.probe_error);
         out.push("  是否回落到空目录: "+ld.library_is_cache_fallback
                  +(ld.library_is_cache_fallback?("  ★ 这就是歌单不出现的原因（cache 目录="+ld.cache_dir+"）"):""));
         out.push("  扫到音频文件数 : "+ld.scanned_files);

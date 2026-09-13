@@ -1923,6 +1923,17 @@ async def ext_local_daily(request: Request):
         lib_is_fallback = bool(lib) and os.path.abspath(lib) == os.path.abspath(
             str(CONF["cache_dir"]))
         files = dailyrec._scan_library_audio_files(lib) if lib else []
+        # 访问权限排障：代理进程对曲库目录到底读不读得动。飞牛的「应用访问权限」
+        # 是按应用账号授权的；代理以 root 运行通常不受限，但如果哪天改了运行身份，
+        # 这里能第一时间看出「目录存在但读不了」。
+        probe_error = ""
+        if lib and os.path.isdir(lib):
+            try:
+                os.listdir(lib)
+            except PermissionError as exc:
+                probe_error = f"权限不足（应用访问权限未覆盖该目录）: {exc}"
+            except OSError as exc:
+                probe_error = f"{type(exc).__name__}: {exc}"
         day = dailyrec.today_key()
         cache_file = dailyrec.local_daily_cache_path("shared", day)
         return {
@@ -1930,8 +1941,11 @@ async def ext_local_daily(request: Request):
             "data": {
                 "enabled": dailyrec.local_daily_enabled(),
                 "limit": dailyrec.local_daily_limit(),
+                "proxy_identity": f"uid={os.getuid()} gid={os.getgid()}",
                 "library_dir": lib,
                 "library_dir_exists": bool(lib) and os.path.isdir(lib),
+                "library_readable": bool(lib) and os.access(lib, os.R_OK),
+                "probe_error": probe_error,
                 "library_is_cache_fallback": lib_is_fallback,
                 "cache_dir": str(CONF["cache_dir"]),
                 "scanned_files": len(files),

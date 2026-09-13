@@ -3,7 +3,60 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.9.3] - 2026-09-13
+
+**修复：真机上本地每日推荐必然失效的决定性 bug（v2.9.0 起一直存在）。**
+
+### 根因：扁平运行形态下的裸相对导入
+
+真机的代理是这么启动的（`run_proxy.sh`）：
+
+```
+uvicorn app:app --app-dir proxy --uds ...
+```
+
+此时 `app` / `recommend` / `local_library` 全是**没有父包的顶层模块**。而
+`_scan_library_audio_files()` 里有一句函数内延迟导入：
+
+```python
+from . import local_library   # ← 顶层模块形态下必抛 ImportError
+```
+
+这行在扫描函数的 `try` **之外**，一抛整个扫描报废 → `get_or_build_local_daily`
+捕获后返回 `scan_failed` 空歌单 → **歌单静默不出现**。曲库目录对不对都一样，
+v2.9.0/2.9.1/2.9.2 全部中招。
+
+更阴的是：**测试全是绿的**——pytest 以 `proxy` 包形态导入（有父包），相对导入
+正常工作，只有真机的扁平形态会炸。这正是 skill 里 admin_ui `_as_path` 注释记过
+的同款坑，这次栽在 recommend 里。
+
+v2.9.2 新增的排障接口反把它暴露了出来：诊断页取快照时报
+`ImportError: attempted relative import with no known parent package`。
+
+### 修复
+
+- 补上 `try/except ImportError` 兜底，扁平/包两种形态都能工作；
+  修复后已用真机同款方式（`cd proxy && python3 -c "import recommend"`）实测扫描正常；
+- **新增 AST 级静态检查**（`test_import_guards.py`）：遍历 `proxy/*.py` 的语法树，
+  任何不在 `except ImportError` 兜底块内的相对导入直接测试失败——这类
+  「测试全绿、真机必炸」的导入问题从此无法混入。
+
+### 关于飞牛「应用访问权限」
+
+有用户反馈第三方应用拿不到像官方音乐那样的目录授权入口。说明两点：
+
+- 代理进程以 **root** 运行（`run_proxy.sh` 由 systemd 以 root 调用），读取文件系统
+  一般不受应用账号 ACL 限制；受限于访问权限的是降权运行的音源服务
+  （`fnmusicext_user`），那影响的是网易云取链，不影响本地曲库扫描。
+- 为防万一，排障接口现在会显示**代理运行身份**（uid/gid）、曲库目录**可读性**，
+  目录探测失败时给出具体错误（含「权限不足（应用访问权限未覆盖该目录）」）。
+
+### 测试
+
+- 新增：相对导入兜底静态检查；合计 805 passed。
+
 ## [2.9.2] - 2026-09-13
+
 
 **修复：本地每日推荐「页面显示保存成功，但没有歌单生成」。**
 

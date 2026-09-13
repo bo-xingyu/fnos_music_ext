@@ -365,7 +365,14 @@ def _scan_library_audio_files(library_dir: str) -> "list[dict]":
     root = str(library_dir or "").strip()
     if not root or not os.path.isdir(root):
         return out
-    from . import local_library  # noqa: PLC0415 - 延迟导入避免循环
+    # ⚠️ 必须带 ImportError 兜底：真机以 `uvicorn app:app --app-dir proxy` 运行，
+    # recommend 是顶层模块、没有父包，裸的 `from . import x` 必抛
+    # ImportError——这行在下面的 try 之外，一抛整个扫描就废，而且表现成
+    # 「歌单静默不出现」（v2.9.2 真机实锤，与 admin_ui._as_path 的注释同一类坑）。
+    try:  # 作为包导入（proxy.recommend）
+        from . import local_library
+    except ImportError:  # 扁平导入
+        import local_library  # type: ignore
 
     audio_exts = local_library.AUDIO_EXTS
     try:
