@@ -383,7 +383,7 @@ def test_setup_fresh_install_fills_defaults_and_new_keys(tmp_path):
     env = _env_dict(pkgvar / "app" / ".env")
     assert env["FNMUSIC_NETEASE_QUALITY"] == "exhigh"
     assert env["FNMUSIC_NETEASE_CHANNELS"] == "mine,toplist,category"
-    assert env["FNMUSIC_NETEASE_CHANNEL_ORDER"] == "daily,mine,nrec,toplist,category,newalbum,fm"
+    assert env["FNMUSIC_NETEASE_CHANNEL_ORDER"] == "daily,localdaily,mine,nrec,toplist,category,newalbum,fm"
     assert env["FNMUSIC_DOWNLOAD_DIR"] == ""
 
 

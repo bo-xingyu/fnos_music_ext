@@ -33,12 +33,15 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_FREE_ONLY_ON_LOGOUT", "true"),
     ("FNMUSIC_DAILY_ENABLED", "true"),
     ("FNMUSIC_DAILY_LIMIT", "20"),
+    # 本地每日推荐（v2.9）：每天从本地曲库随机抽 N 首，与网易云日推独立
+    ("FNMUSIC_LOCAL_DAILY_ENABLED", "true"),
+    ("FNMUSIC_LOCAL_DAILY_LIMIT", "50"),
     # --- 更多口径歌单 / 账户歌单（v2.2 新增）---
     ("FNMUSIC_NETEASE_CHANNELS", "mine,toplist,category"),
     ("FNMUSIC_NETEASE_CHANNEL_LIMIT", "8"),
     ("FNMUSIC_NETEASE_CATEGORY", "华语"),
     # 歌单大类展示顺序（v2.4）：列表里各口径的先后，管理页可改
-    ("FNMUSIC_NETEASE_CHANNEL_ORDER", "daily,mine,nrec,toplist,category,newalbum,fm"),
+    ("FNMUSIC_NETEASE_CHANNEL_ORDER", "daily,localdaily,mine,nrec,toplist,category,newalbum,fm"),
     # 手动歌单顺序（v2.5）：管理页逐个拖排的 token 列表；空=按大类顺序
     ("FNMUSIC_NETEASE_PLAYLIST_ORDER", ""),
     # 歌单曲目缓存（v2.6）：stale-while-revalidate + 每日定时刷新
@@ -102,7 +105,7 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     # 缓存掉可省一次跨洋往返，显著缩短搜索首屏。
     ("FNMUSIC_LOGIN_CACHE_TTL", "300"),
 ]
-NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOGIN_",
+NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOCAL_DAILY", "FNMUSIC_LOGIN_",
                 "FNMUSIC_VIP_", "FNMUSIC_PUSHPLUS_", "FNMUSIC_LOG_",
                 "FNMUSIC_SEARCH_",
                 # v2.2 新增：更多口径歌单、账户歌单、收藏归档与红心同步。

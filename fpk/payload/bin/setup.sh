@@ -153,12 +153,15 @@ write_env_file() {
         echo "# --- 网易云官方每日推荐（需登录） ---"
         echo "FNMUSIC_DAILY_ENABLED=$(dq "$(norm_bool "$(pick_env FNMUSIC_DAILY_ENABLED wizard_daily_enabled true)")")"
         echo "FNMUSIC_DAILY_LIMIT=$(dq "$(pick_env FNMUSIC_DAILY_LIMIT wizard_daily_limit 20)")"
+        # 本地每日推荐（v2.9）：每天从本地曲库随机抽 N 首（与网易云日推独立）
+        echo "FNMUSIC_LOCAL_DAILY_ENABLED=$(dq "$(norm_bool "$(pick_env FNMUSIC_LOCAL_DAILY_ENABLED "" true)")")"
+        echo "FNMUSIC_LOCAL_DAILY_LIMIT=$(dq "$(pick_env FNMUSIC_LOCAL_DAILY_LIMIT "" 50)")"
         echo "# --- 更多口径歌单 / 账户歌单 ---"
         echo "FNMUSIC_NETEASE_CHANNELS=$(dq "$(pick_env FNMUSIC_NETEASE_CHANNELS "" mine,toplist,category)")"
         echo "FNMUSIC_NETEASE_CHANNEL_LIMIT=$(dq "$(pick_env FNMUSIC_NETEASE_CHANNEL_LIMIT "" 8)")"
         echo "FNMUSIC_NETEASE_CATEGORY=$(dq "$(pick_env FNMUSIC_NETEASE_CATEGORY "" 华语)")"
         echo "# 歌单口径展示顺序（大类固定排序，管理页可改）"
-        echo "FNMUSIC_NETEASE_CHANNEL_ORDER=$(dq "$(pick_env FNMUSIC_NETEASE_CHANNEL_ORDER "" daily,mine,nrec,toplist,category,newalbum,fm)")"
+        echo "FNMUSIC_NETEASE_CHANNEL_ORDER=$(dq "$(pick_env FNMUSIC_NETEASE_CHANNEL_ORDER "" daily,localdaily,mine,nrec,toplist,category,newalbum,fm)")"
         # 手动歌单顺序（v2.5）：管理页「歌单顺序」卡片保存的 token 列表；空=按大类
         echo "FNMUSIC_NETEASE_PLAYLIST_ORDER=$(dq "$(pick_env FNMUSIC_NETEASE_PLAYLIST_ORDER "" "")")"
         echo "FNMUSIC_PLAYLIST_TRACK_LIMIT=$(dq "$(pick_env FNMUSIC_PLAYLIST_TRACK_LIMIT "" 300)")"
@@ -229,7 +232,7 @@ write_env_file() {
                     FNMUSIC_SEARCH_TIMEOUT|FNMUSIC_SEARCH_CACHE_TTL|FNMUSIC_SEARCH_EMPTY_TTL|\
                     FNMUSIC_LOGIN_CACHE_TTL|FNMUSIC_MUSICBOX_BIND|FNMUSIC_FREE_ONLY_ON_LOGOUT|\
                     FNMUSIC_LOGIN_STATE_TTL|FNMUSIC_LOGIN_CHECK_INTERVAL|FNMUSIC_VIP_WARN_DAYS|\
-                    FNMUSIC_DAILY_ENABLED|FNMUSIC_DAILY_LIMIT|FNMUSIC_NETEASE_CHANNELS|\
+                    FNMUSIC_DAILY_ENABLED|FNMUSIC_DAILY_LIMIT|FNMUSIC_LOCAL_DAILY_ENABLED|FNMUSIC_LOCAL_DAILY_LIMIT|FNMUSIC_NETEASE_CHANNELS|\
                     FNMUSIC_NETEASE_CHANNEL_LIMIT|FNMUSIC_NETEASE_CATEGORY|FNMUSIC_NETEASE_CHANNEL_ORDER|\
                     FNMUSIC_NETEASE_PLAYLIST_ORDER|FNMUSIC_PLAYLIST_TRACK_CACHE_TTL|FNMUSIC_PLAYLIST_REFRESH_AT|\
                     FNMUSIC_WARM_SKIP_FRESH_S|\

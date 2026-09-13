@@ -298,6 +298,261 @@ def purge_stale_daily_cache(user_guid: str, keep_day: str) -> None:
             logger.warning("failed to purge %s: %s", path, e)
 
 
+# === 本地每日推荐（v2.9）：每天从本地曲库随机抽 N 首 ===
+#
+# 与网易云「每日推荐」（online:playlist:daily:）严格区分：
+#   - guid 命名空间 online:playlist:localdaily:{日}:{用户}
+#   - 注册表 channel 标 localdaily（大类顺序里排在 daily 之后，可调）
+#   - 缓存目录独立（recommend_cache/<user>/local-<day>.json）
+#   - 曲目是**本地文件**（guid 用本地路径指纹生成，播放走官方后端直读文件，
+#     不经过网易云取链），无需登录、零外网
+# 随机性：以「用户+日期」为随机种子——同一天内多次打开结果一致（不会刷新
+# 一次换一批），跨天自动换新。
+
+LOCAL_DAILY_GUID_PREFIX = "online:playlist:localdaily:"
+LOCAL_DAILY_DEFAULT_LIMIT = 50
+
+
+def local_daily_enabled() -> bool:
+    return (os.environ.get("FNMUSIC_LOCAL_DAILY_ENABLED") or "true").strip().lower() \
+        in ("true", "1", "yes", "on")
+
+
+def local_daily_limit() -> int:
+    try:
+        return max(1, min(int(os.environ.get("FNMUSIC_LOCAL_DAILY_LIMIT")
+                              or LOCAL_DAILY_DEFAULT_LIMIT), 500))
+    except (TypeError, ValueError):
+        return LOCAL_DAILY_DEFAULT_LIMIT
+
+
+def local_daily_playlist_guid(day: str | None = None, user_guid: str = "") -> str:
+    day = day or today_key()
+    suffix = re.sub(r"[^A-Za-z0-9]", "", user_guid)[:12]
+    if suffix:
+        return f"{LOCAL_DAILY_GUID_PREFIX}{day}:{suffix}"
+    return f"{LOCAL_DAILY_GUID_PREFIX}{day}"
+
+
+def is_local_daily_playlist_guid(guid: str | None) -> bool:
+    return str(guid or "").startswith(LOCAL_DAILY_GUID_PREFIX)
+
+
+def local_daily_playlist_name(day: str) -> str:
+    return f"本地每日推荐 {day[4:6]}-{day[6:8]}"
+
+
+def _local_track_guid(path: str) -> str:
+    """本地文件 → 稳定 guid。用绝对路径指纹，避免盘符/卷变化时漂移。"""
+    import hashlib
+
+    return "local:file:" + hashlib.sha1(os.path.abspath(path).encode("utf-8")).hexdigest()
+
+
+def _scan_library_audio_files(library_dir: str) -> "list[dict]":
+    """扫曲库目录（含一级子目录）里的音频文件，返回 {path,title,artist,ext}。
+
+    artist/title 尽力从文件名「歌手 - 歌名.ext」解析；没有分隔符就整名当标题。
+    扫描失败/目录不存在返回空列表（不抛异常）。
+    """
+    out: list[dict] = []
+    root = str(library_dir or "").strip()
+    if not root or not os.path.isdir(root):
+        return out
+    from . import local_library  # noqa: PLC0415 - 延迟导入避免循环
+
+    audio_exts = local_library.AUDIO_EXTS
+    try:
+        for base, _dirs, files in os.walk(root):
+            # 只扫两层：飞牛曲库普遍「库/歌手-专辑/文件」结构，更深的是用户
+            # 自建归档，扫了也大概率不是音乐库的组织方式
+            depth = os.path.relpath(base, root).count(os.sep)
+            if depth >= 2:
+                continue
+            for name in files:
+                ext = os.path.splitext(name)[1].lstrip(".").lower()
+                if ext not in audio_exts:
+                    continue
+                path = os.path.join(base, name)
+                try:
+                    if os.path.getsize(path) <= 0:
+                        continue
+                except OSError:
+                    continue
+                stem = os.path.splitext(name)[0].strip()
+                artist, title = "", stem
+                if " - " in stem:
+                    a, t = stem.split(" - ", 1)
+                    if a.strip() and t.strip():
+                        artist, title = a.strip(), t.strip()
+                out.append({"path": path, "title": title, "artist": artist, "ext": ext})
+    except Exception as e:  # noqa: BLE001 - 扫描失败 = 不出本地日推，不影响其它功能
+        logger.warning("scan library for local daily failed (%s): %s: %s",
+                       root, type(e).__name__, e)
+        return []
+    return out
+
+
+def build_local_daily_tracks(library_dir: str, limit: int, user_guid: str,
+                             day: str | None = None) -> "list[dict]":
+    """从本地曲库随机抽 limit 首，构造成飞牛 track 对象列表。"""
+    import random
+
+    day = day or today_key()
+    files = _scan_library_audio_files(library_dir)
+    if not files:
+        return []
+
+    rng = random.Random(f"{user_guid}:{day}")
+    pool = files[:]
+    rng.shuffle(pool)
+
+    tracks: list[dict] = []
+    for f in pool[:limit]:
+        guid = _local_track_guid(f["path"])
+        media_type = None
+        title = f["title"]
+        artist = f["artist"]
+        play_format = f["ext"]
+        # 复用 app.py 的形状构造太重，这里直接按飞牛 track 形状组装
+        artists_list = [{"name": artist, "guid": f"{guid}:artist"}] if artist else []
+        album_obj = {
+            "name": "本地曲库",
+            "guid": f"{guid}:album",
+            "artists": artists_list,
+            "coverId": guid,
+        }
+        tracks.append({
+            "guid": guid,
+            "id": guid,
+            "title": title,
+            "name": title,
+            "artist": artist,
+            "artists": artists_list,
+            "album": album_obj,
+            "albumName": "本地曲库",
+            "duration": 0,
+            "duration_ms": 0,
+            "durationMs": 0,
+            "codec": play_format,
+            "format": play_format,
+            "ext": play_format,
+            "size": 0,
+            "file_size": 0,
+            "coverId": guid,
+            "cover_url": "",
+            "coverUrl": "",
+            "source": "local",
+            "is_online": False,
+            "isFavorite": False,
+            "isCue": False,
+            "genres": [],
+            "accessStatus": 0,
+            "_local_path": f["path"],   # 代理内部用；组装应答时剥掉
+        })
+    return tracks
+
+
+def local_daily_cache_path(user_guid: str, day: str) -> str:
+    return os.path.join(recommend_cache_dir(), _safe_user_name(user_guid), f"local-{day}.json")
+
+
+def load_local_daily_cache(user_guid: str, day: str) -> dict | None:
+    path = local_daily_cache_path(user_guid, day)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        if str(data.get("day") or "") != day:
+            return None
+        if not isinstance(data.get("tracks"), list) or not data.get("tracks"):
+            return None
+        return data
+    except Exception as e:
+        logger.warning("failed to load local daily cache: %s", e)
+    return None
+
+
+def save_local_daily_cache(user_guid: str, day: str, payload: dict) -> None:
+    _atomic_write_json(local_daily_cache_path(user_guid, day), payload)
+
+
+def purge_stale_local_daily_cache(user_guid: str, keep_day: str) -> None:
+    folder = os.path.join(recommend_cache_dir(), _safe_user_name(user_guid))
+    if not os.path.isdir(folder):
+        return
+    keep = f"local-{keep_day}.json"
+    for name in os.listdir(folder):
+        if name.startswith("local-") and name.endswith(".json") and name != keep:
+            try:
+                os.remove(os.path.join(folder, name))
+            except OSError:
+                pass
+
+
+def empty_local_daily_bundle(user_guid: str, reason: str = "") -> dict:
+    day = today_key()
+    guid = local_daily_playlist_guid(day, user_guid)
+    return {
+        "day": day,
+        "guid": guid,
+        "status": "unavailable",
+        "reason": reason,
+        "playlist": build_playlist_record(
+            guid=guid, name=local_daily_playlist_name(day),
+            cover_id=guid, track_count=0,
+        ),
+        "tracks": [],
+        "builtAt": int(time.time()),
+    }
+
+
+def get_or_build_local_daily(user_guid: str, library_dir: str) -> dict:
+    """返回当天的本地每日推荐 bundle（同步——只扫本地磁盘，零网络）。"""
+    day = today_key()
+    guid = local_daily_playlist_guid(day, user_guid)
+    purge_stale_local_daily_cache(user_guid, day)
+
+    cached = load_local_daily_cache(user_guid, day)
+    if cached and cached.get("tracks"):
+        return cached
+
+    if not local_daily_enabled():
+        return empty_local_daily_bundle(user_guid, "disabled")
+
+    limit = local_daily_limit()
+    try:
+        tracks = build_local_daily_tracks(library_dir, limit, user_guid, day)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("local daily build failed: %s: %s", type(e).__name__, e)
+        return empty_local_daily_bundle(user_guid, "scan_failed")
+
+    if not tracks:
+        return empty_local_daily_bundle(user_guid, "library_empty")
+
+    tracks = stamp_playlist_tracks(tracks)
+    payload = {
+        "day": day,
+        "guid": guid,
+        "status": "ready",
+        "reason": "",
+        "playlist": build_playlist_record(
+            guid=guid, name=local_daily_playlist_name(day),
+            cover_id=guid, track_count=len(tracks),
+        ),
+        "tracks": tracks,
+        "source": "local_daily",
+        "builtAt": int(time.time()),
+    }
+    save_local_daily_cache(user_guid, day, payload)
+    logger.info("local daily recommend %s tracks=%d (library=%s)",
+                guid, len(tracks), library_dir)
+    return payload
+
+
 # === 歌单装配 ===
 
 

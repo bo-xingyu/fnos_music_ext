@@ -160,8 +160,8 @@ def _as_channels(v: Any) -> str:
     return ",".join(sorted(picked, key=CHANNEL_KEYS.index))
 
 
-# 大类顺序里额外允许 daily（它不在勾选框里，由独立的每日推荐开关控制）
-_ORDER_KEYS = ("daily",) + CHANNEL_KEYS
+# 大类顺序里额外允许 daily / localdaily（它们不在勾选框里，由各自独立开关控制）
+_ORDER_KEYS = ("daily", "localdaily") + CHANNEL_KEYS
 
 
 def _as_channel_order(v: Any) -> str:
@@ -255,6 +255,9 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     "free_only_on_logout": ("FNMUSIC_FREE_ONLY_ON_LOGOUT", _as_bool, False),
     "daily_enabled": ("FNMUSIC_DAILY_ENABLED", _as_bool, False),
     "daily_limit": ("FNMUSIC_DAILY_LIMIT", _int_range(1, 100), False),
+    # --- 本地每日推荐（v2.9）：每天从本地曲库随机抽 N 首 ---
+    "local_daily_enabled": ("FNMUSIC_LOCAL_DAILY_ENABLED", _as_bool, False),
+    "local_daily_limit": ("FNMUSIC_LOCAL_DAILY_LIMIT", _int_range(1, 500), False),
     "pushplus_enabled": ("FNMUSIC_PUSHPLUS_ENABLED", _as_bool, False),
     "pushplus_token": ("FNMUSIC_PUSHPLUS_TOKEN", _token, True),
     "pushplus_topic": ("FNMUSIC_PUSHPLUS_TOPIC", _free_text(64), True),
@@ -301,6 +304,8 @@ DEFAULTS = {
     "free_only_on_logout": "true",
     "daily_enabled": "true",
     "daily_limit": "20",
+    "local_daily_enabled": "true",
+    "local_daily_limit": "50",
     "pushplus_enabled": "true",
     "pushplus_token": "",
     "pushplus_topic": "",
@@ -1599,10 +1604,10 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
         </label>
 
         <label><span class="lb">歌单大类顺序</span>
-          <input name="netease_channel_order" placeholder="daily,mine,nrec,toplist,category,newalbum,fm">
+          <input name="netease_channel_order" placeholder="daily,localdaily,mine,nrec,toplist,category,newalbum,fm">
           <span class="ht">飞牛歌单列表里各大类的前后顺序，逗号分隔。可用值：
-            daily(每日推荐) / mine(我的歌单) / nrec(推荐歌单) / toplist(排行榜) /
-            category(分类歌单) / newalbum(新碟上架) / fm(私人FM)。没列出来的排最后</span>
+            daily(网易云每日推荐) / localdaily(本地每日推荐) / mine(我的歌单) / nrec(推荐歌单) /
+            toplist(排行榜) / category(分类歌单) / newalbum(新碟上架) / fm(私人FM)。没列出来的排最后</span>
         </label>
 
         <label><span class="lb">分类歌单的分类</span>
@@ -1734,7 +1739,17 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
 
       <div class="sw"><input type="checkbox" name="daily_enabled" id="c_daily">
         <div class="t"><span class="lb">启用网易云官方「每日推荐」歌单</span>
-        <span class="ht">需要登录；未登录时不会注入空歌单</span></div></div>
+          <span class="ht">需要登录；未登录时不会注入空歌单</span></div></div>
+
+      <div class="sw"><input type="checkbox" name="local_daily_enabled" id="c_local_daily">
+        <div class="t"><span class="lb">启用「本地每日推荐」歌单</span>
+          <span class="ht">每天从本地曲库随机抽一批歌组成歌单（与网易云每日推荐相互独立，无需登录）；播放直接读本地文件</span></div></div>
+
+      <div class="grid" style="margin-top:6px">
+        <label><span class="lb">本地每日推荐数量</span>
+          <input name="local_daily_limit" inputmode="numeric" placeholder="50">
+          <span class="ht">1–500，每天随机抽这么多首本地歌</span></label>
+      </div>
 
       <div class="sw"><input type="checkbox" name="pushplus_enabled" id="c_push">
         <div class="t"><span class="lb">启用 PushPlus 推送提醒</span>

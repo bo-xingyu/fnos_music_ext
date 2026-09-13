@@ -2332,6 +2332,24 @@ def stream_tee_response(
 async def stream_track(request: Request):
     started = time.monotonic()
     guid = extract_guid(request)
+
+    # 本地每日推荐的曲目（guid 形如 local:file:<sha1>）：直接从磁盘读文件。
+    # 必须放在「非 online guid 直通官方后端」分支**之前**——local:file: 不带
+    # online: 前缀，先判 alive 会被当成普通本地曲目转发官方后端（它按自己的
+    # 库处理，最坏 404），永远到不了这里。
+    # 路径在当天 bundle 里反查（guid 是路径指纹，无法逆向）。
+    if str(guid or "").startswith("local:file:"):
+        local_path = await _local_daily_path_of(request, guid)
+        if local_path and os.path.isfile(local_path):
+            ext = os.path.splitext(local_path)[1].lstrip(".") or "mp3"
+            logger.info("play-start local-daily %s %.0fms", guid,
+                        (time.monotonic() - started) * 1000.0)
+            return serve_file_with_range(local_path, request.headers.get("range"),
+                                         media_type_for_ext(ext))
+        return await forward_to_upstream(
+            request, get_upstream_client(request.app),
+            timeout=PLAYBACK_FORWARD_TIMEOUT_S, label="local-stream")
+
     if not is_online_guid(guid):
         # 本地曲目直通官方后端；播放链路放宽读超时（见 PLAYBACK_FORWARD_TIMEOUT_S）
         return await forward_to_upstream(
@@ -2920,6 +2938,10 @@ async def static_cover(request: Request, subpath: str = ""):
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not guid and subpath.startswith("online:"):
         guid = subpath
+    if dailyrec.is_local_daily_playlist_guid(guid):
+        # 本地每日推荐封面：借用第一首本地歌的封面字段（本地文件无封面 URL，
+        # 返回 404 让客户端用占位图——与官方空封面行为一致）
+        return Response(status_code=404)
     if dailyrec.is_daily_playlist_guid(guid):
         upstream_client = get_upstream_client(request.app)
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
@@ -3471,6 +3493,37 @@ async def _load_daily_bundle(request: Request, user_guid: str) -> dict:
         return dailyrec.empty_daily_bundle(user_guid)
 
 
+def _load_local_daily_bundle(user_guid: str) -> dict:
+    """本地每日推荐（同步，只扫本地磁盘，零网络）。失败/为空时 tracks=[]。"""
+    try:
+        return dailyrec.get_or_build_local_daily(user_guid, detect_library_dir())
+    except Exception as exc:  # noqa: BLE001 - 本地日推失败不影响其它注入
+        logger.warning("local daily bundle failed: %s: %s", type(exc).__name__, exc)
+        return dailyrec.empty_local_daily_bundle(user_guid)
+
+
+async def _local_daily_path_of(request: Request, guid: str) -> str | None:
+    """在（当前用户的）本地日推 bundle 里反查曲目 guid 对应的磁盘路径。"""
+    upstream_client = get_upstream_client(request.app)
+    is_authed, user_guid, _resp = await _probe_upstream_auth(request, upstream_client)
+    user = user_guid if is_authed else "shared"
+    for _day_offset in range(2):   # 今天 + 昨天（跨零点后旧页仍在用昨天的 guid）
+        day = dailyrec.today_key()
+        if _day_offset == 1:
+            import datetime as _dt
+            day = (_dt.datetime.now() - _dt.timedelta(days=1)).strftime("%Y%m%d")
+        for bundle in (
+            dailyrec.load_local_daily_cache(user, day) or {},
+            _load_local_daily_bundle(user),
+        ):
+            for t in bundle.get("tracks") or []:
+                if isinstance(t, dict) and str(t.get("guid") or "") == guid:
+                    return str(t.get("_local_path") or "") or None
+            if dailyrec.load_local_daily_cache(user, day):
+                break
+    return None
+
+
 async def _netease_logged_in() -> bool:
     """当前网易云账号是否已登录（走带 TTL 的登录态缓存，不额外打上游）。"""
     try:
@@ -3842,6 +3895,7 @@ async def playlist_list(request: Request):
         it for it in official
         if not (isinstance(it, dict) and (
             dailyrec.is_daily_playlist_guid(str(it.get("guid") or ""))
+            or dailyrec.is_local_daily_playlist_guid(str(it.get("guid") or ""))
             or playlists.is_channel_guid(str(it.get("guid") or ""))))
     ]
 
@@ -3868,6 +3922,24 @@ async def playlist_list(request: Request):
         head_items.append(("daily", rec))
     elif str(bundle.get("reason") or ""):
         logger.info("daily playlist not injected for %s: %s", user_guid[:8], bundle.get("reason"))
+
+    # 本地每日推荐（v2.9）：与网易云日导独立，无需登录；失败时 tracks 为空自然不注入
+    try:
+        local_bundle = _load_local_daily_bundle(user_guid)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("local daily inject failed: %s", exc)
+        local_bundle = {}
+    local_tracks = local_bundle.get("tracks") or []
+    if local_tracks:
+        local_rec = _playlist_public_fields(local_bundle.get("playlist") or {})
+        local_rec["name"] = dailyrec.local_daily_playlist_name(local_bundle.get("day") or dailyrec.today_key())
+        local_rec["trackCount"] = len(local_tracks)
+        local_rec["isDaily"] = False
+        local_rec["source"] = "local"
+        head_items.append(("localdaily", local_rec))
+    elif str(local_bundle.get("reason") or "") not in ("", "disabled"):
+        logger.info("local daily not injected: %s", local_bundle.get("reason"))
+
     for r in channel_recs:
         ch = str(r.get("channel") or "")
         head_items.append((ch if ch in stamped_order else "category", _channel_public_fields(r)))
@@ -3909,6 +3981,20 @@ async def playlist_detail(request: Request):
             "updatedAt": reg.get("ts") or int(time.time()),
         }
         return JSONResponse(content={"code": 0, "msg": "ok", "data": _channel_public_fields(rec)})
+    if dailyrec.is_local_daily_playlist_guid(guid):
+        upstream_client = get_upstream_client(request.app)
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        if not is_authed and auth_resp is not None:
+            return auth_resp
+        local_bundle = _load_local_daily_bundle(user_guid)
+        rec = _playlist_public_fields(local_bundle.get("playlist") or {})
+        rec["name"] = dailyrec.local_daily_playlist_name(local_bundle.get("day") or dailyrec.today_key())
+        rec["trackCount"] = len(local_bundle.get("tracks") or [])
+        reg_ts = playlists.lookup(guid).get("ts")
+        if reg_ts:
+            rec["createdAt"] = int(reg_ts)
+            rec["updatedAt"] = int(reg_ts)
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": rec})
     if not dailyrec.is_daily_playlist_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
@@ -3934,7 +4020,9 @@ async def playlist_batch_detail(request: Request):
     guids = [g.strip() for g in raw.split(",") if g.strip()]
 
     def _is_mine(g: str) -> bool:
-        return dailyrec.is_daily_playlist_guid(g) or playlists.is_channel_guid(g)
+        return (dailyrec.is_daily_playlist_guid(g)
+                or dailyrec.is_local_daily_playlist_guid(g)
+                or playlists.is_channel_guid(g))
 
     mine_ids = [g for g in guids if _is_mine(g)]
     if not mine_ids:
@@ -3969,6 +4057,7 @@ async def playlist_batch_detail(request: Request):
 
     out: list[dict] = []
     daily_rec: dict | None = None
+    local_daily_rec: dict | None = None
     for g in mine_ids:
         if playlists.is_channel_guid(g):
             reg = playlists.lookup(g)
@@ -3980,6 +4069,18 @@ async def playlist_batch_detail(request: Request):
                 "channel": reg.get("channel") or playlists.channel_of(g),
                 "createdAt": reg.get("ts"), "updatedAt": reg.get("ts"),
             }))
+        elif dailyrec.is_local_daily_playlist_guid(g):
+            if local_daily_rec is None:
+                local_bundle = _load_local_daily_bundle(user_guid)
+                local_daily_rec = _playlist_public_fields(local_bundle.get("playlist") or {})
+                local_daily_rec["name"] = dailyrec.local_daily_playlist_name(
+                    local_bundle.get("day") or dailyrec.today_key())
+                local_daily_rec["trackCount"] = len(local_bundle.get("tracks") or [])
+                reg_ts = playlists.lookup(g).get("ts")
+                if reg_ts:
+                    local_daily_rec["createdAt"] = int(reg_ts)
+                    local_daily_rec["updatedAt"] = int(reg_ts)
+            out.append(local_daily_rec)
         elif daily_rec is None:
             # 每日推荐只解析一次；同一次批量请求里重复的日推 guid 复用结果
             bundle = await _load_daily_bundle(request, user_guid)
@@ -4005,7 +4106,8 @@ async def playlist_track_list(request: Request):
         or ""
     ).strip()
     is_channel = playlists.is_channel_guid(guid)
-    if not is_channel and not dailyrec.is_daily_playlist_guid(guid):
+    is_local_daily = dailyrec.is_local_daily_playlist_guid(guid)
+    if not is_channel and not is_local_daily and not dailyrec.is_daily_playlist_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     upstream_client = get_upstream_client(request.app)
@@ -4015,7 +4117,15 @@ async def playlist_track_list(request: Request):
 
     started = time.monotonic()
     cache_state = "hit"
-    if is_channel:
+    if is_local_daily:
+        # 本地每日推荐：缓存即磁盘 bundle（当天稳定），构建只扫本地零网络
+        local_bundle = _load_local_daily_bundle(user_guid)
+        tracks = dailyrec.stamp_playlist_tracks(list(local_bundle.get("tracks") or []))
+        # 内部字段（_local_path 等）不能进对外应答
+        for t in tracks:
+            t.pop("_local_path", None)
+        cache_state = "local"
+    elif is_channel:
         try:
             _hit = playlists.load_cached_tracks(guid)
             if _hit is None:

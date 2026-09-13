@@ -49,19 +49,20 @@ _DISPLAY_TS_BASE = 1
 
 # 口径 -> (是否需要登录, 展示名前缀)
 CHANNELS: dict[str, dict[str, Any]] = {
-    "daily":    {"needs_login": True,  "label": "每日推荐"},     # 由 recommend.py 负责
-    "mine":     {"needs_login": True,  "label": "我的歌单"},     # 自建 + 收藏
-    "nrec":     {"needs_login": True,  "label": "推荐歌单"},     # recommend_resource
-    "toplist":  {"needs_login": False, "label": "排行榜"},
-    "category": {"needs_login": False, "label": "分类歌单"},
-    "newalbum": {"needs_login": False, "label": "新碟上架"},
-    "fm":       {"needs_login": True,  "label": "私人FM"},
+    "daily":      {"needs_login": True,  "label": "每日推荐"},     # 由 recommend.py 负责
+    "mine":       {"needs_login": True,  "label": "我的歌单"},     # 自建 + 收藏
+    "nrec":       {"needs_login": True,  "label": "推荐歌单"},     # recommend_resource
+    "toplist":    {"needs_login": False, "label": "排行榜"},
+    "category":   {"needs_login": False, "label": "分类歌单"},
+    "newalbum":   {"needs_login": False, "label": "新碟上架"},
+    "fm":         {"needs_login": True,  "label": "私人FM"},
 }
 DEFAULT_CHANNELS = "mine,toplist,category"
 
 # 大类展示顺序（v2.4）：飞牛歌单列表里各口径的先后由它决定，管理页可改。
 # 默认值同时是兜底序：未列出的口径按此顺序追加在末尾。
-DEFAULT_CHANNEL_ORDER = "daily,mine,nrec,toplist,category,newalbum,fm"
+# v2.9 新增 localdaily（本地每日推荐，由 recommend.py 负责内容，这里只管排序）。
+DEFAULT_CHANNEL_ORDER = "daily,localdaily,mine,nrec,toplist,category,newalbum,fm"
 
 _PREFIX_BY_CHANNEL = {"mine": "", "nrec": "推荐", "toplist": "榜",
                       "category": "", "newalbum": "新碟", "fm": "电台"}
@@ -85,6 +86,8 @@ def channel_order() -> tuple[str, ...]:
             key = part.strip().lower()
             if key in CHANNELS and key not in ordered:
                 ordered.append(key)
+            elif key == "localdaily" and key not in ordered:
+                ordered.append(key)   # localdaily 不在 CHANNELS 里（不由本模块取数），但参与排序
     for key in DEFAULT_CHANNEL_ORDER.split(","):
         if key not in ordered:
             ordered.append(key)
