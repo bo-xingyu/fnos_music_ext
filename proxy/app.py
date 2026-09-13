@@ -638,7 +638,7 @@ def detect_library_dir() -> str:
     explicit = str(CONF.get("library_dir") or "").strip()
     if explicit:
         return explicit
-    db = str(CONF.get("music_db") or "")
+    db = resolve_music_db()
     if db and os.path.exists(db):
         try:
             con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -652,6 +652,54 @@ def detect_library_dir() -> str:
         except Exception as e:
             logger.warning("Failed to read shared_library path: %s", e)
     return CONF["cache_dir"]
+
+
+# ---------------------------------------------------------------------------
+# music.db 自动定位（v2.8.1）
+#
+# 真机诊断铁证：「music.db 扫描 available=false / music.db 不存在或未能打开」——
+# 默认路径 /usr/local/apps/@appdata/trim.music/db/music.db 在该机器上不存在
+# （飞牛把应用数据放 /vol*/@appdata 下，不同版本布局不同）。后果远不止
+# 「跟随飞牛」读不到偏好：**本地曲库优先的索引也建立在空库上**，功能静默失效
+# ——又是那种"猜路径猜错不会报错、只会永远不生效"的坑。
+#
+# 解析顺序：FNMUSIC_MUSIC_DB 显式配置（存在才用）→ 常见布局探测。结果按
+# 「显式值」为键缓存（测试会换 CONF["music_db"]，键变了自动重查）。
+# ---------------------------------------------------------------------------
+
+_MUSIC_DB_RESOLVED: dict[str, str] = {}
+
+
+def resolve_music_db() -> str:
+    explicit = str(CONF.get("music_db") or "").strip()
+    cached = _MUSIC_DB_RESOLVED.get(explicit)
+    if cached is not None:
+        return cached
+
+    candidates: list[str] = []
+    if explicit:
+        candidates.append(explicit)
+    candidates.append("/usr/local/apps/@appdata/trim.music/db/music.db")
+    candidates.extend(sorted(glob.glob("/vol*/@appdata/trim.music/db/music.db")))
+    candidates.extend(sorted(glob.glob("/vol*/@appdata/trim.music/*/db/music.db")))
+
+    for cand in candidates:
+        if cand and os.path.isfile(cand):
+            _MUSIC_DB_RESOLVED[explicit] = cand
+            if cand != explicit:
+                logger.info("music.db 自动定位成功: %s（显式配置=%r）", cand, explicit or "未配置")
+            return cand
+
+    resolved = explicit or (candidates[1] if len(candidates) > 1 else "")
+    _MUSIC_DB_RESOLVED[explicit] = resolved
+    if not os.path.isfile(resolved):
+        logger.info("music.db 未找到（本地曲库优先与「跟随飞牛」不可用）。已探测: %s",
+                    ", ".join(c for c in candidates if c) or "无")
+    return resolved
+
+
+def reset_music_db_cache_for_test() -> None:
+    _MUSIC_DB_RESOLVED.clear()
 
 
 def iter_media_dirs() -> list[str]:
@@ -1314,7 +1362,7 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str,
     按策略的 WiFi 档处理，行为与旧版一致。选中的档位上游不给直链时仍会继续降到
     exhigh，不能因为策略选了高档就直接播放失败。
     """
-    decision = quality.resolve(request, db_path=str(CONF.get("music_db") or ""))
+    decision = quality.resolve(request, db_path=resolve_music_db())
     _log_quality_decision(song_id, decision)
     primary = decision.get("level") or str(CONF.get("netease_quality") or "lossless").strip()
 
@@ -1785,7 +1833,7 @@ async def ext_quality_report():
     （与 /_ext/cache/invalidate 同一套做法）；直接 import 读到的永远是空。
     """
     try:
-        return {"ok": True, "data": quality.report(db_path=str(CONF.get("music_db") or ""))}
+        return {"ok": True, "data": quality.report(db_path=resolve_music_db())}
     except Exception as exc:  # noqa: BLE001
         logger.warning("quality report failed: %s: %s", type(exc).__name__, exc)
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
@@ -2337,11 +2385,11 @@ async def stream_track(request: Request):
     local_hit: dict | None = None
     if local_library.local_first_enabled() and isinstance(info, dict) \
             and str(info.get("title") or "").strip():
-        decision = quality.resolve(request, db_path=str(CONF.get("music_db") or ""))
+        decision = quality.resolve(request, db_path=resolve_music_db())
         local_hit = local_library.find_local_match(
             str(info.get("title") or ""),
             str(info.get("artist") or ""),
-            str(CONF.get("music_db") or ""),
+            resolve_music_db(),
         )
         if local_hit and local_library.serves_request(local_hit, decision.get("level")):
             try:
@@ -2563,6 +2611,50 @@ async def _fetch_cover_bytes(url: str) -> tuple[bytes, str] | None:
 # ---------------------------------------------------------------------------
 
 _COVER_DISK_MAX_FILES = 800
+
+# 封面压缩目标边长（像素）。网易云原图普遍几百 KB～1MB+，一个歌单列表首屏
+# 三四十张就是几十 MB——移动网络下「列表打开卡顿」的主力（真机用户反馈定位）。
+# 网易云 CDN 原生支持 ?param={N}y{N} 服务端缩图（p1.music.126.net 系域名），
+# 300px 的封面约 20~50KB，体积缩到原图的几十分之一。0 = 不压缩。
+# 动态读环境变量（.env 改完保存即生效，无需重启）。
+def _cover_resize_px_config() -> int:
+    return _int("FNMUSIC_COVER_RESIZE_PX", 300)
+
+
+def cover_resize_px(requested_size: "int | None" = None) -> int:
+    """决定本次封面用多大的缩图。客户端带 size 参数时优先，否则用配置默认。"""
+    if requested_size:
+        try:
+            px = int(requested_size)
+        except (TypeError, ValueError):
+            px = 0
+        if px >= 60:
+            return min(px, 800)
+    px = _cover_resize_px_config()
+    if px <= 0:
+        return 0
+    return min(max(px, 60), 800)
+
+
+def resized_cover_url(url: str, px: int) -> str:
+    """给网易云 CDN 封面 URL 加 ?param={px}y{px}（服务端缩图）。
+
+    只对 music.126.net 系域名生效（其他图床不认识这个参数，加了反而可能 404）。
+    已有 query 的先剥掉（网易云该参数是唯一的尺寸控制方式）。
+    """
+    if px <= 0 or not url:
+        return url
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(str(url))
+        host = (parts.hostname or "").lower()
+        if not host.endswith("music.126.net"):
+            return url
+        return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                           f"param={px}y{px}", ""))
+    except Exception:  # noqa: BLE001 - URL 解析失败就原图原样
+        return url
 
 
 def _cover_cache_dir() -> str:
@@ -2869,8 +2961,17 @@ async def static_cover(request: Request, subpath: str = ""):
     # 302 依赖两件我们无法保证的事：客户端能直连 p1.music.126.net，且该 CDN
     # 不校验 Referer/Origin。任一不成立就表现为「列表里没有封面」。
     # 代抓失败时再退回 302，至少保留原来那条能走通的路。
-    # v2.8：字节走磁盘缓存——同一 URL 一生只从 CDN 抓一次。
-    fetched = await _fetch_cover_bytes_cached(cover)
+    # v2.8.1：网易云系封面走 CDN 服务端缩图（?param=NyN）——原图几百 KB～1MB，
+    # 一个列表首屏几十 MB 正是移动网络卡顿的主力；300px 缩图只有几十 KB。
+    # 字节磁盘缓存按最终 URL 键控，不同尺寸各自缓存互不干扰。
+    px = cover_resize_px(request.query_params.get("size"))
+    fetch_url = resized_cover_url(cover, px)
+    if fetch_url != cover:
+        logger.info("cover resize %dx%d for %s", px, px, cover[:80])
+    fetched = await _fetch_cover_bytes_cached(fetch_url)
+    if fetched is None and fetch_url != cover:
+        # 缩图 URL 失败（个别 CDN 节点不认参数）：再试一次原图
+        fetched = await _fetch_cover_bytes_cached(cover)
     if fetched:
         content, ctype = fetched
         headers["Content-Type"] = ctype

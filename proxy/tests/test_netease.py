@@ -1674,7 +1674,7 @@ async def test_static_cover_streams_bytes_with_cache_header(monkeypatch):
     with TestClient(app) as c:
         r = c.get("/music/api/v1/static/cover",
                   params={"coverId": "online:netease:186016"}, follow_redirects=False)
-    assert called == [PIC], "应按上游返回的 https picUrl 代抓"
+    assert called == [PIC + "?param=300y300"], "126.net 封面应走 CDN 缩图 URL 代抓"
     assert r.status_code == 200
     assert r.content == img
     assert r.headers["content-type"].startswith("image/")
@@ -1727,4 +1727,81 @@ async def test_static_cover_disk_cache_fetches_cdn_once(monkeypatch):
         assert r2.status_code == 200
         assert r2.content == img
         assert r2.headers["content-type"].startswith("image/")
-    assert calls == [PIC], "同一封面 URL 只允许出网一次"
+    # v2.8.1 起 126.net 封面走 ?param=NyN 缩图 URL，缓存键随之带上尺寸参数
+    assert calls == [PIC + "?param=300y300"], "同一封面 URL 只允许出网一次"
+
+
+# ---------------------------------------------------------------------------
+# v2.8.1：封面 CDN 服务端缩图（?param=NyN）
+# ---------------------------------------------------------------------------
+
+
+def test_cover_resize_url_netease_only():
+    """126.net 系域名加 ?param=NyN；其他图床不加（不认识该参数，加了可能 404）。"""
+    assert P.resized_cover_url(PIC, 300) == \
+        "https://p1.music.126.net/CoverKey==/109951168064202445.jpg?param=300y300"
+    # 已有 query 的剥掉再挂尺寸参数
+    assert P.resized_cover_url(PIC + "?param=999y999", 120) == \
+        "https://p1.music.126.net/CoverKey==/109951168064202445.jpg?param=120y120"
+    # 非网易云图床：原样返回
+    other = "https://img.example.com/a.jpg"
+    assert P.resized_cover_url(other, 300) == other
+    # 关闭（px=0）：原样返回
+    assert P.resized_cover_url(PIC, 0) == PIC
+
+
+def test_cover_resize_px_env_and_client_size(monkeypatch):
+    # 默认 300
+    monkeypatch.delenv("FNMUSIC_COVER_RESIZE_PX", raising=False)
+    assert P.cover_resize_px() == 300
+    # 客户端带 size 参数优先（下限 60、上限 800）
+    assert P.cover_resize_px(120) == 120
+    assert P.cover_resize_px(40) == 300
+    assert P.cover_resize_px(2000) == 800
+    assert P.cover_resize_px("abc") == 300
+    # 配置 0 = 关闭
+    monkeypatch.setenv("FNMUSIC_COVER_RESIZE_PX", "0")
+    assert P.cover_resize_px() == 0
+    assert P.cover_resize_px(120) == 120, "客户端显式要尺寸时仍应尊重"
+
+
+@pytest.mark.anyio
+async def test_static_cover_serves_resized_and_falls_back(monkeypatch):
+    """封面请求应打到缩图 URL（CDN 服务端压缩）；缩图失败时回落原图。"""
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=_mb_request({"186016": _SONG_RAW}, []), base_url="http://127.0.0.1:8770")
+
+    img_small = b"\xff\xd8\xff\xe0RESIZED_SMALL_JPEG"
+    img_full = b"\xff\xd8\xff\xe0FULLSIZE_ORIGINAL_JPEG" * 50
+    calls = []
+
+    async def fake_fetch(url):
+        calls.append(url)
+        if "param=" in url:
+            return img_small, "image/jpeg"
+        return img_full, "image/jpeg"
+
+    monkeypatch.setattr(P, "_fetch_cover_bytes", fake_fetch)
+    with TestClient(app) as c:
+        r = c.get("/music/api/v1/static/cover",
+                  params={"coverId": "online:netease:186016"}, follow_redirects=False)
+    assert r.status_code == 200
+    assert r.content == img_small, "应返回 CDN 缩图（300px，几十 KB）而不是原图"
+    assert calls and "param=300y300" in calls[0]
+
+    # 缩图失败 → 回落原图（不留空白封面）。先清掉上一场景留下的磁盘缓存
+    import shutil as _shutil
+    _shutil.rmtree(P._cover_cache_dir(), ignore_errors=True)
+
+    async def fail_small(url):
+        if "param=" in url:
+            return None
+        return img_full, "image/jpeg"
+
+    calls.clear()
+    monkeypatch.setattr(P, "_fetch_cover_bytes", fail_small)
+    with TestClient(app) as c:
+        r2 = c.get("/music/api/v1/static/cover",
+                   params={"coverId": "online:netease:186016"}, follow_redirects=False)
+    assert r2.status_code == 200
+    assert r2.content == img_full

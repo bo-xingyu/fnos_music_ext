@@ -64,6 +64,10 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_LOCAL_FIRST", "true"),
     # 本地曲库索引的内存缓存时长（秒）
     ("FNMUSIC_LOCAL_INDEX_TTL", "300"),
+    # 封面缩图边长（像素）：网易云 CDN 服务端缩图（?param=NyN）。原图几百 KB
+    # ~1MB，一个歌单列表首屏几十 MB 正是移动网络卡顿的主力；300px 约 20~50KB。
+    # 0 = 不压缩
+    ("FNMUSIC_COVER_RESIZE_PX", "300"),
     # --- 收藏归档与红心同步（v2.2 新增）---
     # 归档目录默认留空 = 关闭自动下载：这是往用户自己的磁盘写文件，
     # 绝不能替他决定写到哪儿，必须他在管理页里显式填。
@@ -104,7 +108,8 @@ NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOGIN_",
                 "FNMUSIC_NETEASE_CHANNEL", "FNMUSIC_NETEASE_CATEGOR",
                 "FNMUSIC_NETEASE_PLAYLIST_", "FNMUSIC_PLAYLIST_", "FNMUSIC_DOWNLOAD_", "FNMUSIC_FAV_",
                 "FNMUSIC_QUALITY_", "FNMUSIC_WATCHDOG_", "FNMUSIC_URL_CACHE_",
-                "FNMUSIC_CHANNEL_LIST_", "FNMUSIC_REMOTE_AS_", "FNMUSIC_LOCAL_")
+                "FNMUSIC_CHANNEL_LIST_", "FNMUSIC_REMOTE_AS_", "FNMUSIC_LOCAL_",
+                "FNMUSIC_COVER_")
 
 # v2.0 已废弃的配置项：升级合并时从 .env 中清理，避免残留误导。
 # 只删「确定已无代码读取」的键；FNMUSIC_MODE / BASE_IMAGE / PIP_INDEX 等 docker 相关项保留。

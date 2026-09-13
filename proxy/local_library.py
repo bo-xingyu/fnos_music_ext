@@ -182,6 +182,14 @@ def build_index(db_path: str) -> dict[str, list[dict]]:
         logger.info("local library index unavailable (%s): %s: %s",
                     db_path, type(exc).__name__, exc)
         return {}
+    if index:
+        logger.info("本地曲库索引就绪：%d 首（db=%s）", sum(len(v) for v in index.values()), db_path)
+    else:
+        # 索引为空 = 本地优先将永远不命中。必须留痕说明是「库没扫到东西」，
+        # 否则用户只看到功能没生效、却不知道该往哪儿查（music.db 路径不对？
+        # 列名没匹配上？）。真机排障时这是第一现场。
+        logger.info("本地曲库索引为空（db=%s）——music.db 可能路径不对或表结构未匹配，"
+                    "本地曲库优先不会生效；请把 music.db 的 .schema 发给开发者适配", db_path)
     return index
 
 

@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from proxy import local_library as ll
 from proxy import netease_auth
 from proxy.app import app, CONF
+from proxy import app as P
 
 
 # ---------------------------------------------------------------------------
@@ -220,3 +221,45 @@ def test_stream_local_first_disabled_by_env(monkeypatch, tmp_path):
     with TestClient(app) as client:
         resp = client.get(f"/music/api/v1/track/stream?guid=online:netease:{_SONG_ID}")
         assert resp.status_code == 404, "关闭本地优先时无直链应如实 404"
+
+
+# ---------------------------------------------------------------------------
+# v2.8.1：music.db 自动定位
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_music_db_prefers_existing_explicit(monkeypatch, tmp_path):
+    db = _make_music_db(tmp_path, [("t", "a", "/x.flac")])
+    monkeypatch.setitem(CONF, "music_db", db)
+    P.reset_music_db_cache_for_test()
+    assert P.resolve_music_db() == db
+
+
+def test_resolve_music_db_falls_back_when_explicit_missing(monkeypatch, tmp_path):
+    """显式配置的路径不存在时必须探测常见布局，而不是带着死路径静默失效。
+
+    真机事故：默认路径 /usr/local/apps/... 在该机器上不存在（飞牛数据在
+    /vol*/@appdata），诊断里「music.db 不存在」，本地曲库优先建立在空库上。
+    """
+    monkeypatch.setitem(CONF, "music_db", "/nonexistent/music.db")
+    P.reset_music_db_cache_for_test()
+    fake = str(tmp_path / "vol1_appdata.db")
+    con = sqlite3.connect(fake)
+    con.execute("CREATE TABLE t (x)")
+    con.commit()
+    con.close()
+    import glob as _glob
+    orig_glob = _glob.glob
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(P.glob, "glob",
+                   lambda pat, *a, **k: [fake] if "trim.music" in pat else orig_glob(pat))
+        got = P.resolve_music_db()
+    assert got == fake, "应探测到 /vol*/@appdata/trim.music/db/music.db 布局"
+
+
+def test_resolve_music_db_uses_default_when_nothing_exists(monkeypatch):
+    monkeypatch.setitem(CONF, "music_db", "/nonexistent/music.db")
+    P.reset_music_db_cache_for_test()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(P.glob, "glob", lambda pat, *a, **k: [])
+        assert P.resolve_music_db() == "/nonexistent/music.db"
