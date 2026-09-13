@@ -787,6 +787,28 @@ async def _probe_proxy_local_daily() -> dict:
         return {"reachable": False, "error": f"{type(exc).__name__}: {exc}"[:160]}
 
 
+async def _probe_proxy_authorized() -> dict:
+    """向代理进程取「飞牛应用授权目录」状态快照。
+
+    这是判断「本地曲库到底有没有被合规授权」的唯一权威来源：网关 socket 只有
+    代理进程那侧查得到，管理页面是另一个进程。
+    """
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=PROXY_SOCK),
+            base_url="http://unix",
+            timeout=10.0,
+        ) as client:
+            r = await client.get("/_ext/authorized", params={"refresh": "1"})
+            body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            if r.status_code == 200 and isinstance(body, dict) and body.get("ok") is not False:
+                return {"reachable": True, **(body.get("data") if isinstance(body.get("data"), dict) else {})}
+            return {"reachable": False, "status": r.status_code,
+                    "error": str(body.get("error") or "")[:160]}
+    except Exception as exc:  # noqa: BLE001
+        return {"reachable": False, "error": f"{type(exc).__name__}: {exc}"[:160]}
+
+
 async def _probe_proxy_health() -> dict:
     """透过被接管的 socket 读扩展自身的 healthz。"""
     try:
@@ -966,6 +988,7 @@ async def api_diag(request: Request):
         "watchdog": watchdog,
         "quality": quality_probe,
         "local_daily": await _probe_proxy_local_daily(),
+        "authorized": await _probe_proxy_authorized(),
         "musicbox": {
             "url": MUSICBOX_URL,
             "healthz": mb,
@@ -1303,6 +1326,38 @@ async def api_playlists(request: Request):
     data["saved_order"] = saved
     data["saved_order_tokens"] = [t for t in saved.split(",") if t.strip()]
     return {"ok": True, **data}
+
+
+@app.get("/api/authorized")
+async def api_authorized(request: Request):
+    """飞牛「应用授权目录」状态，供管理页「授权目录」卡片。
+
+    数据源是代理进程的 /_ext/authorized（网关 socket 只有那侧查得到）。
+    """
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    force = request.query_params.get("refresh") in ("1", "true", "yes")
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=PROXY_SOCK),
+            base_url="http://unix",
+            timeout=15.0,
+        ) as client:
+            r = await client.get("/_ext/authorized",
+                                 params={"refresh": "1" if force else "0"})
+    except Exception as exc:  # noqa: BLE001
+        return _err(502, f"读取授权状态失败（代理未运行？）：{type(exc).__name__}: {exc}")
+    if r.status_code != 200:
+        return _err(502, f"代理返回 HTTP {r.status_code}")
+    try:
+        body = r.json()
+    except Exception:  # noqa: BLE001
+        return _err(502, "代理返回的不是 JSON")
+    if not body.get("ok"):
+        return _err(502, f"代理查询失败：{str(body.get('error') or '')[:160]}")
+    return {"ok": True, **(body.get("data") or {})}
 
 
 @app.post("/api/playlists/warm")
@@ -1840,6 +1895,19 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
   </div>
 
   <div class="card">
+    <h2>飞牛授权目录（本地曲库访问权）</h2>
+    <div class="sub">按飞牛开发规范，应用读取存储空间里的目录前必须先取得授权——系统会把该路径的 ACL
+      授予本应用，之后本地每日推荐、本地曲库优先才读得动。点「申请授权」在弹窗里选你的音乐目录
+      （需管理员）；授权后点「刷新状态」，下方会列出已授权目录。</div>
+    <div class="acts">
+      <button class="btn pri" id="authPickBtn" type="button">申请授权目录…</button>
+      <button class="btn" id="authRefreshBtn" type="button">刷新状态</button>
+    </div>
+    <div class="msg" id="authMsg"></div>
+    <div class="sub" id="authState" style="margin:0 0 6px;white-space:pre-wrap"></div>
+  </div>
+
+  <div class="card">
     <h2>歌单顺序（手动排序）</h2>
     <div class="sub">点「读取当前歌单」拉取当前实际注入飞牛的网易云歌单（真实名称，顺序与飞牛里显示一致），
       用 ▲▼ 调整后保存。保存后<b>立即生效、无需重启</b>；新出现的歌单会排在手动排过的之后。
@@ -2222,6 +2290,24 @@ function runDiag(auto){
         if(ld.hint) out.push("  ★ "+ld.hint);
       }
       out.push("");
+      out.push("-- 飞牛应用授权目录（开放能力 / api-scope）--");
+      var az=d.authorized||{};
+      if(!az.reachable){
+        out.push("  取不到代理侧快照: "+JSON.stringify(az));
+      }else{
+        var gw=az.gateway||{};
+        out.push("  应用名         : "+gw.app_name);
+        out.push("  开放网关       : "+gw.socket+"  存在="+gw.exists);
+        out.push("  TRIM_API_TOKEN : "+(gw.token_present?"已注入":"★ 未注入（需由系统脚本启动进程）"));
+        out.push("  已授权目录     : "+((az.shared_paths&&az.shared_paths.length)?az.shared_paths.join(" | "):"（无）"));
+        if(az.env_paths&&az.env_paths.length)
+          out.push("  环境变量路径   : "+az.env_paths.join(" | "));
+        out.push("  当前曲库目录   : "+az.library_dir+"  被授权覆盖="+(!!az.authorized));
+        out.push("  严格模式       : "+az.strict+"（true=只扫已授权目录）");
+        if(az.shared_error) out.push("  网关返回       : "+az.shared_error);
+        if(az.hint) out.push("  ★ "+az.hint);
+      }
+      out.push("");
       out.push("-- 音源服务 (musicbox) --");
       out.push("  "+d.musicbox.url);
       out.push("  healthz      : "+JSON.stringify(d.musicbox.healthz));
@@ -2361,6 +2447,65 @@ $("#plWarmBtn").onclick=function(){
     setTimeout(loadPl,5000);  // 预热是后台任务，稍后回读缓存状态
   });
 };
+
+/* ===== 飞牛授权目录（api-scope: trim.file.sharedAccess） =====
+   管理页保持「单文件、零外链」约束，不动态加载任何 CDN SDK。若宿主已把
+   TrimApp 注入为全局对象（微应用形态），直接唤起系统目录选择器；否则降级为
+   「去应用设置 → 授权目录添加 + 本页刷新状态核对」的引导，绝不报错、不联网。 */
+function authRender(j){
+  var box=$("#authState"), m=$("#authMsg");
+  if(!j.ok){ box.textContent="读取失败："+(j.error||"未知错误"); m.className="msg err";
+             m.textContent="代理不可达，无法查询授权状态。"; return; }
+  var gw=j.gateway||{};
+  var lines=[];
+  lines.push("开放网关       : "+(gw.exists?"存在":"★ 不存在")+"  "+gw.socket);
+  lines.push("TRIM_API_TOKEN : "+(gw.token_present?"已注入":"★ 未注入（进程需由系统脚本启动）"));
+  lines.push("已授权目录     : "+((j.shared_paths&&j.shared_paths.length)?j.shared_paths.join("\n                 "):"（无）"));
+  lines.push("当前曲库目录   : "+(j.library_dir||"（未定位）")+"   被授权覆盖="+(j.authorized?"是":"★ 否"));
+  if(j.shared_error) lines.push("网关返回       : "+j.shared_error);
+  box.textContent=lines.join("\n");
+  if(j.hint){ m.className="msg err"; m.textContent=j.hint; }
+  else { m.className="msg ok"; m.textContent="已授权 "+(j.shared_paths||[]).length+" 个目录。"; }
+}
+function authLoad(refresh){
+  var b=$("#authRefreshBtn"); if(b){ b.disabled=true; b.textContent="刷新中…"; }
+  api("api/authorized"+(refresh?"?refresh=1":"")).then(function(j){
+    if(b){ b.disabled=false; b.textContent="刷新状态"; }
+    authRender(j);
+  });
+}
+$("#authRefreshBtn").onclick=function(){ authLoad(true); };
+$("#authPickBtn").onclick=function(){
+  var m=$("#authMsg");
+  if(typeof window.TrimApp==="function"){
+    m.className="msg"; m.textContent="正在唤起飞牛目录选择器…";
+    try{
+      var sdk=new window.TrimApp();
+      var p=sdk.isStandaloneWeb
+        ? sdk.openAppAuth("pickSharedFile",{appName:"fnmusicext",directory:true,
+            title:"选择音乐曲库目录",okText:"确认授权",
+            redirectUri:window.location.pathname,state:"localdaily"},
+            {target:"_blank",features:"width=750,height=630"})
+        : sdk.pickSharedFile({directory:true,title:"选择音乐曲库目录",okText:"确认授权"});
+      Promise.resolve(p).then(function(res){
+        if(res&&typeof res.code==="number"){
+          m.className=res.code===0?"msg ok":"msg err";
+          m.textContent=res.code===0?("已授权："+((res.data||[]).join(" | ")||"（空）"))
+                                     :("授权失败："+(res.msg||"未知错误"));
+        }
+        authLoad(true);
+      })["catch"](function(e){
+        m.className="msg err";
+        m.textContent="唤起失败："+(e&&(e.message||e))+"（可到「应用设置 → 授权目录」手动添加）";
+      });
+      return;
+    }catch(e){ /* 落到下面的引导 */ }
+  }
+  m.className="msg";
+  m.textContent="本页没有宿主注入的 SDK。请到「应用中心 → 飞牛音乐扩展 → 设置 → 授权目录」"
+    +"添加你的音乐目录（需管理员），完成后回到这里点「刷新状态」核对。";
+};
+authLoad(false);
 loadPl();
 Array.prototype.forEach.call($("#logTabs").querySelectorAll("button"),function(b){
   b.onclick=function(){

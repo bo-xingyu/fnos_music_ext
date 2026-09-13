@@ -44,6 +44,7 @@ try:
     from . import quality
     from . import pushplus
     from . import recommend as dailyrec
+    from . import trimgw
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import netease_auth  # type: ignore
@@ -54,6 +55,7 @@ except ImportError:  # uvicorn --app-dir proxy
     import quality  # type: ignore
     import pushplus  # type: ignore
     import recommend as dailyrec  # type: ignore
+    import trimgw  # type: ignore
     from version import get_version  # type: ignore
 
 logger = logging.getLogger("fnmusic_proxy")
@@ -633,8 +635,78 @@ def write_audio_tags(path: str, title: str, artist: str = "", album: str = "") -
         logger.warning("Failed to write audio tags for %s: %s", path, e)
 
 
+def _db_library_dirs() -> "list[str]":
+    """从飞牛 music.db 的 shared_library 表读曲库目录（纯候选，不做任何回退）。"""
+    db = resolve_music_db()
+    if not db or not os.path.exists(db):
+        logger.warning("曲库目录无法确定：music.db 不存在（%s），且未配置 FNMUSIC_LIBRARY_DIR", db)
+        return []
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            rows = con.execute("SELECT path FROM shared_library ORDER BY id").fetchall()
+        finally:
+            con.close()
+    except Exception as e:
+        logger.warning("Failed to read shared_library path: %s", e)
+        return []
+    out = [str(p) for p, in rows if p and os.path.isdir(str(p))]
+    if not out:
+        logger.warning("music.db 里没有可用的共享库路径（shared_library 行数=%d）: %s",
+                       len(rows), db)
+    return out
+
+
+def _authorized_dirs() -> "list[str]":
+    """飞牛**正式授权**给本应用的目录（开放网关 + 兼容环境变量）。
+
+    这是 v2.9.4 的核心改动：以前靠 root 硬读 /vol1/...，既不合飞牛规范，
+    也让管理员在应用设置里看不到「授权目录」入口、没法合规授权。现在改成
+    先问网关「我被授权了哪些目录」，再用这些目录当曲库来源。
+    """
+    try:
+        rep = trimgw.authorized_report()
+    except Exception as exc:  # noqa: BLE001 - 查授权失败绝不能拖垮主流程
+        logger.warning("查询飞牛授权目录失败: %s: %s", type(exc).__name__, exc)
+        return []
+    paths = rep.get("shared_paths") or []
+    if not paths:
+        logger.warning("飞牛尚未给 %s 授权任何目录：%s",
+                       trimgw.app_name(), rep.get("hint") or rep.get("shared_error") or "")
+    return list(paths)
+
+
+def _strict_authorization() -> bool:
+    """true = 只扫已授权目录，绝不依赖 root 直读未授权路径（合规最严档）。"""
+    return (os.environ.get("FNMUSIC_STRICT_AUTHORIZATION") or "false").strip().lower() in (
+        "true", "1", "yes", "on")
+
+
+def library_authorization_state(path: str) -> dict:
+    """判断一个曲库目录当前是否处在飞牛授权范围内（供诊断/日志使用）。"""
+    try:
+        rep = trimgw.authorized_report()
+    except Exception as exc:  # noqa: BLE001
+        return {"authorized": False, "paths": [], "hint": f"查询失败: {exc}"}
+    paths = rep.get("shared_paths") or []
+    covered = bool(path) and any(
+        os.path.abspath(path) == os.path.abspath(a)
+        or os.path.abspath(path).startswith(os.path.abspath(a).rstrip(os.sep) + os.sep)
+        for a in paths
+    )
+    return {
+        "authorized": covered,
+        "paths": paths,
+        "hint": rep.get("hint") or "",
+        "error": rep.get("shared_error") or "",
+    }
+
+
 def detect_library_dir() -> str:
-    """优先环境变量，否则读飞牛 music.db 的共享库路径，最后回退到仓库 cache/。
+    """定位本地曲库目录。
+
+    优先级：**管理页显式配置** → **飞牛正式授权目录**（v2.9.4 新增，合规范做法）
+    → music.db 的 shared_library → 最后才回退到 cache_dir。
 
     ⚠️ 回退到 cache_dir 是「静默失效」的根源：那里一首歌都没有，于是本地曲库
     优先、本地每日推荐全都表现成「功能没开」而不是「路径错了」。所以每次回退
@@ -644,25 +716,40 @@ def detect_library_dir() -> str:
     if explicit:
         if not os.path.isdir(explicit):
             logger.warning("FNMUSIC_LIBRARY_DIR 配置了但目录不存在: %s", explicit)
+        else:
+            st = library_authorization_state(explicit)
+            if not st["authorized"]:
+                logger.warning(
+                    "曲库目录 %s 不在飞牛授权范围内（当前靠 root 直读）。"
+                    "建议到「应用设置 → 授权目录」把它授权给本应用：%s",
+                    explicit, st.get("hint") or "尚未授权任何目录",
+                )
         return explicit
-    db = resolve_music_db()
-    if db and os.path.exists(db):
-        try:
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-            try:
-                rows = con.execute("SELECT path FROM shared_library ORDER BY id").fetchall()
-            finally:
-                con.close()
-            for (path,) in rows:
-                if path and os.path.isdir(path):
-                    return path
-            logger.warning("music.db 里没有可用的共享库路径（shared_library 行数=%d）: %s",
-                           len(rows), db)
-        except Exception as e:
-            logger.warning("Failed to read shared_library path: %s", e)
-    else:
-        logger.warning("曲库目录无法确定：music.db 不存在（%s），且未配置 FNMUSIC_LIBRARY_DIR；"
-                       "回退到 %s（空目录，本地每日推荐不会出歌）", db, CONF["cache_dir"])
+
+    authorized = _authorized_dirs()
+    if authorized:
+        db_dirs = _db_library_dirs()
+        picked = trimgw.pick_library_from_authorized(db_dirs, authorized)
+        if picked:
+            logger.info("曲库目录取自飞牛已授权目录: %s", picked)
+            return picked
+        # music.db 没给可用路径，或它给的路径没被授权：直接用第一个授权目录。
+        # 授权目录是管理员显式指定的音乐目录，比缓存目录可靠得多。
+        logger.info("曲库目录使用飞牛授权目录（music.db 未提供可用路径）: %s", authorized[0])
+        return authorized[0]
+
+    db_dirs = _db_library_dirs()
+    if db_dirs:
+        if _strict_authorization():
+            logger.warning("FNMUSIC_STRICT_AUTHORIZATION=true，拒绝使用未授权目录 %s", db_dirs[0])
+        else:
+            logger.warning("飞牛未授权任何目录，暂按 music.db 路径 %s 读取（建议到应用设置授权）",
+                           db_dirs[0])
+            return db_dirs[0]
+
+    logger.warning("曲库目录无法确定：既没有飞牛授权目录，music.db 也不可用，"
+                   "且未配置 FNMUSIC_LIBRARY_DIR；回退到 %s（空目录，本地每日推荐不会出歌）",
+                   CONF["cache_dir"])
     return CONF["cache_dir"]
 
 
@@ -1954,15 +2041,40 @@ async def ext_local_daily(request: Request):
                 "cache_file": cache_file,
                 "cache_exists": os.path.exists(cache_file),
                 "music_db": db,
+                "authorization": library_authorization_state(lib),
                 "hint": (
                     "library_is_cache_fallback=true 表示没定位到曲库："
-                    "到管理页填「本地曲库目录」即可，无需重启以外的操作"
+                    "到管理页填「本地曲库目录」，或到「应用设置 → 授权目录」授权你的音乐目录"
                     if lib_is_fallback else ""
                 ),
             },
         }
     except Exception as exc:  # noqa: BLE001
         logger.warning("local daily diag failed: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
+
+
+@app.get("/_ext/authorized")
+async def ext_authorized(request: Request):
+    """飞牛「应用授权目录」状态快照（v2.9.4）。
+
+    以前本地曲库靠 root 硬读，管理员在应用设置里压根看不到「授权目录」入口。
+    这里把「网关在不在 / token 有没有 / 授权了哪些目录 / 当前曲库是否覆盖」
+    一次摊开，管理页据此提示去哪里点。
+    """
+    try:
+        if request.query_params.get("refresh") in ("1", "true", "yes"):
+            trimgw.invalidate_cache()
+        rep = trimgw.authorized_report(force=request.query_params.get("refresh") in ("1", "true", "yes"))
+        lib = detect_library_dir()
+        is_fallback = bool(lib) and os.path.abspath(lib) == os.path.abspath(str(CONF["cache_dir"]))
+        rep["library_dir"] = lib
+        rep["library_is_cache_fallback"] = is_fallback
+        rep["strict"] = _strict_authorization()
+        rep["env_share_paths"] = trimgw.env_share_paths()
+        return {"ok": True, "data": rep}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("authorized diag failed: %s: %s", type(exc).__name__, exc)
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
 
 
@@ -3059,6 +3171,72 @@ async def track_metadata(request: Request, subpath: str = ""):
     return JSONResponse(content=build_metadata_payload(guid, data))
 
 
+# ---------------------------------------------------------------------------
+# 本地每日推荐封面（现生成，零依赖）
+# ---------------------------------------------------------------------------
+
+_LOCAL_DAILY_COVER_CACHE: dict[int, bytes] = {}
+
+
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    import struct
+    import zlib
+
+    return (struct.pack(">I", len(data)) + tag + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+
+def _local_daily_cover_png(px: int = 300) -> bytes:
+    """生成一张「唱片」图形封面：深蓝紫渐变底 + 白色唱片环。
+
+    不引第三方库（PIL 在真机的 python312 环境里不保证有），直接按 PNG 规范
+    用 zlib/struct 手搓；生成结果按尺寸内存缓存，一首歌单相一次。
+    """
+    import struct
+    import zlib
+
+    try:
+        size = int(px)
+    except Exception:  # noqa: BLE001
+        size = 300
+    size = max(96, min(512, size))
+    hit = _LOCAL_DAILY_COVER_CACHE.get(size)
+    if hit:
+        return hit
+
+    w = h = size
+    cx = cy = (size - 1) / 2.0
+    r_outer = size * 0.30
+    r_inner = size * 0.115
+    rows = bytearray()
+    for y in range(h):
+        rows.append(0)  # PNG filter type 0 (None)
+        t = y / max(1, h - 1)
+        base = (int(26 + 44 * t), int(30 + 28 * t), int(70 + 66 * t))
+        for x in range(w):
+            dx = x - cx
+            dy = y - cy
+            d = (dx * dx + dy * dy) ** 0.5
+            if d <= r_inner:
+                r, g, b = 248, 249, 252
+            elif d <= r_outer:
+                ring = (d - r_inner) / max(1e-6, r_outer - r_inner)
+                k = 0.78 if int(ring * 6) % 2 else 0.42
+                r = int(248 * k + base[0] * (1 - k))
+                g = int(249 * k + base[1] * (1 - k))
+                b = int(252 * k + base[2] * (1 - k))
+            else:
+                r, g, b = base
+            rows += bytes((r, g, b))
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += _png_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    png += _png_chunk(b"IDAT", zlib.compress(bytes(rows), 9))
+    png += _png_chunk(b"IEND", b"")
+    _LOCAL_DAILY_COVER_CACHE[size] = png
+    return png
+
+
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
 async def static_cover(request: Request, subpath: str = ""):
@@ -3066,9 +3244,16 @@ async def static_cover(request: Request, subpath: str = ""):
     if not guid and subpath.startswith("online:"):
         guid = subpath
     if dailyrec.is_local_daily_playlist_guid(guid):
-        # 本地每日推荐封面：借用第一首本地歌的封面字段（本地文件无封面 URL，
-        # 返回 404 让客户端用占位图——与官方空封面行为一致）
-        return Response(status_code=404)
+        # 本地每日推荐封面：本地文件没有封面 URL，早期版本直接返回 404 让客户端用
+        # 占位图。但真机上确实见过客户端因为歌单封面 404 而整条不渲染（日志里就是
+        # 一行 404，界面上则是"歌单凭空消失"），所以这里干脆现生成一张 PNG 封面：
+        # 零依赖（zlib+struct 手写 PNG）、按尺寸内存缓存，永远拿得到图。
+        px = cover_resize_px(request.query_params.get("size")) or 300
+        return Response(
+            content=_local_daily_cover_png(px),
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
     if dailyrec.is_daily_playlist_guid(guid):
         upstream_client = get_upstream_client(request.app)
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)

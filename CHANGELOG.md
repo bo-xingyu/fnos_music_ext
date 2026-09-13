@@ -3,6 +3,46 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.9.4] - 2026-09-13
+
+**按飞牛开发规范改用「应用授权目录」访问本地曲库，不再依赖 root 硬读用户存储空间。**
+
+### 问题：绕过了飞牛的应用访问权限体系
+
+之前本地曲库的实现是「代理以 root 运行 → 直接 `os.listdir('/vol1/...')`」。这在飞牛
+的开发规范里不合规：应用访问用户存储空间中的文件夹前必须先获得授权，由系统把
+目标路径的 ACL 授予应用账号。副作用很明显——管理员在应用设置里**看不到「授权
+目录」入口**（manifest 里 `disable_authorization_path = true` 把它关掉了），想合规
+授权都没地方点；一旦系统收紧权限或改用非 root 运行身份，读取直接
+`PermissionError`，表现就是「本地每日推荐歌单不出现」且日志里查不到原因。
+
+### 改动
+
+1. **声明能力**：`fpk/config/resource` 写入
+   `{"api-scope": ["trim.file.sharedAccess"]}`；manifest 改
+   `disable_authorization_path = false`（打开授权入口）、新增 `micro_app = true`
+   （JS SDK 需要）。
+2. **新增 `proxy/trimgw.py`**：飞牛开放网关客户端。通过 Unix Socket
+   `/var/run/trim_open_gateway_apiscope.socket` 调 `POST /api/v1/trimapp`，
+   `Authorization: Bearer <TRIM_API_TOKEN>`，用
+   `trim.file.getSharedAccessibleFolders` 查询管理员已授权目录。token **每次调用
+   现读环境变量**，绝不落盘（重装/重注册后会变）。零第三方依赖，失败永不抛异常。
+   同时兼容旧版 `TRIM_DATA_SHARE_PATHS` 环境变量。
+3. **曲库目录定位改优先级**：管理页显式配置 → **已授权目录** → music.db 的
+   `shared_library` → 缓存目录。未授权时明确 WARNING 并给出指引；可用
+   `FNMUSIC_STRICT_AUTHORIZATION=true` 强制只扫已授权目录（合规最严档，默认关）。
+4. **管理页新增「飞牛授权目录」卡片**：一键唤起飞牛目录选择器（JS SDK 可用时），
+   SDK 不可用时降级为「去应用设置授权 + 本页刷新状态」的引导。
+5. **诊断页新增授权状态区块**：网关是否存在、token 是否注入、已授权目录清单、
+   当前曲库是否被授权覆盖。
+
+### 附带修复：本地每日推荐歌单封面 404
+
+日志里 `static/cover?coverId=online:playlist:localdaily:...` 返回 404。早期实现是
+「本地文件没有封面 URL，返回 404 让客户端用占位图」，但个别客户端会因为歌单封
+面 404 而整条不渲染——日志只有一行 404，界面则是「歌单凭空消失」。现改为**现生成
+零依赖 PNG 唱片封面**（zlib + struct 手写 PNG，不依赖 PIL；按尺寸内存缓存）。
+
 ## [2.9.3] - 2026-09-13
 
 **修复：真机上本地每日推荐必然失效的决定性 bug（v2.9.0 起一直存在）。**

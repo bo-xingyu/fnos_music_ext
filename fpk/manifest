@@ -1,5 +1,5 @@
 appname               = fnmusicext
-version               = 2.9.3
+version               = 2.9.4
 display_name          = 飞牛音乐扩展（网易云）
 desc                  = 为飞牛音乐（trim.music）提供网易云在线音源扩展：在官方 App 搜索框内直接搜播网易云曲库，补齐 LRC 歌词与高清封面，边播边存无感离线，多用户隔离红心收藏，并注入网易云官方「每日推荐」歌单。<br/><br/>安装后飞牛桌面会出现「飞牛音乐扩展」图标，打开即可在网页里扫码登录网易云、配置全部选项、查看运行日志，全程无需 SSH。<br/><br/>采用无侵入 Unix Domain Socket 接管，完全不修改飞牛官方程序、nginx 配置与数据库。在线音源只使用你扫码登录的那一个私人网易云账号的权益；未登录时自动降级为只播免费曲目，并可通过 PushPlus 推送登录失效与 VIP 临期提醒。
 source                = thirdparty
@@ -16,9 +16,9 @@ install_dep_apps      = python312
 
 ctl_stop              = true
 checkport             = false
-disable_authorization_path = true
+disable_authorization_path = false
+micro_app             = true
 
-changelog             = v2.9.3：修复本地每日推荐在真机上必然失效的决定性 bug——真机以 uvicorn --app-dir proxy 扁平方式运行，扫描函数里一句无 ImportError 兜底的延迟导入（from . import local_library）在顶层模块形态下必抛 ImportError，导致曲库扫描整个报废、歌单静默不出现，且测试全绿（测试是包导入形态）。已修复并新增 AST 级静态检查：proxy 下所有相对导入必须带 ImportError 兜底，此类问题无法再混入。同时排障接口增强：显示代理运行身份 uid/gid、曲库目录可读性、目录探测失败的具体原因（含飞牛应用访问权限导致的权限拒绝）。v2.9.2：修复「保存成功但本地每日推荐歌单不出现」。根因是曲库目录定位失败后**静默回退到空的 cache 目录**：detect_library_dir 读不到飞牛 music.db 的 shared_library 时，返回代理自己的 cache/，那里一首歌都没有，于是扫描结果恒为 0、歌单不注入，界面表现与「开关关着」完全一样，且不报任何错。本次：① 扩充 music.db 候选路径（新增 @appcenter 布局与trim.music 目录下递归查找），探测失败时日志逐个列出候选路径及存在性；② 管理页新增「本地曲库目录」配置项（FNMUSIC_LIBRARY_DIR，留空=自动探测），路径猜不中时可手动指定，填错直接报错而不会静默失败；③ 诊断页新增「本地每日推荐（排障）」区块，一次给出开关状态、曲库目录、是否回落到空目录、扫到多少首音频、music.db 解析结果与全部已探测候选路径。v2.9.1：修复「本地每日推荐」开关与歌单不显示——① 管理页漏把 local_daily_enabled 登记进前端 BOOLS 开关表，导致启用开关永远显示未勾选、且保存时该字段根本不提交（勾了也不生效）；② 管理页「歌单大类顺序」默认值漏了 localdaily，保存一次配置就会把它从顺序里抹掉；③ 本地曲库扫描深度放宽到 4 层子目录（原来 3 层），「库/歌手/专辑/分碟/文件」这类偏深布局不再整库扫空；④ 未注入时在日志里明确写出原因（开关关闭 / 曲库没扫到文件）与曲库目录，便于定位。v2.9.0：新增「本地每日推荐」歌单——每天从本地曲库随机抽 N 首（默认 50，管理页可改1–500，FNMUSIC_LOCAL_DAILY_LIMIT），与网易云官方「每日推荐」相互独立：独立 guid 命名空间与缓存，歌单名「本地每日推荐 MM-DD」，无需登录、零外网，播放直接读本地文件。随机种子按用户+日期：当天内多次打开结果一致、跨天自动换新。管理页新增启用开关与数量输入框；大类顺序新增 localdaily 可排位（默认在网易云日推之后）。v2.8.2：预热跳过仍新鲜缓存。v2.8.1：封面 CDN 缩图+music.db 自动定位。v2.8.0：远程识别省流+本地曲库优先。v2.7.1：歌单缓存计数修复。v2.7.0：看门狗自愈+直链短缓存。v2.6.0：歌单打开提速。v2.0.0：网易云单源化。
-
+changelog             = v2.9.4：按飞牛开发规范改用「应用授权目录」访问本地曲库，不再靠 root 硬读。① 应用包声明 api-scope: trim.file.sharedAccess，manifest 打开授权入口（disable_authorization_path=false）并声明 micro_app=true，管理员在「应用设置 → 授权目录」即可合规授权；② 新增 trimgw 模块，通过 Unix Socket /var/run/trim_open_gateway_apiscope.socket 调 trim.file.getSharedAccessibleFolders 查询已授权目录（token 每次从 TRIM_API_TOKEN 现读、绝不落盘），兼容旧版 TRIM_DATA_SHARE_PATHS 环境变量；③ 曲库目录定位优先级改为「管理页配置 → 已授权目录 → music.db → 缓存目录」，未授权时明确告警并给出指引（可用 FNMUSIC_STRICT_AUTHORIZATION=true 强制只扫已授权目录）；④ 管理页新增「飞牛授权目录」卡片，可一键唤起飞牛目录选择器，SDK 不可用时降级为引导+刷新状态；⑤ 诊断页新增授权状态区块（网关/token/已授权目录/当前曲库是否被覆盖）。同时修复本地每日推荐歌单封面 404：改为现生成零依赖 PNG 唱片封面（按尺寸内存缓存），避免个别客户端因歌单封面 404 而整条不渲染。
 desktop_uidir         = ui
 desktop_applaunchname = fnmusicext.main
