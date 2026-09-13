@@ -62,7 +62,7 @@ DEFAULT_CHANNELS = "mine,toplist,category"
 # 大类展示顺序（v2.4）：飞牛歌单列表里各口径的先后由它决定，管理页可改。
 # 默认值同时是兜底序：未列出的口径按此顺序追加在末尾。
 # v2.9 新增 localdaily（本地每日推荐，由 recommend.py 负责内容，这里只管排序）。
-DEFAULT_CHANNEL_ORDER = "daily,localdaily,mine,nrec,toplist,category,newalbum,fm"
+DEFAULT_CHANNEL_ORDER = "localdaily,daily,mine,nrec,toplist,category,newalbum,fm"
 
 _PREFIX_BY_CHANNEL = {"mine": "", "nrec": "推荐", "toplist": "榜",
                       "category": "", "newalbum": "新碟", "fm": "电台"}
@@ -81,9 +81,12 @@ def channel_order() -> tuple[str, ...]:
     """
     raw = (os.environ.get("FNMUSIC_NETEASE_CHANNEL_ORDER") or "").strip()
     ordered: list[str] = []
+    daily_listed = False
     if raw:
         for part in raw.replace(";", ",").split(","):
             key = part.strip().lower()
+            if key == "localdaily":
+                daily_listed = True
             if key in CHANNELS and key not in ordered:
                 ordered.append(key)
             elif key == "localdaily" and key not in ordered:
@@ -91,6 +94,12 @@ def channel_order() -> tuple[str, ...]:
     for key in DEFAULT_CHANNEL_ORDER.split(","):
         if key not in ordered:
             ordered.append(key)
+    # 配置里没提 localdaily 时，**插到最前面**而不是按默认序补在后面：
+    # 本地每日推荐是零外网、秒开的歌单，默认就该是列表第一项；用户在配置里
+    # 明确给出位置时（含把它往后排）则以配置为准。
+    if not daily_listed and "localdaily" in ordered:
+        ordered.remove("localdaily")
+        ordered.insert(0, "localdaily")
     return tuple(ordered)
 
 

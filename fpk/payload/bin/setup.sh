@@ -161,7 +161,14 @@ write_env_file() {
         echo "FNMUSIC_NETEASE_CHANNEL_LIMIT=$(dq "$(pick_env FNMUSIC_NETEASE_CHANNEL_LIMIT "" 8)")"
         echo "FNMUSIC_NETEASE_CATEGORY=$(dq "$(pick_env FNMUSIC_NETEASE_CATEGORY "" 华语)")"
         echo "# 歌单口径展示顺序（大类固定排序，管理页可改）"
-        echo "FNMUSIC_NETEASE_CHANNEL_ORDER=$(dq "$(pick_env FNMUSIC_NETEASE_CHANNEL_ORDER "" daily,localdaily,mine,nrec,toplist,category,newalbum,fm)")"
+        # v2.9.5 迁移：大类顺序的旧默认值（日推在前）整体换成新默认值
+        # （本地每日推荐排第一）。只认"完全等于旧默认值"的情况——用户自己调过
+        # 顺序的话原样保留，绝不覆盖。
+        _cho="$(pick_env FNMUSIC_NETEASE_CHANNEL_ORDER "" localdaily,daily,mine,nrec,toplist,category,newalbum,fm)"
+        if [ "${_cho}" = "daily,localdaily,mine,nrec,toplist,category,newalbum,fm" ]; then
+            _cho="localdaily,daily,mine,nrec,toplist,category,newalbum,fm"
+        fi
+        echo "FNMUSIC_NETEASE_CHANNEL_ORDER=$(dq "${_cho}")"
         # 手动歌单顺序（v2.5）：管理页「歌单顺序」卡片保存的 token 列表；空=按大类
         echo "FNMUSIC_NETEASE_PLAYLIST_ORDER=$(dq "$(pick_env FNMUSIC_NETEASE_PLAYLIST_ORDER "" "")")"
         echo "FNMUSIC_PLAYLIST_TRACK_LIMIT=$(dq "$(pick_env FNMUSIC_PLAYLIST_TRACK_LIMIT "" 300)")"

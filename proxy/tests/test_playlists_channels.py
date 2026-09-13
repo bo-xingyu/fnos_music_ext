@@ -382,14 +382,14 @@ async def test_channel_records_cache_hit_and_stale_refresh(monkeypatch):
 def test_channel_order_custom_and_fallback(monkeypatch):
     # 自定义顺序：用户给的顺序原样生效，漏掉的按默认序追加
     monkeypatch.setenv("FNMUSIC_NETEASE_CHANNEL_ORDER", "toplist, mine, daily")
-    assert pl.channel_order()[:3] == ("toplist", "mine", "daily")
-    assert pl.channel_order()[3:] == ("localdaily", "nrec", "category", "newalbum", "fm")
+    assert pl.channel_order()[:4] == ("localdaily", "toplist", "mine", "daily")
+    assert pl.channel_order()[4:] == ("nrec", "category", "newalbum", "fm")
 
     # 未知 key 忽略，空值/坏值回落默认
     monkeypatch.setenv("FNMUSIC_NETEASE_CHANNEL_ORDER", "")
-    assert pl.channel_order() == ("daily", "localdaily", "mine", "nrec", "toplist", "category", "newalbum", "fm")
+    assert pl.channel_order() == ("localdaily", "daily", "mine", "nrec", "toplist", "category", "newalbum", "fm")
     monkeypatch.setenv("FNMUSIC_NETEASE_CHANNEL_ORDER", "bogus,,???")
-    assert pl.channel_order() == ("daily", "localdaily", "mine", "nrec", "toplist", "category", "newalbum", "fm")
+    assert pl.channel_order() == ("localdaily", "daily", "mine", "nrec", "toplist", "category", "newalbum", "fm")
 
     assert pl.rank_of("toplist") == pl.channel_order().index("toplist")
     assert pl.rank_of("nonexistent") == len(pl.CHANNELS)

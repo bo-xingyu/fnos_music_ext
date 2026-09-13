@@ -35,6 +35,7 @@
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -176,6 +177,43 @@ def env_share_paths() -> list[str]:
     return _split_paths(os.environ.get(SHARE_PATHS_ENV) or "")
 
 
+def config_share_paths() -> list[str]:
+    """从应用自己的配置目录里读 share_paths。
+
+    真机实锤：部分版本（或系统版本低于 1.2.0401）不会注入 TRIM_API_TOKEN，
+    网关查不了，但管理员在「应用设置 → 授权目录」里加的目录会落在应用配置
+    目录下的 share_paths 文件里。这时它就是授权状态的权威来源，必须认。
+    """
+    app = app_name()
+    cands: list[str] = []
+    for var in ("TRIM_PKGVAR", "TRIM_PKGETC", "TRIM_PKGHOME", "TRIM_PKGMETA"):
+        base = str(os.environ.get(var) or "").strip()
+        if base:
+            cands.append(os.path.join(base, "share_paths"))
+            cands.append(os.path.join(base, ".share_paths"))
+    for pat in (f"/vol*/@appdata/{app}/share_paths",
+                f"/vol*/@appconf/{app}/share_paths",
+                f"/vol*/@appdata/{app}/.share_paths",
+                f"/vol*/@apphome/{app}/.share_paths",
+                f"/usr/local/apps/@appdata/{app}/share_paths"):
+        try:
+            cands.extend(sorted(glob.glob(pat)))
+        except Exception:  # noqa: BLE001
+            continue
+    out: list[str] = []
+    for path in cands:
+        try:
+            if not os.path.isfile(path):
+                continue
+            with open(path, "r", encoding="utf-8") as fh:
+                for p in _split_paths(fh.read()):
+                    if p not in out:
+                        out.append(p)
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
 def shared_accessible_folders(force: bool = False) -> tuple[list[str], str]:
     """管理员为应用授权的共享目录（trim.file.getSharedAccessibleFolders）。
 
@@ -187,12 +225,15 @@ def shared_accessible_folders(force: bool = False) -> tuple[list[str], str]:
         if hit is not None:
             return hit  # type: ignore[return-value]
     resp = call("trim.file.getSharedAccessibleFolders")
+    fallback = env_share_paths() + config_share_paths()
     if int(resp.get("code") or 0) != 0:
-        res: tuple[list[str], str] = (env_share_paths(), str(resp.get("msg") or "未知错误"))
+        # 网关查不动（没 token / 系统版本低）时，退到环境变量与 share_paths 文件：
+        # 管理员已经授权过的话，这两处能查到，不能因为查不了网关就报"未授权"。
+        res: tuple[list[str], str] = (fallback, str(resp.get("msg") or "未知错误"))
     else:
         data = resp.get("data") or {}
         paths = [str(p) for p in (data.get("paths") or []) if p]
-        for p in env_share_paths():
+        for p in fallback:
             if p not in paths:
                 paths.append(p)
         res = (paths, "")
@@ -225,6 +266,11 @@ def authorized_report(force: bool = False) -> dict:
     shared = _existing(shared)
     token_present = bool(str(os.environ.get(TOKEN_ENV) or "").strip())
     gateway_present = os.path.exists(GATEWAY_SOCKET)
+    # 授权来源：gateway = 开放网关查到的（最权威）；config = 退到 share_paths
+    # 文件/环境变量读到的；none = 完全查不到。前两种都算「已授权」。
+    source = "gateway" if (token_present and not shared_err) else ("config" if shared else "none")
+    if not shared_err:
+        source = "gateway" if token_present else ("config" if shared else "none")
     return {
         "gateway": {
             "socket": GATEWAY_SOCKET,
@@ -234,19 +280,42 @@ def authorized_report(force: bool = False) -> dict:
         },
         "shared_paths": shared,
         "shared_error": shared_err,
+        "source": source,
         "env_paths": _existing(env_share_paths()),
+        "config_paths": _existing(config_share_paths()),
+        "degraded": source != "gateway",
         "authorized": bool(shared),
         "hint": _hint(shared, shared_err, gateway_present, token_present),
+        "note": _note(source, token_present, gateway_present),
     }
 
 
+def _note(source: str, token_present: bool, gateway_present: bool) -> str:
+    """非「网关直查」时的解释性说明。降级不该被当成故障报错——曲库照样读得动。"""
+    if source == "gateway":
+        return ""
+    if source == "config":
+        return ("已从应用配置（share_paths）读到授权目录，功能正常。"
+                + ("" if token_present else
+                   "系统未向本进程注入 TRIM_API_TOKEN（系统版本较低或需重装应用以注册 api-scope），"
+                   "因此改用配置文件判定授权，不影响使用。"))
+    if not token_present:
+        return ("系统未向本进程注入 TRIM_API_TOKEN（系统版本较低或需重装应用以注册 api-scope），"
+                "无法自动查询授权目录；若你已在应用设置里授权，请重启本应用后重试。")
+    return ""
+
+
 def _hint(shared: list[str], err: str, gateway_present: bool, token_present: bool) -> str:
+    """只有在**确实一个授权目录都没有**时才给指引；能读到就不打扰用户。"""
     if shared:
         return ""
-    if not gateway_present:
-        return "本机未发现飞牛开放网关（系统版本较低），请在应用设置→授权目录添加，或到管理页手动填写「本地曲库目录」。"
+    if not gateway_present and not token_present:
+        return ("本机未发现飞牛开放网关/TRIM_API_TOKEN（系统版本低于 1.2.0401 时无此能力）。"
+                "请到「应用设置 → 授权目录」添加音乐目录，或在管理页手动填写「本地曲库目录」。")
     if not token_present:
-        return "进程环境里没有 TRIM_API_TOKEN（需由系统脚本启动），无法查询授权目录；可到管理页手动填写「本地曲库目录」。"
+        return ("进程环境里没有 TRIM_API_TOKEN，无法查询授权目录。"
+                "请在「应用设置 → 授权目录」添加你的音乐目录；若已添加，重启本应用后再刷新，"
+                "或直接在管理页填写「本地曲库目录」。")
     if err and "仅管理员" in err:
         return "需管理员操作：在应用设置→授权目录里添加曲库目录后重试。"
     return "尚未授权任何目录。请到「应用设置 → 授权目录」添加你的音乐目录（或在管理页手动填写「本地曲库目录」）。"

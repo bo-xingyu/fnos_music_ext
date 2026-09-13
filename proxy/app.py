@@ -45,6 +45,7 @@ try:
     from . import pushplus
     from . import recommend as dailyrec
     from . import trimgw
+    from . import local_files
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import netease_auth  # type: ignore
@@ -56,6 +57,7 @@ except ImportError:  # uvicorn --app-dir proxy
     import pushplus  # type: ignore
     import recommend as dailyrec  # type: ignore
     import trimgw  # type: ignore
+    import local_files  # type: ignore
     from version import get_version  # type: ignore
 
 logger = logging.getLogger("fnmusic_proxy")
@@ -1783,6 +1785,79 @@ def build_metadata_payload(guid: str, data: dict | None) -> dict:
     }
 
 
+def build_local_metadata_payload(guid: str, entry: dict) -> dict:
+    """本地曲目（local:file:…）的 metadata 应答。
+
+    形状对齐 ``build_metadata_payload``：飞牛客户端会无防护读 track.genres.join /
+    album / artists，缺字段直接抛错 → 播放器跳过、连 stream 都不请求。
+    duration 也必须给真值（早先恒为 0，客户端据此判定不可播）。
+    """
+    title = str(entry.get("title") or "") or _stem_of(entry.get("path"))
+    artist = str(entry.get("artist") or "")
+    album = str(entry.get("album") or "") or "本地曲库"
+    duration = int(entry.get("duration") or 0)
+    ext = str(entry.get("ext") or "mp3")
+    artists = [{"name": artist, "guid": f"{guid}:artist"}] if artist else []
+    album_obj = {
+        "name": album,
+        "guid": f"{guid}:album",
+        "artists": artists,
+        "coverId": guid,
+    }
+    track = {
+        "guid": guid,
+        "id": guid,
+        "title": title,
+        "name": title,
+        "artist": artist,
+        "artists": artists,
+        "album": album_obj,
+        "albumName": album,
+        "duration": duration,
+        "duration_ms": int(entry.get("duration_ms") or duration * 1000),
+        "durationMs": int(entry.get("duration_ms") or duration * 1000),
+        "size": int(entry.get("size") or 0),
+        "file_size": int(entry.get("size") or 0),
+        "codec": ext,
+        "format": ext,
+        "ext": ext,
+        "bitrate": int(entry.get("bitrate") or 0),
+        "genres": [],
+        "coverId": guid,
+        "coverUrl": "",
+        "cover_url": "",
+        "source": "local",
+        "is_online": False,
+        "isFavorite": False,
+        "isCue": False,
+        "hasLyric": False,
+        "accessStatus": 0,
+        "audioSpec": {"bitrate": int(entry.get("bitrate") or 0),
+                      "sampleRate": int(entry.get("sample_rate") or 0),
+                      "channels": int(entry.get("channels") or 0),
+                      "format": ext},
+    }
+    return {
+        "code": 0,
+        "msg": "ok",
+        "data": {
+            **track,
+            "guid": guid,
+            "id": guid,
+            "album": album_obj,
+            "audioSpec": track["audioSpec"],
+            "track": track,
+        },
+    }
+
+
+def _stem_of(path: str | None) -> str:
+    try:
+        return os.path.splitext(os.path.basename(str(path or "")))[0].strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _conf_log_value(key: str, value: Any) -> Any:
     lowered = key.lower()
     if any(part in lowered for part in _REDACT_KEY_PARTS):
@@ -2578,7 +2653,8 @@ async def stream_track(request: Request):
     # 库处理，最坏 404），永远到不了这里。
     # 路径在当天 bundle 里反查（guid 是路径指纹，无法逆向）。
     if str(guid or "").startswith("local:file:"):
-        local_path = await _local_daily_path_of(request, guid)
+        local_path = await _local_daily_path_of(request, guid) \
+            or local_files.resolve(guid)
         if local_path and os.path.isfile(local_path):
             ext = os.path.splitext(local_path)[1].lstrip(".") or "mp3"
             logger.info("play-start local-daily %s %.0fms", guid,
@@ -3154,6 +3230,30 @@ async def track_lyrics(request: Request, subpath: str = ""):
 @app.get("/music/api/v1/track/audio-info")
 async def track_metadata(request: Request, subpath: str = ""):
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
+    # 本地曲目（local:file:<sha1>）必须自己应答：官方后端不认识这个 guid，
+    # 转发过去只回一堆空值，客户端就显示「有条目但没信息、点不开」。
+    if str(guid or "").startswith("local:file:"):
+        entry = local_files.entry_with_probe(guid)
+        if not entry:
+            # 索引没命中（清过缓存 / 换了运行目录）：再从当天歌单里反查一次路径，
+            # 顺手补回索引，之后的请求就不必再走这条慢路。
+            path = await _local_daily_path_of(request, guid)
+            if path and os.path.isfile(path):
+                stem = os.path.splitext(os.path.basename(path))[0]
+                artist, title = "", stem
+                if " - " in stem:
+                    a, t = stem.split(" - ", 1)
+                    if a.strip() and t.strip():
+                        artist, title = a.strip(), t.strip()
+                local_files.record_files([{
+                    "path": path, "title": title, "artist": artist,
+                    "ext": os.path.splitext(path)[1].lstrip(".").lower(),
+                }])
+                entry = local_files.entry_with_probe(guid)
+        if entry:
+            return JSONResponse(content=build_local_metadata_payload(guid, entry))
+        logger.info("local metadata miss: %s（索引里没有或文件已不在）", guid)
+        return JSONResponse(content=build_local_metadata_payload(guid, {}))
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
@@ -3243,6 +3343,21 @@ async def static_cover(request: Request, subpath: str = ""):
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not guid and subpath.startswith("online:"):
         guid = subpath
+    # 本地曲目封面：优先从音频文件里抽内嵌图（flac 的 picture 块 / ID3 APIC /
+    # MP4 covr），没有内嵌图再找同目录的 cover.jpg 等，最后才用生成的唱片占位图。
+    # 早期版本把 coverId=local:file:… 转发给官方后端，后端不认这个 guid 直接 400
+    # ——整张歌单因此没封面，日志里就一行 400，很难联想到是转发造成的。
+    if str(guid or "").startswith("local:file:"):
+        found = local_files.cover(guid)
+        if found:
+            data, mime = found
+            return Response(content=data, media_type=mime,
+                            headers={"Cache-Control": "public, max-age=604800"})
+        return Response(
+            content=_local_daily_cover_png(cover_resize_px(request.query_params.get("size")) or 300),
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
     if dailyrec.is_local_daily_playlist_guid(guid):
         # 本地每日推荐封面：本地文件没有封面 URL，早期版本直接返回 404 让客户端用
         # 占位图。但真机上确实见过客户端因为歌单封面 404 而整条不渲染（日志里就是

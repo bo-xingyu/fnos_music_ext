@@ -409,6 +409,22 @@ def _scan_library_audio_files(library_dir: str) -> "list[dict]":
     return out
 
 
+def _record_local_files(files: "list[dict]") -> None:
+    """把扫描结果写进 sha1→path 索引。
+
+    guid 是路径指纹、无法反推，metadata / cover / stream 三处都得靠这份索引
+    找回真实文件。写失败不影响歌单生成（退化成当天 bundle 内查找）。
+    """
+    try:
+        try:
+            from . import local_files  # type: ignore
+        except ImportError:  # 扁平运行形态
+            import local_files  # type: ignore
+        local_files.record_files(files)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("写入本地文件索引失败: %s: %s", type(exc).__name__, exc)
+
+
 def build_local_daily_tracks(library_dir: str, limit: int, user_guid: str,
                              day: str | None = None) -> "list[dict]":
     """从本地曲库随机抽 limit 首，构造成飞牛 track 对象列表。"""
@@ -425,6 +441,15 @@ def build_local_daily_tracks(library_dir: str, limit: int, user_guid: str,
     pool = files[:]
     rng.shuffle(pool)
 
+    _record_local_files(files)
+
+    # 时长/体积必须是真值：客户端拿 duration=0 会判定「不可播」，点了没反应，
+    # 而且列表里也不显示时长。只给入选的这几首读标签（每天一次，成本可忽略）。
+    try:  # 作为包导入（proxy.recommend）
+        from . import local_files  # type: ignore
+    except ImportError:  # 扁平运行形态（uvicorn --app-dir proxy）
+        import local_files  # type: ignore
+
     tracks: list[dict] = []
     for f in pool[:limit]:
         guid = _local_track_guid(f["path"])
@@ -432,6 +457,17 @@ def build_local_daily_tracks(library_dir: str, limit: int, user_guid: str,
         title = f["title"]
         artist = f["artist"]
         play_format = f["ext"]
+        probed = {}
+        try:
+            probed = local_files.probe(f["path"]) or {}
+        except Exception:  # noqa: BLE001 - 标签读不出来不该让整首歌消失
+            probed = {}
+        duration = int(probed.get("duration") or 0)
+        size = int(probed.get("size") or 0)
+        if str(probed.get("title") or ""):
+            title = str(probed.get("title"))
+        if str(probed.get("artist") or ""):
+            artist = str(probed.get("artist"))
         # 复用 app.py 的形状构造太重，这里直接按飞牛 track 形状组装
         artists_list = [{"name": artist, "guid": f"{guid}:artist"}] if artist else []
         album_obj = {
@@ -449,14 +485,15 @@ def build_local_daily_tracks(library_dir: str, limit: int, user_guid: str,
             "artists": artists_list,
             "album": album_obj,
             "albumName": "本地曲库",
-            "duration": 0,
-            "duration_ms": 0,
-            "durationMs": 0,
+            "duration": duration,
+            "duration_ms": duration * 1000,
+            "durationMs": duration * 1000,
             "codec": play_format,
             "format": play_format,
             "ext": play_format,
-            "size": 0,
-            "file_size": 0,
+            "size": size,
+            "file_size": size,
+            "bitrate": int(probed.get("bitrate") or 0),
             "coverId": guid,
             "cover_url": "",
             "coverUrl": "",

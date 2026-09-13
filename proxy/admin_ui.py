@@ -343,7 +343,7 @@ DEFAULTS = {
     "netease_category": "华语",
     # ⚠️ 必须与 fpk/payload/bin/setup.sh 的默认顺序保持一致：v2.9.0 这里漏了
     # localdaily，用户只要保存一次配置，大类顺序里就没有本地每日推荐了。
-    "netease_channel_order": "daily,localdaily,mine,nrec,toplist,category,newalbum,fm",
+    "netease_channel_order": "localdaily,daily,mine,nrec,toplist,category,newalbum,fm",
     "netease_playlist_order": "",
     "playlist_track_limit": "300",
     "playlist_cache_ttl_h": "6",
@@ -1704,7 +1704,7 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
         </label>
 
         <label><span class="lb">歌单大类顺序</span>
-          <input name="netease_channel_order" placeholder="daily,localdaily,mine,nrec,toplist,category,newalbum,fm">
+          <input name="netease_channel_order" placeholder="localdaily,daily,mine,nrec,toplist,category,newalbum,fm">
           <span class="ht">飞牛歌单列表里各大类的前后顺序，逗号分隔。可用值：
             daily(网易云每日推荐) / localdaily(本地每日推荐) / mine(我的歌单) / nrec(推荐歌单) /
             toplist(排行榜) / category(分类歌单) / newalbum(新碟上架) / fm(私人FM)。没列出来的排最后</span>
@@ -2300,6 +2300,9 @@ function runDiag(auto){
         out.push("  开放网关       : "+gw.socket+"  存在="+gw.exists);
         out.push("  TRIM_API_TOKEN : "+(gw.token_present?"已注入":"★ 未注入（需由系统脚本启动进程）"));
         out.push("  已授权目录     : "+((az.shared_paths&&az.shared_paths.length)?az.shared_paths.join(" | "):"（无）"));
+        if(az.config_paths&&az.config_paths.length)
+          out.push("  配置文件路径   : "+az.config_paths.join(" | "));
+        if(az.source) out.push("  授权来源       : "+az.source+(az.degraded?"（降级，功能不受影响）":""));
         if(az.env_paths&&az.env_paths.length)
           out.push("  环境变量路径   : "+az.env_paths.join(" | "));
         out.push("  当前曲库目录   : "+az.library_dir+"  被授权覆盖="+(!!az.authorized));
@@ -2462,9 +2465,11 @@ function authRender(j){
   lines.push("TRIM_API_TOKEN : "+(gw.token_present?"已注入":"★ 未注入（进程需由系统脚本启动）"));
   lines.push("已授权目录     : "+((j.shared_paths&&j.shared_paths.length)?j.shared_paths.join("\n                 "):"（无）"));
   lines.push("当前曲库目录   : "+(j.library_dir||"（未定位）")+"   被授权覆盖="+(j.authorized?"是":"★ 否"));
+  if(j.source) lines.push("授权来源       : "+j.source+(j.degraded?"（降级，功能不受影响）":""));
   if(j.shared_error) lines.push("网关返回       : "+j.shared_error);
   box.textContent=lines.join("\n");
   if(j.hint){ m.className="msg err"; m.textContent=j.hint; }
+  else if(j.note){ m.className="msg"; m.textContent=j.note; }
   else { m.className="msg ok"; m.textContent="已授权 "+(j.shared_paths||[]).length+" 个目录。"; }
 }
 function authLoad(refresh){

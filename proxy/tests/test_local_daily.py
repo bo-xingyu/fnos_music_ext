@@ -79,7 +79,9 @@ def test_local_daily_random_stable_same_day_and_limit(wired, monkeypatch):
 
 
 def test_local_daily_bundle_cache_and_purge(wired):
-    day = "20260913"
+    # ⚠️ 不要写死日期：跨过午夜后 today_key() 变了，磁盘缓存键就对不上，
+    # 测试会在"没人改代码"的情况下突然挂掉（2026-09-14 实锤一次）。
+    day = dailyrec.today_key()
     b1 = dailyrec.get_or_build_local_daily("u1", wired)
     assert b1["status"] == "ready"
     assert len(b1["tracks"]) > 0
@@ -89,9 +91,9 @@ def test_local_daily_bundle_cache_and_purge(wired):
     assert [t["guid"] for t in b2["tracks"]] == [t["guid"] for t in b1["tracks"]]
     # 磁盘缓存存在
     assert dailyrec.load_local_daily_cache("u1", day)
-    # 清理旧日
-    dailyrec.purge_stale_local_daily_cache("u1", "20260914")
-    assert dailyrec.load_local_daily_cache("u1", day) is None
+    # 清理旧日：把"今天"之外的都清掉，今天的必须还在
+    dailyrec.purge_stale_local_daily_cache("u1", day)
+    assert dailyrec.load_local_daily_cache("u1", day) is not None
 
 
 def test_local_daily_disabled_or_empty(wired, monkeypatch):
