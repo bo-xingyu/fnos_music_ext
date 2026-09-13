@@ -213,6 +213,22 @@ def _as_time_of_day(v: Any) -> str:
     return f"{h:02d}:{mi:02d}"
 
 
+def _as_library_dir(v: Any) -> str:
+    """本地曲库目录：留空 = 交给自动探测；填了就必须是**已存在的目录**。
+
+    这里刻意只校验「存在且是目录」，不要求可写——曲库是只读的，要求可写会把
+    飞牛自己的共享目录挡在门外。同时也不接受相对路径（进程工作目录不固定）。
+    """
+    path = str(v or "").strip()
+    if not path:
+        return ""          # 空 = 自动探测
+    if not os.path.isabs(path):
+        raise ValueError("必须填绝对路径（例如 /vol1/1000/music）")
+    if not os.path.isdir(path):
+        raise ValueError("目录不存在：请先在飞牛音乐里确认曲库位置，或到文件管理里复制完整路径")
+    return path
+
+
 def _as_path(v: Any) -> str:
     """归档目录：必须是已存在的可写绝对路径，且不能是系统目录。
 
@@ -258,6 +274,9 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     # --- 本地每日推荐（v2.9）：每天从本地曲库随机抽 N 首 ---
     "local_daily_enabled": ("FNMUSIC_LOCAL_DAILY_ENABLED", _as_bool, False),
     "local_daily_limit": ("FNMUSIC_LOCAL_DAILY_LIMIT", _int_range(1, 500), False),
+    # 自动探测靠 music.db；飞牛各版本目录布局不统一，猜不中就整个功能静默失效，
+    # 所以必须留一个手动指定的入口（留空 = 自动探测）。
+    "library_dir": ("FNMUSIC_LIBRARY_DIR", _as_library_dir, False),
     "pushplus_enabled": ("FNMUSIC_PUSHPLUS_ENABLED", _as_bool, False),
     "pushplus_token": ("FNMUSIC_PUSHPLUS_TOKEN", _token, True),
     "pushplus_topic": ("FNMUSIC_PUSHPLUS_TOPIC", _free_text(64), True),
@@ -306,6 +325,7 @@ DEFAULTS = {
     "daily_limit": "20",
     "local_daily_enabled": "true",
     "local_daily_limit": "50",
+    "library_dir": "",
     "pushplus_enabled": "true",
     "pushplus_token": "",
     "pushplus_topic": "",
@@ -745,6 +765,28 @@ async def _probe_proxy_quality() -> dict:
         return {"reachable": False, "error": f"{type(exc).__name__}: {exc}"[:160]}
 
 
+async def _probe_proxy_local_daily() -> dict:
+    """向代理进程取「本地每日推荐」排障快照。
+
+    曲库目录、扫描结果这些只存在于代理进程的一侧（它才持有 music.db 解析结果），
+    管理页面是另一个进程，必须经 unix socket 取。
+    """
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=PROXY_SOCK),
+            base_url="http://unix",
+            timeout=15.0,   # 大曲库扫描需要时间
+        ) as client:
+            r = await client.get("/_ext/localdaily")
+            body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            if r.status_code == 200 and isinstance(body, dict) and body.get("ok") is not False:
+                return {"reachable": True, **(body.get("data") if isinstance(body.get("data"), dict) else {})}
+            return {"reachable": False, "status": r.status_code,
+                    "error": str(body.get("error") or "")[:160]}
+    except Exception as exc:  # noqa: BLE001
+        return {"reachable": False, "error": f"{type(exc).__name__}: {exc}"[:160]}
+
+
 async def _probe_proxy_health() -> dict:
     """透过被接管的 socket 读扩展自身的 healthz。"""
     try:
@@ -923,6 +965,7 @@ async def api_diag(request: Request):
         "proxy_socket": proxy_socket,
         "watchdog": watchdog,
         "quality": quality_probe,
+        "local_daily": await _probe_proxy_local_daily(),
         "musicbox": {
             "url": MUSICBOX_URL,
             "healthz": mb,
@@ -1751,6 +1794,12 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
         <label><span class="lb">本地每日推荐数量</span>
           <input name="local_daily_limit" inputmode="numeric" placeholder="50">
           <span class="ht">1–500，每天随机抽这么多首本地歌</span></label>
+
+        <label><span class="lb">本地曲库目录（留空=自动探测）</span>
+          <input name="library_dir" placeholder="/vol1/1000/music">
+          <span class="ht">自动探测依赖飞牛的 music.db；各版本目录布局不统一，猜不中时本地每日推荐
+            会一首歌都扫不到（界面上表现为「不出现」）。此时在这里直接填曲库目录即可，
+            例如 /vol1/1000/music。填错会在保存时直接报错，不会静默失败。</span></label>
       </div>
 
       <div class="sw"><input type="checkbox" name="pushplus_enabled" id="c_push">
@@ -2148,6 +2197,27 @@ function runDiag(auto){
         if(cur.source&&cur.source.indexOf("fallback")===0)
           out.push("  ★ 目前是回落状态（没读到飞牛偏好）。把上面「客户端线索」与「music.db 命中行」"
                   +"贴出来，就能确定飞牛把音质偏好放在哪里，进而改成真正的自动跟随。");
+      }
+      out.push("");
+      out.push("-- 本地每日推荐（排障）--");
+      var ld=d.local_daily||{};
+      if(!ld.reachable){
+        out.push("  取不到代理侧快照: "+JSON.stringify(ld));
+      }else{
+        out.push("  开关           : enabled="+ld.enabled+"   数量上限="+ld.limit);
+        out.push("  曲库目录       : "+ld.library_dir+"  存在="+ld.library_dir_exists);
+        out.push("  是否回落到空目录: "+ld.library_is_cache_fallback
+                 +(ld.library_is_cache_fallback?("  ★ 这就是歌单不出现的原因（cache 目录="+ld.cache_dir+"）"):""));
+        out.push("  扫到音频文件数 : "+ld.scanned_files);
+        (ld.sample_files||[]).forEach(function(f){ out.push("     例: "+f); });
+        out.push("  music.db       : "+ld.music_db.resolved+"  存在="+ld.music_db.exists
+                 +(ld.music_db.read_error?("  读取失败="+ld.music_db.read_error):""));
+        (ld.music_db.shared_library||[]).slice(0,5).forEach(function(p){ out.push("     shared_library: "+p); });
+        out.push("  已探测候选路径 :");
+        (ld.music_db.probed||[]).forEach(function(c){
+          out.push("     "+(c.exists?"[存在] ":"[缺失] ")+c.path);
+        });
+        if(ld.hint) out.push("  ★ "+ld.hint);
       }
       out.push("");
       out.push("-- 音源服务 (musicbox) --");

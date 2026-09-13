@@ -1345,3 +1345,25 @@ def test_local_daily_toggle_roundtrip(env):
             assert r.json()["ok"] is True, r.text
             assert r.json()["config"]["values"]["local_daily_enabled"] == wanted
         assert read_env(env)["FNMUSIC_LOCAL_DAILY_ENABLED"] == "true"
+
+
+def test_library_dir_is_optional_but_must_exist_when_set(tmp_path):
+    """留空 = 自动探测；填了就必须是已存在的绝对路径（曲库只读，不要求可写）。"""
+    assert admin_ui._as_library_dir("") == ""
+    assert admin_ui._as_library_dir("   ") == ""
+    assert admin_ui._as_library_dir(str(tmp_path)) == str(tmp_path)
+    with pytest.raises(ValueError):
+        admin_ui._as_library_dir("relative/music")
+    with pytest.raises(ValueError):
+        admin_ui._as_library_dir("/definitely/not/a/real/dir")
+
+
+def test_library_dir_roundtrip(env, tmp_path):
+    """手动指定曲库目录必须能落盘并回读（自动探测失败时的自救入口）。"""
+    with TestClient(admin_ui.app) as c:
+        r = post_cfg(c, {"library_dir": str(tmp_path)})
+        assert r.json()["ok"] is True, r.text
+        assert r.json()["config"]["values"]["library_dir"] == str(tmp_path)
+        r = post_cfg(c, {"library_dir": ""})
+        assert r.json()["ok"] is True, r.text
+    assert read_env(env)["FNMUSIC_LIBRARY_DIR"] == ""

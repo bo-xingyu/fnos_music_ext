@@ -634,9 +634,16 @@ def write_audio_tags(path: str, title: str, artist: str = "", album: str = "") -
 
 
 def detect_library_dir() -> str:
-    """优先环境变量，否则读飞牛 music.db 的共享库路径，最后回退到仓库 cache/。"""
+    """优先环境变量，否则读飞牛 music.db 的共享库路径，最后回退到仓库 cache/。
+
+    ⚠️ 回退到 cache_dir 是「静默失效」的根源：那里一首歌都没有，于是本地曲库
+    优先、本地每日推荐全都表现成「功能没开」而不是「路径错了」。所以每次回退
+    都要把原因和探测到的东西写进日志。
+    """
     explicit = str(CONF.get("library_dir") or "").strip()
     if explicit:
+        if not os.path.isdir(explicit):
+            logger.warning("FNMUSIC_LIBRARY_DIR 配置了但目录不存在: %s", explicit)
         return explicit
     db = resolve_music_db()
     if db and os.path.exists(db):
@@ -649,8 +656,13 @@ def detect_library_dir() -> str:
             for (path,) in rows:
                 if path and os.path.isdir(path):
                     return path
+            logger.warning("music.db 里没有可用的共享库路径（shared_library 行数=%d）: %s",
+                           len(rows), db)
         except Exception as e:
             logger.warning("Failed to read shared_library path: %s", e)
+    else:
+        logger.warning("曲库目录无法确定：music.db 不存在（%s），且未配置 FNMUSIC_LIBRARY_DIR；"
+                       "回退到 %s（空目录，本地每日推荐不会出歌）", db, CONF["cache_dir"])
     return CONF["cache_dir"]
 
 
@@ -670,18 +682,45 @@ def detect_library_dir() -> str:
 _MUSIC_DB_RESOLVED: dict[str, str] = {}
 
 
+def _music_db_candidates() -> "list[str]":
+    """music.db 的候选路径（按优先级，去重保序）。
+
+    飞牛各版本把应用数据放在 /vol*/@appdata 下，目录层级并不统一（有的多一层
+    data/、有的在 @appcenter）。只在 trim.music 自己的目录里递归找，不去扫
+    音乐库那种大盘——递归 glob 落在 /vol*/@appdata/trim.music/ 下是安全的。
+    """
+    explicit = str(CONF.get("music_db") or "").strip()
+    cands: list[str] = []
+    if explicit:
+        cands.append(explicit)
+    cands.append("/usr/local/apps/@appdata/trim.music/db/music.db")
+    for pat in (
+        "/vol*/@appdata/trim.music/db/music.db",
+        "/vol*/@appdata/trim.music/*/db/music.db",
+        "/vol*/@appcenter/trim.music/db/music.db",
+        "/vol*/@appdata/trim.music/**/music.db",
+        "/usr/local/apps/@appdata/trim.music/**/music.db",
+    ):
+        try:
+            cands.extend(sorted(glob.glob(pat, recursive=True)))
+        except Exception:  # noqa: BLE001 - 单个 glob 表达式异常不该影响整体
+            continue
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in cands:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
 def resolve_music_db() -> str:
     explicit = str(CONF.get("music_db") or "").strip()
     cached = _MUSIC_DB_RESOLVED.get(explicit)
     if cached is not None:
         return cached
 
-    candidates: list[str] = []
-    if explicit:
-        candidates.append(explicit)
-    candidates.append("/usr/local/apps/@appdata/trim.music/db/music.db")
-    candidates.extend(sorted(glob.glob("/vol*/@appdata/trim.music/db/music.db")))
-    candidates.extend(sorted(glob.glob("/vol*/@appdata/trim.music/*/db/music.db")))
+    candidates = _music_db_candidates()
 
     for cand in candidates:
         if cand and os.path.isfile(cand):
@@ -693,9 +732,40 @@ def resolve_music_db() -> str:
     resolved = explicit or (candidates[1] if len(candidates) > 1 else "")
     _MUSIC_DB_RESOLVED[explicit] = resolved
     if not os.path.isfile(resolved):
-        logger.info("music.db 未找到（本地曲库优先与「跟随飞牛」不可用）。已探测: %s",
-                    ", ".join(c for c in candidates if c) or "无")
+        # 逐个列出候选与存在性：真机上「猜路径猜错」是本地曲库类功能静默失效的
+        # 头号原因，没有这份清单就只能靠用户去 SSH 上 ls。
+        logger.warning(
+            "music.db 未找到（本地曲库优先/本地每日推荐/跟随飞牛 均不可用）。已探测: %s",
+            "; ".join(f"{c}{'[存在]' if os.path.isfile(c) else '[缺失]'}" for c in candidates[:12]) or "无",
+        )
     return resolved
+
+
+def music_db_probe() -> dict:
+    """供诊断页使用：把 music.db 的解析结果与探测明细摊开。"""
+    explicit = str(CONF.get("music_db") or "").strip()
+    cands = _music_db_candidates()
+    resolved = resolve_music_db()
+    rows: list[str] = []
+    read_error = ""
+    if os.path.isfile(resolved):
+        try:
+            con = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
+            try:
+                rows = [str(r[0]) for r in
+                        con.execute("SELECT path FROM shared_library ORDER BY id").fetchall()]
+            finally:
+                con.close()
+        except Exception as exc:  # noqa: BLE001
+            read_error = f"{type(exc).__name__}: {exc}"[:160]
+    return {
+        "explicit": explicit,
+        "resolved": resolved,
+        "exists": os.path.isfile(resolved),
+        "read_error": read_error,
+        "shared_library": rows[:10],
+        "probed": [{"path": c, "exists": os.path.isfile(c)} for c in cands[:20]],
+    }
 
 
 def reset_music_db_cache_for_test() -> None:
@@ -1836,6 +1906,49 @@ async def ext_quality_report():
         return {"ok": True, "data": quality.report(db_path=resolve_music_db())}
     except Exception as exc:  # noqa: BLE001
         logger.warning("quality report failed: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
+
+
+@app.get("/_ext/localdaily")
+async def ext_local_daily(request: Request):
+    """本地每日推荐的排障快照：开关 / 曲库目录 / 扫到几首 / 为什么不注入。
+
+    真机头号失效链条是：music.db 定位不到 → 曲库目录回退到空的 cache 目录 →
+    一首歌扫不到 → 歌单**静默不出现**（界面上和「开关关着」一模一样）。
+    这里把整条链路摊开，免得靠猜。只读，不写缓存、不触发构建。
+    """
+    try:
+        db = music_db_probe()
+        lib = detect_library_dir()
+        lib_is_fallback = bool(lib) and os.path.abspath(lib) == os.path.abspath(
+            str(CONF["cache_dir"]))
+        files = dailyrec._scan_library_audio_files(lib) if lib else []
+        day = dailyrec.today_key()
+        cache_file = dailyrec.local_daily_cache_path("shared", day)
+        return {
+            "ok": True,
+            "data": {
+                "enabled": dailyrec.local_daily_enabled(),
+                "limit": dailyrec.local_daily_limit(),
+                "library_dir": lib,
+                "library_dir_exists": bool(lib) and os.path.isdir(lib),
+                "library_is_cache_fallback": lib_is_fallback,
+                "cache_dir": str(CONF["cache_dir"]),
+                "scanned_files": len(files),
+                "sample_files": [os.path.relpath(f["path"], lib) for f in files[:5]],
+                "day": day,
+                "cache_file": cache_file,
+                "cache_exists": os.path.exists(cache_file),
+                "music_db": db,
+                "hint": (
+                    "library_is_cache_fallback=true 表示没定位到曲库："
+                    "到管理页填「本地曲库目录」即可，无需重启以外的操作"
+                    if lib_is_fallback else ""
+                ),
+            },
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("local daily diag failed: %s: %s", type(exc).__name__, exc)
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
 
 
