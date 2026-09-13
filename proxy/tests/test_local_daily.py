@@ -148,3 +148,56 @@ def test_channel_order_accepts_localdaily(monkeypatch):
     assert order[:3] == ("localdaily", "toplist", "daily")
     # 没列出的按默认序跟在后面
     assert "mine" in order and "fm" in order
+
+
+def test_scan_covers_nested_album_layouts(tmp_path):
+    """曲库是「库/歌手/专辑/文件」这类嵌套布局时也必须扫得到。
+
+    真机最常见的事故就是埋得深一点就一首扫不到 → 歌单静默消失。
+    """
+    lib = tmp_path / "lib"
+    for rel in (
+        "顶层歌曲.mp3",                       # 相对深度 0
+        "周杰伦/晴天.mp3",                     # 1
+        "周杰伦/七里香/01 七里香.flac",          # 2
+        "陈奕迅/十年/2015 重制/02.flac",        # 3（旧实现会被漏掉）
+    ):
+        p = lib / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"F" * 512)
+
+    got = {os.path.relpath(f["path"], str(lib)) for f in dailyrec._scan_library_audio_files(str(lib))}
+    assert got == {
+        "顶层歌曲.mp3",
+        os.path.join("周杰伦", "晴天.mp3"),
+        os.path.join("周杰伦", "七里香", "01 七里香.flac"),
+        os.path.join("陈奕迅", "十年", "2015 重制", "02.flac"),
+    }
+
+
+def test_scan_stops_at_configured_depth(tmp_path):
+    """超过配置深度的归档目录不参与扫描（避免大曲库被拖慢）。
+
+    LOCAL_DAILY_SCAN_MAX_DEPTH=3 → 最远扫到「库/一/二/三/四.mp3」。
+    """
+    lib = tmp_path / "lib"
+    ok = lib / "a" / "b" / "c" / "d"
+    ok.mkdir(parents=True)
+    (ok / "ok.mp3").write_bytes(b"F" * 512)
+    deep = lib / "a" / "b" / "c" / "d" / "e"
+    deep.mkdir(parents=True)
+    (deep / "too-deep.mp3").write_bytes(b"F" * 512)
+
+    got = {os.path.relpath(f["path"], str(lib)) for f in dailyrec._scan_library_audio_files(str(lib))}
+    assert got == {os.path.join("a", "b", "c", "d", "ok.mp3")}
+
+
+def test_scan_ignores_non_audio_and_empty_files(tmp_path):
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    (lib / "cover.jpg").write_bytes(b"F" * 512)
+    (lib / "empty - 空文件.mp3").write_bytes(b"")          # 0 字节视为损坏
+    (lib / "歌手 - 真歌.mp3").write_bytes(b"F" * 512)
+    got = dailyrec._scan_library_audio_files(str(lib))
+    assert [f["title"] for f in got] == ["真歌"]
+    assert got[0]["artist"] == "歌手"

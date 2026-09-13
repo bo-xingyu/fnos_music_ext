@@ -311,6 +311,12 @@ def purge_stale_daily_cache(user_guid: str, keep_day: str) -> None:
 
 LOCAL_DAILY_GUID_PREFIX = "online:playlist:localdaily:"
 LOCAL_DAILY_DEFAULT_LIMIT = 50
+# 扫描深度：以曲库根为基准的目录层数（相对路径里的分隔符个数）。
+# 3 层 = 能覆盖「库/歌手/专辑/CD 分碟/文件.mp3」这种偏深的归档布局；
+# 再深的大概率不是音乐库的组织方式，继续递归只会拖慢大曲库。
+LOCAL_DAILY_SCAN_MAX_DEPTH = 3
+# 超大曲库的兜底：扫到这个数就停，避免几万首歌把列表请求拖住。
+LOCAL_DAILY_SCAN_MAX_FILES = 20000
 
 
 def local_daily_enabled() -> bool:
@@ -350,7 +356,7 @@ def _local_track_guid(path: str) -> str:
 
 
 def _scan_library_audio_files(library_dir: str) -> "list[dict]":
-    """扫曲库目录（含一级子目录）里的音频文件，返回 {path,title,artist,ext}。
+    """扫曲库目录里的音频文件，返回 {path,title,artist,ext}。
 
     artist/title 尽力从文件名「歌手 - 歌名.ext」解析；没有分隔符就整名当标题。
     扫描失败/目录不存在返回空列表（不抛异常）。
@@ -363,11 +369,12 @@ def _scan_library_audio_files(library_dir: str) -> "list[dict]":
 
     audio_exts = local_library.AUDIO_EXTS
     try:
-        for base, _dirs, files in os.walk(root):
-            # 只扫两层：飞牛曲库普遍「库/歌手-专辑/文件」结构，更深的是用户
+        for base, dirs, files in os.walk(root):
+            # 只扫有限层：飞牛曲库普遍「库/歌手/专辑/文件」结构，更深的是用户
             # 自建归档，扫了也大概率不是音乐库的组织方式
             depth = os.path.relpath(base, root).count(os.sep)
-            if depth >= 2:
+            if depth > LOCAL_DAILY_SCAN_MAX_DEPTH:
+                dirs[:] = []   # 剪掉这棵子树，别在大曲库上做无谓递归
                 continue
             for name in files:
                 ext = os.path.splitext(name)[1].lstrip(".").lower()
@@ -386,6 +393,8 @@ def _scan_library_audio_files(library_dir: str) -> "list[dict]":
                     if a.strip() and t.strip():
                         artist, title = a.strip(), t.strip()
                 out.append({"path": path, "title": title, "artist": artist, "ext": ext})
+                if len(out) >= LOCAL_DAILY_SCAN_MAX_FILES:
+                    return out
     except Exception as e:  # noqa: BLE001 - 扫描失败 = 不出本地日推，不影响其它功能
         logger.warning("scan library for local daily failed (%s): %s: %s",
                        root, type(e).__name__, e)
@@ -401,6 +410,8 @@ def build_local_daily_tracks(library_dir: str, limit: int, user_guid: str,
     day = day or today_key()
     files = _scan_library_audio_files(library_dir)
     if not files:
+        logger.info("local daily: 曲库里没扫到音频文件 library=%s（检查曲库目录是否正确、"
+                    "音频是否埋得太深）", library_dir)
         return []
 
     rng = random.Random(f"{user_guid}:{day}")
@@ -521,6 +532,8 @@ def get_or_build_local_daily(user_guid: str, library_dir: str) -> dict:
         return cached
 
     if not local_daily_enabled():
+        logger.info("local daily: 开关关闭（FNMUSIC_LOCAL_DAILY_ENABLED=%s），不注入",
+                    os.environ.get("FNMUSIC_LOCAL_DAILY_ENABLED"))
         return empty_local_daily_bundle(user_guid, "disabled")
 
     limit = local_daily_limit()

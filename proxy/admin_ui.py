@@ -321,7 +321,9 @@ DEFAULTS = {
     "netease_channels": "mine,toplist,category",
     "netease_channel_limit": "8",
     "netease_category": "华语",
-    "netease_channel_order": "daily,mine,nrec,toplist,category,newalbum,fm",
+    # ⚠️ 必须与 fpk/payload/bin/setup.sh 的默认顺序保持一致：v2.9.0 这里漏了
+    # localdaily，用户只要保存一次配置，大类顺序里就没有本地每日推荐了。
+    "netease_channel_order": "daily,localdaily,mine,nrec,toplist,category,newalbum,fm",
     "netease_playlist_order": "",
     "playlist_track_limit": "300",
     "playlist_cache_ttl_h": "6",
@@ -1833,7 +1835,13 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
 (function(){
 "use strict";
 var $=function(s){return document.querySelector(s)};
-var BOOLS=["free_only_on_logout","daily_enabled","pushplus_enabled","download_on_favorite","fav_sync_like"];
+// ⚠️ 任何新增的 checkbox 开关都必须登记进这里，否则会出现「页面永远显示未启用、
+// 且保存时该字段根本不提交」的哑 bug（v2.9.0 的 local_daily_enabled 栽过一次）：
+//   - loadCfg 只对 BOOLS 里的键做 el.checked=...，其余一律走 el.value=...，
+//     而给 checkbox 赋 value 不会改变勾选外观；
+//   - 提交时下面那句 `el.type==="checkbox"` 会把未登记的 checkbox 整个跳过，
+//     该字段不会出现在 values 里。
+var BOOLS=["free_only_on_logout","daily_enabled","local_daily_enabled","pushplus_enabled","download_on_favorite","fav_sync_like"];
 var pollTimer=null, qrUnikey="", expireTimer=null;
 
 // 服务端注入的绝对前缀（形如 /app/fnmusicext/）。
@@ -2293,7 +2301,13 @@ Array.prototype.forEach.call($("#logTabs").querySelectorAll("button"),function(b
 $("#cfgForm").onsubmit=function(ev){
   ev.preventDefault();
   var fd=new FormData(ev.target), values={};
-  BOOLS.forEach(function(k){ values[k]=document.getElementsByName(k)[0].checked?"true":"false" });
+  // 未登记的 checkbox 会被下面 `el.type==="checkbox"` 直接跳过 → 该字段丢失，
+  // 后端按「页面没提交 → 保留原值」处理，于是用户勾了也永远不生效。改成
+  // 以页面实际的 checkbox 为准兜底：凡是 BOOLS 里有、页面上却没有元素的就跳过。
+  BOOLS.forEach(function(k){
+    var b=document.getElementsByName(k)[0];
+    if(b) values[k]=b.checked?"true":"false";
+  });
   Array.prototype.forEach.call(document.querySelectorAll("#cfgForm input,#cfgForm select"),function(el){
     if(!el.name||BOOLS.indexOf(el.name)>=0||el.type==="checkbox") return;
     values[el.name]=el.value;

@@ -1288,3 +1288,60 @@ def test_invalid_playlist_cache_config_rejected(env):
         assert r.status_code == 422
         r = post_cfg(c, {"playlist_cache_ttl_h": "0"})
         assert r.status_code == 422
+
+
+# ------------------------------------------- 本地每日推荐开关（v2.9.1 回归） ----
+
+def _page_source() -> str:
+    return Path(admin_ui.__file__).read_text(encoding="utf-8")
+
+
+def test_every_named_checkbox_is_registered_in_bools():
+    """页面上每个带 name 的 checkbox 开关都必须登记进前端 BOOLS 数组。
+
+    v2.9.0 漏登记了 local_daily_enabled，导致两个叠加症状：
+      1) loadCfg 只对 BOOLS 里的键赋 el.checked，漏掉的键走 el.value，
+         而给 checkbox 赋 value 不改变勾选外观 → 永远显示「未启用」；
+      2) 提交时 `el.type==="checkbox"` 分支把未登记的开关整个跳过 →
+         该字段不进 values，用户勾了也白勾。
+    这条测试就是防止以后新增开关再踩同一个坑。
+    """
+    src = _page_source()
+    m = re.search(r"var BOOLS=\[([^\]]*)\];", src)
+    assert m, "页面里找不到 BOOLS 定义"
+    bools = set(re.findall(r'"([^"]+)"', m.group(1)))
+
+    named = set(re.findall(r"<input[^>]*\bname=\"([^\"]+)\"[^>]*\btype=\"checkbox\"", src))
+    named |= set(re.findall(r"<input[^>]*\btype=\"checkbox\"[^>]*\bname=\"([^\"]+)\"", src))
+    assert named, "没从页面解析到任何具名 checkbox（选择器该更新了）"
+
+    missing = sorted(named - bools)
+    assert not missing, f"这些开关没登记进 BOOLS，会永远显示未启用且保存不生效: {missing}"
+
+
+def test_local_daily_enabled_is_a_registered_bool():
+    """本地每日推荐开关本身必须登记（v2.9.0 的第一个症状）。"""
+    src = _page_source()
+    m = re.search(r"var BOOLS=\[([^\]]*)\];", src)
+    assert '"local_daily_enabled"' in m.group(1)
+
+
+def test_channel_order_default_contains_localdaily():
+    """管理页默认值必须与 setup.sh 一致地带上 localdaily。
+
+    v2.9.0 的默认值还是旧的（没有 localdaily），用户保存一次配置就把本地每日
+    推荐从大类顺序里抹掉了。
+    """
+    assert "localdaily" in admin_ui.DEFAULTS["netease_channel_order"]
+    assert admin_ui.DEFAULTS["local_daily_enabled"] == "true"
+
+
+def test_local_daily_toggle_roundtrip(env):
+    """开关开→关→开必须能真正写进 .env 并回读到同一个值。"""
+    with TestClient(admin_ui.app) as c:
+        for wanted in ("true", "false", "true"):
+            r = post_cfg(c, {"local_daily_enabled": wanted})
+            assert r.status_code == 200, r.text
+            assert r.json()["ok"] is True, r.text
+            assert r.json()["config"]["values"]["local_daily_enabled"] == wanted
+        assert read_env(env)["FNMUSIC_LOCAL_DAILY_ENABLED"] == "true"

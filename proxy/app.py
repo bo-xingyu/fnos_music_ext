@@ -3937,8 +3937,12 @@ async def playlist_list(request: Request):
         local_rec["isDaily"] = False
         local_rec["source"] = "local"
         head_items.append(("localdaily", local_rec))
-    elif str(local_bundle.get("reason") or "") not in ("", "disabled"):
-        logger.info("local daily not injected: %s", local_bundle.get("reason"))
+    else:
+        # 不注入的原因必须落日志：真机最常见的两类是「开关关着」和「曲库没扫到
+        # 文件」，两者在界面上都表现为「歌单不出现」，没有日志就只能靠猜。
+        logger.info("本地每日推荐未注入: reason=%s library=%s user=%s",
+                    str(local_bundle.get("reason") or "unknown"),
+                    detect_library_dir(), user_guid[:8])
 
     for r in channel_recs:
         ch = str(r.get("channel") or "")
