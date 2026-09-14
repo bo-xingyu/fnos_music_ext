@@ -676,3 +676,56 @@ def test_quality_module_registered_in_fpk_manifest():
 
     text = (Path(__file__).resolve().parent.parent.parent / "build_fpk.sh").read_text(encoding="utf-8")
     assert "proxy/quality.py" in text, "quality.py 未登记进打包清单"
+
+
+# ------------------------------------------- v2.9.22 局域网无损 / 其他 320k
+
+
+def test_by_lan_policy_gives_lossless_only_on_lan(monkeypatch):
+    monkeypatch.setenv("FNMUSIC_QUALITY_POLICY", "by_lan")
+    monkeypatch.setenv("FNMUSIC_QUALITY_WIFI", "lossless")
+    monkeypatch.setenv("FNMUSIC_QUALITY_CELLULAR", "exhigh")
+    q.reset_for_test()
+    assert q.resolve(_fake_request(
+        headers={"x-forwarded-for": "192.168.1.50"}), db_path="")["level"] == "lossless"
+    assert q.resolve(_fake_request(
+        headers={"x-forwarded-for": "114.114.114.9"}), db_path="")["level"] == "exhigh"
+
+
+def test_by_lan_treats_unknown_as_non_lan():
+    """这条策略的全部价值就在 unknown 这一档：by_network 把它当 WiFi 照发母带
+    （真机卡顿 7~8s 的成因），by_lan 一律按非局域网走 320k。"""
+    q.reset_for_test()
+    assert q.on_lan("lan") is True and q.on_lan("wifi") is True
+    assert q.on_lan("cellular") is False
+    for net in ("unknown", "", "weird"):
+        assert q.on_lan(net) is False, f"{net!r} 必须按非局域网处理"
+
+
+def test_by_lan_differs_from_by_network_only_on_unknown(monkeypatch):
+    """两条策略在能判出网络时结论一致，差别只在判不出的那部分。"""
+    monkeypatch.setenv("FNMUSIC_QUALITY_WIFI", "jymaster")
+    monkeypatch.setenv("FNMUSIC_QUALITY_CELLULAR", "exhigh")
+    q.reset_for_test()
+    no_clue = _fake_request()          # 无 XFF、无网络提示
+    monkeypatch.setenv("FNMUSIC_QUALITY_POLICY", "by_network")
+    assert q.resolve(no_clue, db_path="")["level"] == "jymaster"   # 照发母带
+    monkeypatch.setenv("FNMUSIC_QUALITY_POLICY", "by_lan")
+    assert q.resolve(no_clue, db_path="")["level"] == "exhigh"     # 降到 320k
+
+
+def test_by_lan_is_an_accepted_policy(monkeypatch):
+    monkeypatch.setenv("FNMUSIC_QUALITY_POLICY", "by_lan")
+    assert q.policy() == "by_lan"
+    assert "by_lan" in q.POLICIES
+
+
+def test_local_first_shares_the_same_lan_definition(monkeypatch):
+    """本地优先放行无损必须用同一口径，否则会「在线降到 320k、本地照灌 30MB FLAC」。"""
+    import proxy.local_library as L
+    # unknown 也算非局域网 → 本地无损让给在线
+    assert L.serves_request({"ext": "flac"}, "exhigh", "unknown") is False
+    assert L.serves_request({"ext": "flac"}, "exhigh", "cellular") is False
+    # 明确局域网才放行
+    assert L.serves_request({"ext": "flac"}, "jymaster", "lan") is True
+    assert L.serves_request({"ext": "flac"}, "jymaster", "wifi") is True

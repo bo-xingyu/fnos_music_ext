@@ -125,7 +125,10 @@ def test_serves_request_default_is_any_class(monkeypatch):
     monkeypatch.delenv("FNMUSIC_LOCAL_FIRST_ANY_CLASS", raising=False)
     assert ll.any_class_allowed() is True
     assert ll.serves_request({"ext": "mp3"}, "jymaster") is True
-    assert ll.serves_request({"ext": "flac"}, "exhigh") is True
+    # 不传 network 时按**非局域网**处理（fail-safe）：宁可让给在线 320k，
+    # 也不能在窄管道上灌 30MB 本地无损。要放行本地无损必须明确传 lan/wifi。
+    assert ll.serves_request({"ext": "flac"}, "exhigh") is False
+    assert ll.serves_request({"ext": "flac"}, "exhigh", "lan") is True
 
 
 def test_serves_request_strict_mode(monkeypatch):
@@ -507,7 +510,8 @@ def test_wifi_and_lan_keep_using_local_lossless():
     import proxy.local_library as L
     assert L.serves_request({"ext": "flac"}, "jymaster", "wifi") is True
     assert L.serves_request({"ext": "flac"}, "jymaster", "lan") is True
-    assert L.serves_request({"ext": "flac"}, "jymaster", "") is True
+    # 未给出网络线索时按非局域网处理：这是刻意的 fail-safe，不是漏判
+    assert L.serves_request({"ext": "flac"}, "jymaster", "") is False
 
 
 def test_cellular_lossy_only_can_be_disabled(monkeypatch):

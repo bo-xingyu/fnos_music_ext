@@ -62,6 +62,14 @@ import sqlite3
 import time
 from typing import Any
 
+# 与 quality 模块保持同一套「局域网」口径（只有明确判出 lan/wifi 才算局域网）。
+# 两边各写一份判断必然漂移——本地优先放行无损、在线却降到 320k 这种自相矛盾
+# 最难查。相对导入必须兜底：真机是 uvicorn --app-dir proxy 的扁平运行形态。
+try:
+    from . import quality  # type: ignore
+except ImportError:  # pragma: no cover - uvicorn --app-dir proxy
+    import quality  # type: ignore # noqa: F401
+
 logger = logging.getLogger("fnmusic_proxy")
 
 # ---------------------------------------------------------------------------
@@ -614,8 +622,10 @@ def serves_request(entry: dict, level: str, network: str = "") -> bool:
     能承受多大"，后者是硬约束。
     """
     if any_class_allowed():
-        if (str(network or "").strip().lower() == "cellular"
-                and cellular_lossy_only()
+        # 口径与 quality.on_lan 保持一致：只有**明确**判出局域网才放行本地无损，
+        # unknown 一律按非局域网处理。否则会出现「在线降到 320k、本地却照灌
+        # 30MB FLAC」这种自相矛盾——正是 2.9.21 修掉的「越修越慢」。
+        if (not quality.on_lan(network) and cellular_lossy_only()
                 and klass_of_ext(entry.get("ext") or "") == "lossless"):
             _CELL_SKIPS["n"] += 1
             return False

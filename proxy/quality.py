@@ -60,7 +60,23 @@ _HINT_KEYS = ("quality", "bitrate", "network", "nettype", "net_type",
               "audiotype", "audio_type", "prefer", "transcode")
 
 DEFAULT_POLICY = "follow_fnos"
-POLICIES = ("follow_fnos", "fixed", "by_network")
+POLICIES = ("follow_fnos", "fixed", "by_network", "by_lan")
+
+
+def on_lan(network: str) -> bool:
+    """是否**明确**处于局域网；判不出来（unknown）一律不算。
+
+    ``by_lan`` 这条策略的全部价值就落在 unknown 这一档上：
+
+    - ``by_network`` 把 unknown 当 WiFi 处理（只有 ``cellular`` 才降档），于是在
+      数据网络下照发母带——真机实测卡顿 7~8 秒，这正是前面几轮抱怨的来源；
+    - ``by_lan`` 反过来：**只有真的看见私网 IP 才给无损**，其余（含判不出的、
+      远程公网的）一律走省流档。
+
+    宁可在判不出时少给一档音质（用户多半听不出来），也不能在窄管道上灌母带
+    （用户立刻感觉到卡）。两种错误的代价不对等。
+    """
+    return str(network or "").strip().lower() in ("lan", "wifi")
 
 # 进程内观察记录（用于诊断与自动策略）
 _OBSERVED: dict[str, Any] = {
@@ -540,6 +556,13 @@ def resolve(request: Any = None, db_path: str = "") -> dict[str, str]:
     if pol == "fixed":
         return {"level": fixed_level() or fallback, "network": network,
                 "policy": pol, "source": "manual:fixed"}
+    if pol == "by_lan":
+        # 「局域网无损 / 其他 320k」：只有**明确**判出局域网才给 WiFi 档，
+        # 其余一律省流档（含判不出的 unknown——见 on_lan 的说明）。
+        lan = on_lan(network)
+        level = (wifi_level() if lan else cellular_level()) or fallback
+        return {"level": level, "network": network, "policy": pol,
+                "source": f"manual:{'lan' if lan else 'non-lan'}"}
     if pol == "by_network":
         on_cellular = network == "cellular"
         level = (cellular_level() if on_cellular else wifi_level()) or fallback

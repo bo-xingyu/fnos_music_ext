@@ -89,7 +89,7 @@ QUALITIES = ("lossless", "exhigh", "higher", "standard")
 # 音质策略可选档位比播放音质多两档：hires / jymaster 在 musicbox 的 QUALITY_WHITELIST
 # 里合法（账号无对应权益时上游会自动降级，不会因此播不出来）。顺序由高到低。
 QUALITY_LEVELS = ("jymaster", "hires", "lossless", "exhigh", "higher", "standard")
-quality_POLICIES = ("follow_fnos", "fixed", "by_network")
+quality_POLICIES = ("follow_fnos", "fixed", "by_network", "by_lan")
 TEMPLATES = ("markdown", "html", "txt", "json")
 
 
@@ -1791,11 +1791,16 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
 
         <label><span class="lb">音质策略</span>
           <select name="quality_policy">
+            <option value="by_lan">局域网听无损 / 其他一律 320k（推荐）</option>
             <option value="follow_fnos">跟随飞牛偏好（读不到时回落到下面的手动值）</option>
             <option value="by_network">按网络分别设置（WiFi / 流量）</option>
             <option value="fixed">固定音质（不分网络）</option>
           </select>
-          <span class="ht">飞牛把音质偏好放在哪个接口/库表我们没有可靠证据，因此「跟随」只做被动发现。
+          <span class="ht"><b>局域网听无损 / 其他一律 320k</b>：只有真的看见私网 IP 才给无损；
+          <b>判不出网络的请求也算「其他」</b>，一律走 320k。这跟「按网络分别设置」的差别就在
+          判不出来的那部分——后者会把它们当 WiFi 处理、照发母带，数据网络下正是卡顿来源。
+          代价是：若你家里一次 XFF 都没透传，WiFi 也会停在 320k（诊断页「网络判定计数」可确认）。
+          <br/>「跟随飞牛」：飞牛把音质偏好放在哪个接口/库表我们没有可靠证据，因此只做被动发现。
           到底读到没有，请到<b>一键诊断</b>看 <code>quality</code> 段的 <code>current.source</code>：
           <code>auto:*</code> = 真读到了，<code>fallback:*</code> = 没读到、在用手动脉位</span>
         </label>
@@ -2301,7 +2306,11 @@ function runDiag(auto){
         out.push("  代理进程不可达（"+(qy.error||("status="+qy.status))+
                  "）→ 看不到已观察到的客户端线索");
       }else{
-        out.push("  策略            : "+qy.policy);
+        var _POLNAME={"by_lan":"局域网听无损 / 其他一律 320k",
+                      "follow_fnos":"跟随飞牛偏好","by_network":"按网络分别设置",
+                      "fixed":"固定音质"};
+        out.push("  策略            : "+(qy.policy||"")
+                 +(_POLNAME[qy.policy]?("（"+_POLNAME[qy.policy]+"）"):""));
         out.push("  档位配置        : "+JSON.stringify(qy.levels||{}));
         var cur=qy.current||{};
         out.push("  当前判定        : level="+cur.level+"  network="+cur.network+"  source="+cur.source);
