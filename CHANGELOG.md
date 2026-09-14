@@ -3,6 +3,61 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.9.7] - 2026-09-14
+
+**修掉本地每日推荐「有清单、能进播放器、但点下去不出声」的最后一环：曲目时长单位与 `audioSpec`。**
+
+### 起因
+
+2.9.6 之后封面已经能出来（`static/cover` 返回 200），说明客户端确实走进了播放器，
+但日志里**一条 `track/stream` 请求都没有**——客户端卡在「解析可播信息」这一步就放弃了。
+
+把本地曲目和在线曲目逐字段对齐后，差距非常明确：
+
+| 字段 | 在线（网易云注入，可播） | 本地（2.9.6 及以前） |
+|---|---|---|
+| `duration` | **毫秒**，例如 `233000` | **秒**，例如 `233` |
+| `durationMs` | 毫秒 | 写的是秒 |
+| `audioSpec.path` | `https://.../x.flac` | **缺失** |
+| `audioSpec.format/codec/container` | 有 | **缺失** |
+| `audioSpec.bitrate` / `sampleRate` / `bitDepth` | 有 | **缺失** |
+
+飞牛全链路的 `duration` 一律是**毫秒**这件事，可以在 `build_online_track()` 里直接看到：
+
+```python
+"duration": duration_ms,
+```
+
+而我本地这条路径是从 mutagen 的 `info.length`（秒）一路原样透传的，于是：
+客户端拿 `233` 当 `233 毫秒` 用 —— 一首歌只有 0.23 秒，直接被判为无效音源。
+
+同时 `audioSpec.path` 为空，飞牛的 `ll()` 正是**用 path 的后缀去解析 extension**，
+没有 path 就没有容器类型，转码/HLS 也不知道该按什么格式处理。
+
+再叠加一个连带问题：即便客户端真发起了播放，2.9.6 的 `track/hls` 与 `track/transcode`
+对 `local:file:` 这个它不认识的 guid **直接转发给官方后端**，官方后端当然不认识，
+于是还没走到取流就已经 4xx 了。
+
+### 改动
+
+1. `recommend.py`：歌单列表里的本地曲目，`duration` / `durationMs` / `duration_ms`
+   统一改为 **毫秒**（`duration * 1000`），另保留 `duration_s` 存秒，避免任何一处误读。
+2. `app.py` `build_local_metadata_payload()`：重写成与在线曲目**同形状**——
+   `duration` 毫秒、`duration_s` 秒，并补全完整 `audioSpec`：
+   `path`（`local/<sha1>.<format>`，带真实后缀）/ `format` / `codec` / `container` /
+   `duration` / `size` / `channel` / `sampleRate` / `bitDepth` / `bitrate`
+   （缺失时按格式兜底：flac 1411kbps、其余 320kbps），另加 `codecName`、`coverURL`。
+3. `app.py`：`track/hls`、`track/transcode_session`、`track/transcode` 现在**拦截
+   `local:file:` 并自行应答**，不再转发给官方后端。
+4. `LOCAL_DAILY_SCHEMA` 提到 3，旧缓存自动判废重建，升级后无需手动清缓存。
+
+### 回归测试
+
+* `test_local_duration_uses_same_unit_as_online` —— 直接拿 `app.build_online_track()`
+  的输出当基准，断言本地曲目的 `duration` 单位与在线一致。
+* `test_local_audiospec_carries_path_with_extension` —— 断言 `audioSpec.path` 非空且带后缀。
+* `test_local_daily_tracks_duration_unit_matches_online` —— 歌单列表层的单位一致性。
+
 ## [2.9.6] - 2026-09-14
 
 **本地每日推荐缓存加版本号：旧格式自动判废重建，升级后不需要任何手动操作。**

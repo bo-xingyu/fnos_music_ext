@@ -1795,8 +1795,11 @@ def build_local_metadata_payload(guid: str, entry: dict) -> dict:
     title = str(entry.get("title") or "") or _stem_of(entry.get("path"))
     artist = str(entry.get("artist") or "")
     album = str(entry.get("album") or "") or "本地曲库"
-    duration = int(entry.get("duration") or 0)
+    duration_s = float(entry.get("duration") or 0)
+    duration_ms = int(entry.get("duration_ms") or duration_s * 1000)
+    size = int(entry.get("size") or 0)
     ext = str(entry.get("ext") or "mp3")
+    play_format = play_format_from_ext(ext)
     artists = [{"name": artist, "guid": f"{guid}:artist"}] if artist else []
     album_obj = {
         "name": album,
@@ -1804,6 +1807,25 @@ def build_local_metadata_payload(guid: str, entry: dict) -> dict:
         "artists": artists,
         "coverId": guid,
     }
+    # ⚠️ 两处必须与在线曲目（build_online_track）严格一致，否则客户端拒绝播放：
+    #   1) duration 单位是**毫秒**（在线版 "duration": duration_ms）；
+    #      早期这里填秒，客户端把 240 读成 240 毫秒 → 判定不可播。
+    #   2) audioSpec.path 必须带真实后缀（"飞牛 ll() 用 path 解析 extension"）；
+    #      早期这里整个 audioSpec 是另起炉灶的简版，缺 path 就拿不到容器格式。
+    audio_spec = {
+        "path": f"local/{guid.split('local:file:', 1)[-1]}.{play_format}",
+        "format": play_format,
+        "codec": play_format,
+        "container": play_format,
+        "duration": duration_ms,
+        "size": size,
+        "channel": int(entry.get("channels") or 2) or 2,
+        "sampleRate": int(entry.get("sample_rate") or 44100) or 44100,
+        "bitDepth": 16 if play_format in ("wav", "flac", "aiff") else None,
+        "bitrate": int(entry.get("bitrate") or 0)
+        or (1411000 if play_format in ("flac", "wav", "ape", "wv") else 320000),
+    }
+    audio_spec = {k: v for k, v in audio_spec.items() if v is not None}
     track = {
         "guid": guid,
         "id": guid,
@@ -1813,29 +1835,28 @@ def build_local_metadata_payload(guid: str, entry: dict) -> dict:
         "artists": artists,
         "album": album_obj,
         "albumName": album,
-        "duration": duration,
-        "duration_ms": int(entry.get("duration_ms") or duration * 1000),
-        "durationMs": int(entry.get("duration_ms") or duration * 1000),
-        "size": int(entry.get("size") or 0),
-        "file_size": int(entry.get("size") or 0),
-        "codec": ext,
-        "format": ext,
+        "audioSpec": audio_spec,
+        "duration": duration_ms,
+        "duration_ms": duration_ms,
+        "durationMs": duration_ms,
+        "duration_s": duration_s,
+        "codec": play_format,
+        "codecName": play_format,
+        "format": play_format,
         "ext": ext,
-        "bitrate": int(entry.get("bitrate") or 0),
-        "genres": [],
+        "size": size,
+        "file_size": size,
         "coverId": guid,
-        "coverUrl": "",
         "cover_url": "",
+        "coverUrl": "",
+        "coverURL": "",
         "source": "local",
         "is_online": False,
         "isFavorite": False,
         "isCue": False,
         "hasLyric": False,
+        "genres": [],
         "accessStatus": 0,
-        "audioSpec": {"bitrate": int(entry.get("bitrate") or 0),
-                      "sampleRate": int(entry.get("sample_rate") or 0),
-                      "channels": int(entry.get("channels") or 0),
-                      "format": ext},
     }
     return {
         "code": 0,
@@ -1845,7 +1866,7 @@ def build_local_metadata_payload(guid: str, entry: dict) -> dict:
             "guid": guid,
             "id": guid,
             "album": album_obj,
-            "audioSpec": track["audioSpec"],
+            "audioSpec": audio_spec,
             "track": track,
         },
     }
@@ -2811,6 +2832,23 @@ async def stream_track(request: Request):
 @app.get("/music/api/v1/track/hls/{guid}/preset.m3u8")
 @app.get("/music/api/v1/track/hls/{guid}/{filename}")
 async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
+    # 本地曲目：官方后端不认 local:file:，转发过去只会失败。直接指回我们自己的
+    # /track/stream（它已经能从索引反查真实文件并按 Range 输出）。
+    if str(guid or "").startswith("local:file:"):
+        entry = local_files.entry_with_probe(guid) or {}
+        duration_s = int(entry.get("duration") or 0) or 240
+        stream_url = f"/music/api/v1/track/stream?guid={quote(guid, safe='')}"
+        playlist = (
+            "#EXTM3U\n"
+            "#EXT-X-VERSION:3\n"
+            f"#EXT-X-TARGETDURATION:{max(duration_s, 1)}\n"
+            "#EXT-X-PLAYLIST-TYPE:VOD\n"
+            "#EXT-X-MEDIA-SEQUENCE:0\n"
+            f"#EXTINF:{duration_s:.3f},\n"
+            f"{stream_url}\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        return Response(content=playlist, media_type="application/vnd.apple.mpegurl")
     if not is_online_guid(guid):
         client = get_upstream_client(request.app)
         if str(filename).lower().endswith(".m3u8"):
@@ -2850,6 +2888,9 @@ async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
 @app.api_route("/music/api/v1/track/transcode/quit", methods=["GET", "POST"])
 async def track_transcode_session(request: Request):
     guid = await extract_guid_from_body(request)
+    # 本地曲目本来就是本地文件直读，不需要官方的转码会话；转发过去只会失败。
+    if str(guid or "").startswith("local:file:"):
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": {"guid": guid}})
     if not is_online_guid(guid):
         return await forward_buffered(
             request, get_upstream_client(request.app),
@@ -2860,6 +2901,14 @@ async def track_transcode_session(request: Request):
 @app.api_route("/music/api/v1/track/transcode", methods=["GET", "POST"])
 async def track_transcode(request: Request):
     guid = await extract_guid_from_body(request)
+    if str(guid or "").startswith("local:file:"):
+        # 本地文件直接给，不走官方转码（它没有这个曲目，必然失败）。
+        return JSONResponse(content={
+            "code": 0,
+            "msg": "ok",
+            "status": "success",
+            "data": {"guid": guid, "status": "ready"},
+        })
     if not is_online_guid(guid):
         # 本地转码启动要等 ffmpeg 就绪，30s 共享超时会把它打成 504。
         # 应答整包透传 + 留证：转码会话到底建没建起来，日志里必须看得见。

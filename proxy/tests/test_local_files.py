@@ -142,8 +142,39 @@ def test_local_metadata_payload_shape(tmp_path):
     assert track["guid"] == guid
     assert track["album"]["coverId"] == guid
     assert track["duration"] >= 0
-    # 客户端靠 duration 判断能不能播：真值必须透传
-    assert track["duration"] == int(entry.get("duration") or 0)
+
+
+def test_local_duration_uses_same_unit_as_online():
+    """决定性回归：duration 单位必须与在线曲目一致（毫秒）。
+
+    早期本地版填的是秒，客户端把 240 读成 240 毫秒 → 判定不可播，表现就是
+    「列表有歌、点开没反应」。这里直接拿在线构造器做对照，不许再分叉。
+    """
+    online = app.build_online_track({
+        "id": "netease:1", "source": "netease",
+        "duration_s": 180.0, "file_size": 4096, "ext": "flac",
+        "title": "t", "artist": "a", "album": "b",
+    })
+    local = app.build_local_metadata_payload("local:file:abc", {
+        "path": "/x/t.flac", "duration": 180, "duration_ms": 180000,
+        "size": 4096, "ext": "flac", "bitrate": 900000,
+        "sample_rate": 44100, "channels": 2,
+    })
+    assert local["data"]["track"]["duration"] == online["duration"] == 180000
+    assert local["data"]["track"]["duration_s"] == online["duration_s"] == 180.0
+
+
+def test_local_audiospec_carries_path_with_extension():
+    """audioSpec.path 必须带真实后缀：飞牛 ll() 靠它解析容器格式。"""
+    body = app.build_local_metadata_payload("local:file:abc", {
+        "path": "/x/t.flac", "duration": 180, "duration_ms": 180000,
+        "size": 4096, "ext": "flac",
+    })
+    spec = body["data"]["track"]["audioSpec"]
+    assert spec["path"].endswith(".flac"), spec
+    assert spec["format"] == spec["codec"] == spec["container"] == "flac"
+    assert spec["duration"] == 180000
+    assert spec["size"] == 4096
 
 
 def test_local_metadata_title_falls_back_to_filename(tmp_path):

@@ -233,3 +233,22 @@ def test_old_schema_cache_is_discarded_and_rebuilt(wired, monkeypatch):
         import local_files  # type: ignore
     assert local_files.resolve(str(b2["tracks"][0]["guid"])), \
         "重建后必须能在索引里查到首曲的真实路径"
+
+
+def test_local_daily_tracks_duration_unit_matches_online(wired, monkeypatch):
+    """列表里的 duration 也必须是毫秒——客户端在点开前就先按它判断可不可播。"""
+    try:
+        from proxy import local_files
+    except ImportError:
+        import local_files  # type: ignore
+    monkeypatch.setattr(
+        local_files, "probe",
+        lambda p: {"duration": 180.0, "duration_ms": 180000, "size": 4096,
+                   "bitrate": 900000, "album": "A", "title": "T", "artist": "Ar",
+                   "sample_rate": 44100, "channels": 2})
+    tracks = dailyrec.build_local_daily_tracks(wired, 3, "u1", "20260913")
+    assert len(tracks) == 3
+    for t in tracks:
+        assert t["duration"] == 180000, "duration 必须是毫秒（与在线曲目一致）"
+        assert t["duration_s"] == 180.0
+        assert t["duration_ms"] == t["duration"]

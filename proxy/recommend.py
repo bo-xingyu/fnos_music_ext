@@ -478,9 +478,14 @@ def build_local_daily_tracks(library_dir: str, limit: int, user_guid: str,
             "artists": artists_list,
             "album": album_obj,
             "albumName": "本地曲库",
-            "duration": duration,
+            # ⚠️ 单位必须与在线曲目一致：飞牛全链路的 duration 是**毫秒**
+            # （见 app.build_online_track：duration = duration_s * 1000）。
+            # 早期这里填的是秒，客户端把 240 当成 240 毫秒 → 判定时长异常/不可播，
+            # 表现就是「列表有歌、点开没反应」。
+            "duration": duration * 1000,
             "duration_ms": duration * 1000,
             "durationMs": duration * 1000,
+            "duration_s": duration,
             "codec": play_format,
             "format": play_format,
             "ext": play_format,
@@ -508,10 +513,11 @@ def local_daily_cache_path(user_guid: str, day: str) -> str:
 # 缓存格式版本。
 # 1 = v2.9.0~v2.9.4：tracks 里 duration / size 恒为 0，且没有写过本地文件索引；
 # 2 = v2.9.5：duration / size / bitrate 为真值，构建时写 local_files 索引。
+# 3 = v2.9.7：duration 单位改为毫秒（与在线曲目一致），并补 duration_s。
 # ⚠️ 升级时旧缓存不会自动重扫（get_or_build 命中缓存就直接 return），于是
-# 「装了新版本但列表里时长还是 0、索引也没建」。靠版本号显式判废，让它在
-# 下一次拉歌单列表时静默重建——用户不需要点任何按钮。
-LOCAL_DAILY_SCHEMA = 2
+# 「装了新版本但列表里时长还是旧单位/旧值、索引也没建」。靠版本号显式判废，
+# 让它在下一次拉歌单列表时静默重建——用户不需要点任何按钮。
+LOCAL_DAILY_SCHEMA = 3
 
 
 def _cache_is_stale(data: dict) -> bool:
