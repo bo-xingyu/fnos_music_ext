@@ -2443,12 +2443,22 @@ function runDiag(auto){
       else{
         out.push("  开关           : "+pf.enabled+"（预热 "+pf.lookahead+" 首，列表下发即预热头首="+pf.on_list+"）");
         out.push("  调度/成功/失败 : "+pf.scheduled+" / "+pf.done+" / "+pf.failed
-                 +"（推断不出下一首 "+pf.no_next+" 次，已预热过跳过 "+pf.already+" 次）");
+                 +"（推断不出下一首 "+pf.no_next+" 次，已预热过跳过 "+pf.already+" 次"
+                 +(pf.queued_out?("，队列满放弃 "+pf.queued_out+" 次"):"")+"）");
+        out.push("  队列上限       : "+pf.max_queue+"（同时在飞的预热任务上限，满了就让位给播放）");
+        out.push("  成果有效期     : "+pf.warm_ttl_s+"s（与直链缓存 TTL 对齐；以前写死 3600s，"
+                 +"导致过期后照付往返的播放仍被标 warm）");
         out.push("  在线播放       : "+pf.plays+" 首，命中预热 "+pf.hits+" 首（命中率 "
                  +Math.round((pf.hit_rate||0)*100)+"%）"
                  +(pf.repeat_plays?("，另有 "+pf.repeat_plays+" 次是同一首的续传请求（不计入）"):""));
+        // warm/cold 现在按「这次有没有真的省掉 musicbox 往返」分，不再是「曾经预热过」
         out.push("  取链耗时       : 未预热 "+pf.cold_ms+"ms → 命中预热 "+pf.warm_ms+"ms"
-                 +(pf.saved_ms?("  ★ 省下约 "+pf.saved_ms+"ms"):""));
+                 +(pf.saved_ms?("  ★ 省下约 "+pf.saved_ms+"ms")
+                              :(pf.warm_ms?("  ★ 命中预热反而更慢 "+(pf.warm_ms-pf.cold_ms)
+                                 +"ms——看下面的「撞上预热进行中」"):"")));
+        if(pf.warming_hits)
+          out.push("  撞上预热进行中 : "+pf.warming_hits+" 次（这些归在未预热里；预热没跑完就"
+                   +"点播，不但吃不到成果还要跟它抢 musicbox，是「越预热越慢」的主因）");
         (pf.contexts||[]).forEach(function(c){
           out.push("     上下文: "+c.ctx+"（"+c.tracks+" 首，"+(c.age_s||0)+"s 前下发）");
         });

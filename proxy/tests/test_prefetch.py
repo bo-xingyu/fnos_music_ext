@@ -144,7 +144,9 @@ def test_next_n_returns_following_tracks():
 
 
 def test_lookahead_env(monkeypatch):
-    assert pf._lookahead() == 3
+    # v2.9.25：默认 3 → 2。musicbox 单进程，多预热一首就多占它 ~400ms，而用户
+    # 随时可能切歌——少预热一首只是「下一首慢一次」，拖慢正在播的是「每次都慢」。
+    assert pf._lookahead() == 2
     monkeypatch.setenv("FNMUSIC_PREFETCH_LOOKAHEAD", "5")
     assert pf._lookahead() == 5
     monkeypatch.setenv("FNMUSIC_PREFETCH_LOOKAHEAD", "99")

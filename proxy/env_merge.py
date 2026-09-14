@@ -46,6 +46,9 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     # 默认 false——客户端主动要 HLS 通常意味着它吃不下原始容器/编码（本地多为 FLAC）。
     ("FNMUSIC_HLS_LOCAL_BYPASS", "false"),
     ("FNMUSIC_PREFETCH_NEXT", "true"),
+    # v2.9.25：同时在飞的预热任务硬上限。musicbox 是单进程，连续切歌时每首都会
+    # 追加 N 个预热，堆多了拖慢的恰恰是「正在播的那一首」；满了就放弃新预热。
+    ("FNMUSIC_PREFETCH_MAX_QUEUE", "2"),
     # --- 更多口径歌单 / 账户歌单（v2.2 新增）---
     ("FNMUSIC_NETEASE_CHANNELS", "mine,toplist,category"),
     ("FNMUSIC_NETEASE_CHANNEL_LIMIT", "8"),

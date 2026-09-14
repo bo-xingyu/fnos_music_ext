@@ -56,11 +56,32 @@ MAX_TRACKS = 3000
 CONTEXT_TTL = 3 * 3600.0
 
 def _lookahead() -> int:
-    """一次预热几首（含紧邻的下一首）。"""
+    """一次预热几首（含紧邻的下一首）。
+
+    v2.9.25：默认 3 → 2。musicbox 是单进程，一首预热 ~400ms，多预热一首就多占
+    它 400ms；而用户随时可能切歌，那首歌的 gather 得跟这些预热排队。少预热一首
+    只是「下一首慢一次」，把正在播的拖慢是「每次都慢」——不划算。
+    """
     try:
-        return max(1, min(5, int(float(os.environ.get("FNMUSIC_PREFETCH_LOOKAHEAD", "3") or 3))))
+        return max(1, min(5, int(float(os.environ.get("FNMUSIC_PREFETCH_LOOKAHEAD", "2") or 2))))
     except (TypeError, ValueError):
-        return 3
+        return 2
+
+
+def max_queue() -> int:
+    """同时在飞的预热任务硬上限（v2.9.25）。
+
+    `_lookahead` 只是一首歌「想」预热几首，这个才是总闸门：用户连续切歌时**每
+    一首**都会追加 N 个预热，队列越堆越长，musicbox 消化不过来，最后被拖慢的
+    恰恰是「正在播的那一首」——真机「未预热 114ms → 命中预热 332ms」的反常数据
+    就是这么来的。
+
+    到上限就放弃新预热：预热是锦上添花，播放是正事，两者冲突时让位给播放。
+    """
+    try:
+        return max(1, min(10, int(float(os.environ.get("FNMUSIC_PREFETCH_MAX_QUEUE", "2") or 2))))
+    except (TypeError, ValueError):
+        return 2
 
 
 def on_list_enabled() -> bool:
@@ -117,6 +138,9 @@ _STATS: dict[str, float] = {
     "cold_ms_n": 0,
     "warm_ms_sum": 0.0,  # 命中预热后的 gather 耗时累计
     "warm_ms_n": 0,
+    # v2.9.25
+    "warming_hits": 0,   # 播放撞上「预热正在进行中」（可能反而更慢，单独记）
+    "queued_out": 0,     # 预热队列已满，主动放弃的调度次数
 }
 
 
@@ -231,13 +255,31 @@ def claim(guid: str) -> bool:
     return True
 
 
+def warm_ttl_seconds() -> float:
+    """预热成果的有效期（秒）——必须与直链缓存 TTL 对齐，不能自己定一个数。
+
+    以前这里写死 3600s，而直链缓存只有 600s（FNMUSIC_URL_CACHE_TTL）。于是
+    「20 分钟前预热过」的歌在诊断里**仍被标成 warm**，可那次播放一次缓存都没
+    命中、照样付了全额 musicbox 往返。标记的窗口比成果的窗口长 6 倍，warm 这个
+    字就彻底没了意义——真机据此算出「未预热 114ms → 命中预热 332ms」，读起来像
+    预热在帮倒忙，实际是口径把自己骗了。
+    """
+    try:
+        ttl = float(os.environ.get("FNMUSIC_URL_CACHE_TTL", "600") or 600)
+    except (TypeError, ValueError):
+        ttl = 600.0
+    if ttl <= 0:      # 0 = 关闭直链缓存，那预热成果也活不过当次
+        ttl = 600.0
+    return min(3600.0, ttl)
+
+
 def warming_seconds(guid: str) -> "float | None":
     """这个 guid 的直链是不是我们提前取回来的？是则返回预热至今的秒数。"""
     ts = float(_WARMED.get(str(guid or "").strip()) or 0.0)
     if ts <= 0:
         return None
     age = time.time() - ts
-    return age if 0 <= age < 3600 else None
+    return age if 0 <= age < warm_ttl_seconds() else None
 
 
 def note_result(guid: str, ok: bool, ms: float, detail: str = "") -> None:
@@ -252,12 +294,18 @@ def note_result(guid: str, ok: bool, ms: float, detail: str = "") -> None:
     logger.info("prefetch %s %s %.0fms %s", "ok" if ok else "fail", guid, ms, detail)
 
 
-def note_play(guid: str, gather_ms: float, warm: bool) -> bool:
-    """一次在线播放的 gather 耗时记账：预热过的走 warm，否则走 cold。
+def note_play(guid: str, gather_ms: float, warm: bool, warming: bool = False) -> bool:
+    """一次在线播放的 gather 耗时记账：吃到预热成果的走 warm，否则走 cold。
 
     返回是否计入统计——**同一首歌的重复 Range 请求会被折叠掉**。一次流式播放
     客户端会连发好几个 Range，全算进去的话「播放次数」是「曲目数」的好几倍，
     命中率与冷/热均值也就都失真了（真机 3 分钟 78 次「播放」其实是十几首歌）。
+
+    v2.9.25：`warm` 的含义收紧为「**这次真的省掉了 musicbox 往返**」（由调用方
+    按直链缓存是否命中传入），不再是「曾经预热过这首歌」——后者会把「预热成果早
+    过期了」的播放也算成 warm，均值自然失真。`warming` 单独记「撞上预热正在进
+    行中」：那种情况不但没省，还可能因为跟预热抢 musicbox 而更慢，混进 cold 会
+    低估预热的副作用，所以另开一列。
     """
     g = str(guid or "").strip()
     now = time.time()
@@ -271,6 +319,8 @@ def note_play(guid: str, gather_ms: float, warm: bool) -> bool:
             _PLAY_SEEN.pop(k, None)
 
     _STATS["plays"] += 1
+    if warming:
+        _STATS["warming_hits"] += 1
     if warm:
         _STATS["hits"] += 1
         _STATS["warm_ms_sum"] += max(0.0, float(gather_ms))
@@ -304,9 +354,14 @@ def status() -> dict:
         "failed": int(_STATS.get("failed") or 0),
         "no_next": int(_STATS.get("no_next") or 0),
         "already": int(_STATS.get("already") or 0),
+        "queued_out": int(_STATS.get("queued_out") or 0),
+        "max_queue": max_queue(),
         "plays": int(_STATS.get("plays") or 0),
         "hits": int(_STATS.get("hits") or 0),
         "repeat_plays": int(_STATS.get("repeat_plays") or 0),
+        # 撞上「预热正在跑」的播放次数：它归在 cold 里，但成因与普通的没预热不同
+        "warming_hits": int(_STATS.get("warming_hits") or 0),
+        "warm_ttl_s": round(warm_ttl_seconds(), 1),
         "hit_rate": (round(float(_STATS.get("hits") or 0) / float(_STATS["plays"]), 3)
                      if _STATS.get("plays") else 0.0),
         "cold_ms": cold,

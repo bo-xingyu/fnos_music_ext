@@ -1549,12 +1549,17 @@ def invalidate_url_cache() -> int:
 
 
 async def resolve_netease_url(client: httpx.AsyncClient, song_id: str,
-                              request: Request | None = None) -> str | None:
+                              request: Request | None = None,
+                              stats: dict | None = None) -> str | None:
     """取播放直链。音质档位**按本次请求动态决定**（见 proxy/quality.py）。
 
     传入 request 是为了让 quality 看到客户端的网络类型线索；不传（同步场景或测试）时
     按策略的 WiFi 档处理，行为与旧版一致。选中的档位上游不给直链时仍会继续降到
     exhigh，不能因为策略选了高档就直接播放失败。
+
+    `stats` 是一个可选的「出参」字典：命中直链短缓存时置 `url_cache_hit=True`。
+    调用方据此判断这次取链到底有没有发出网络往返——预热是不是真的省下了时间，
+    只有这个说得准（v2.9.25）。
     """
     decision = quality.resolve(request, db_path=resolve_music_db())
     _log_quality_decision(song_id, decision)
@@ -1570,6 +1575,8 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str,
     for q in qualities:
         cached = _url_cache_get(song_id, q)
         if cached:
+            if stats is not None:
+                stats["url_cache_hit"] = True
             return cached
 
     for q in qualities:
@@ -1946,6 +1953,7 @@ async def lifespan(fastapi_app: FastAPI):
     created_upstream = False
     created_musicbox = False
     created_push = False
+    created_cdn = False
 
     if getattr(fastapi_app.state, "upstream_client", None) is None:
         fastapi_app.state.upstream_client = httpx.AsyncClient(
@@ -1965,6 +1973,10 @@ async def lifespan(fastapi_app: FastAPI):
     if getattr(fastapi_app.state, "push_client", None) is None:
         fastapi_app.state.push_client = httpx.AsyncClient(timeout=pushplus.REQUEST_TIMEOUT_S)
         created_push = True
+
+    if getattr(fastapi_app.state, "cdn_client", None) is None:
+        fastapi_app.state.cdn_client = _new_cdn_client()
+        created_cdn = True
 
     musicbox_client = fastapi_app.state.musicbox_client
     stop_event = asyncio.Event()
@@ -1994,6 +2006,9 @@ async def lifespan(fastapi_app: FastAPI):
         if created_push and getattr(fastapi_app.state, "push_client", None):
             await fastapi_app.state.push_client.aclose()
             fastapi_app.state.push_client = None
+        if created_cdn and getattr(fastapi_app.state, "cdn_client", None):
+            await fastapi_app.state.cdn_client.aclose()
+            fastapi_app.state.cdn_client = None
 
 
 app = FastAPI(title="fnmusic-ext", lifespan=lifespan)
@@ -2895,6 +2910,12 @@ def _prefetch_if_needed(request: Request, from_guid: str, next_guid: str) -> int
     if prefetch.warming_seconds(next_guid) is not None or not prefetch.claim(next_guid):
         prefetch.bump("already")
         return 0
+    # v2.9.25：总闸门。musicbox 是单进程，用户连续切歌时**每一首**都会追加 N 个
+    # 预热，队列越堆越长它越消化不过来，最后被拖慢的恰恰是「正在播的那一首」。
+    # 到上限就放弃这次预热——预热是锦上添花，跟播放冲突时必须让位。
+    if len(_PREFETCH_TASKS) >= prefetch.max_queue():
+        prefetch.bump("queued_out")
+        return 0
     prefetch.bump("scheduled")
     _PREFETCH_TASKS[next_guid] = asyncio.create_task(_prefetch_one(request, next_guid))
     return 1
@@ -2984,6 +3005,39 @@ def play_start_stats() -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# 网易云 CDN 取流客户端：进程内共享，复用连接（v2.9.25）
+#
+# 以前每次 /track/stream 都 `httpx.AsyncClient(...)` 现建一个、用完 `aclose()`
+# 拆掉——等于**每个 Range 请求都要重新 TCP + TLS 握手**到网易云 CDN（TLS 通常
+# 2 个 RTT）。而一次播放客户端要发十几个 Range 请求（诊断页「每次播放请求数」
+# 实测 14.62），于是一首歌光建连就白扔 7~14 次握手；数据网络下 RTT 大，单次
+# 50~200ms，加起来是 0.35~3 秒纯等待——这笔开销跟音质、带宽全无关系，纯属浪费。
+#
+# 共享一个 client 后由 httpx 连接池按 host 复用：流没读完就关的请求，httpx 会
+# 丢弃那条连接而不是把它交给下一个请求，所以不会串数据。
+# ---------------------------------------------------------------------------
+def _new_cdn_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=30.0,
+        follow_redirects=True,
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10,
+                            keepalive_expiry=30.0),
+    )
+
+
+def get_cdn_client(app: FastAPI) -> httpx.AsyncClient:
+    """取共享的 CDN 取流客户端（进程内唯一，懒创建）。
+
+    挂在 app.state 上是为了让 lifespan 统一关闭；测试里没走 lifespan 时就地建一个。
+    """
+    client = getattr(app.state, "cdn_client", None)
+    if client is None or client.is_closed:
+        client = _new_cdn_client()
+        app.state.cdn_client = client
+    return client
+
+
 @app.get("/music/api/v1/track/stream")
 @app.get("/music/api/v1/track/stream/{subpath:path}")
 async def stream_track(request: Request):
@@ -3018,7 +3072,7 @@ async def stream_track(request: Request):
             request, get_upstream_client(request.app),
             timeout=PLAYBACK_FORWARD_TIMEOUT_S, label="local-stream")
 
-    def _log_play(source: str, tag: str | None = None) -> bool:
+    def _log_play(source: str, tag: str | None = None, warm: bool | None = None) -> bool:
         """播放起步留证：来源 + 总耗时 + 音频到底走了哪条路。
 
         cold/warm 直接写在 play-start 行里 —— 想评估预热有没有用，
@@ -3036,8 +3090,9 @@ async def stream_track(request: Request):
         if not _play_start_fresh(guid):
             return False
         if tag is None:
-            _w = prefetch.warming_seconds(guid) if prefetch.enabled() else None
-            tag = " warm" if _w is not None else " cold"
+            if warm is None:
+                warm = prefetch.warming_seconds(guid) is not None
+            tag = " warm" if warm else " cold"
         logger.info("play-start %s %s %.0fms%s", source, guid,
                     (time.monotonic() - started) * 1000.0, tag)
         return True
@@ -3129,14 +3184,28 @@ async def stream_track(request: Request):
     _schedule_prefetch(request, guid)
 
     warm_before = prefetch.warming_seconds(guid)
+    # 「撞上预热正在跑」：预热任务还没收尾，这次 gather 不但吃不到成果，还要跟它
+    # 抢单进程 musicbox。单独记一笔——混进 cold 的话，就看不出预热在帮倒忙。
+    warming_now = guid in _PREFETCH_TASKS
+    _gather_flags: dict[str, bool] = {}
     _gather_started = time.monotonic()
     play_url_res, info_res = await asyncio.gather(
-        resolve_netease_url(musicbox_client, song_id, request),
+        resolve_netease_url(musicbox_client, song_id, request, stats=_gather_flags),
         _online_info(request, guid),
         return_exceptions=True,
     )
     _gather_ms = (time.monotonic() - _gather_started) * 1000.0
-    prefetch.note_play(guid, _gather_ms, warm_before is not None)
+    # v2.9.25：warm 收紧为「这次真的省掉了 musicbox 往返」（直链缓存是否命中）。
+    # 以前拿「曾经预热过这首歌」当 warm，可预热成果的寿命是直链缓存 TTL、比标记
+    # 窗口短得多，于是过期后照付全额往返的播放也被算成 warm —— 真机据此算出
+    # 「未预热 114ms → 命中预热 332ms」这种反方向结论，其实是口径把自己骗了。
+    _gather_warm = bool(_gather_flags.get("url_cache_hit"))
+    prefetch.note_play(guid, _gather_ms, _gather_warm, warming=warming_now)
+    if warm_before is not None and not _gather_warm:
+        # 标着「预热过」却没吃到缓存：多半是成果已过期（直链缓存 TTL 到了），
+        # 也可能档位变了（预热时是 jymaster、播的时候降成了 exhigh）。留个线索。
+        logger.debug("prefetch stale for %s: 预热于 %.0fs 前，但本次未命中直链缓存",
+                     guid, warm_before)
     play_url = None if isinstance(play_url_res, Exception) else play_url_res
     info = None if isinstance(info_res, Exception) else info_res
 
@@ -3171,24 +3240,27 @@ async def stream_track(request: Request):
     if range_header:
         req_headers["Range"] = range_header
 
-    async def _open_cdn(url: str) -> tuple[httpx.Response | None, httpx.AsyncClient | None]:
-        """连网易云 CDN 取流。失败返回 (None, None)（客户端已自行关闭）。"""
-        stream_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+    async def _open_cdn(url: str) -> "httpx.Response | None":
+        """连网易云 CDN 取流。失败返回 None（客户端已自行关闭）。
+
+        v2.9.25：client 改为共享（见 get_cdn_client），**不再随请求关闭**——关掉
+        它等于把整个连接池一起拆了，复用也就无从谈起。这里只关 resp：未读完的流
+        httpx 会丢弃该连接，不会把半截响应交给下一个请求。
+        """
+        stream_client = get_cdn_client(request.app)
         try:
             stream_req = stream_client.build_request("GET", url, headers=req_headers)
             resp = await stream_client.send(stream_req, stream=True)
             content_type = (resp.headers.get("content-type") or "").lower()
             if resp.status_code >= 400 or "text/html" in content_type:
                 await resp.aclose()
-                await stream_client.aclose()
-                return None, None
-            return resp, stream_client
+                return None
+            return resp
         except Exception as e:
             logger.warning("Failed to stream netease url for %s: %s", guid, e)
-            await stream_client.aclose()
-            return None, None
+            return None
 
-    resp, stream_client = await _open_cdn(play_url)
+    resp = await _open_cdn(play_url)
     if resp is None:
         # 直链失效兜底：命中的可能是短缓存里的旧链（CDN 已过期/403）。
         # 丢弃该歌曲的全部缓存直链、强制重取一次；拿到**不同的**新链才重试。
@@ -3197,7 +3269,7 @@ async def stream_track(request: Request):
         if fresh_url and fresh_url != play_url:
             logger.info("netease url stale for %s, retrying with fresh url", guid)
             play_url = fresh_url
-            resp, stream_client = await _open_cdn(play_url)
+            resp = await _open_cdn(play_url)
         if resp is None and local_hit:
             try:
                 return _serve_local_fallback("cdn unreachable")
@@ -3206,13 +3278,14 @@ async def stream_track(request: Request):
         if resp is None:
             return _online_unavailable()
 
-    _log_play("netease")
+    _log_play("netease", warm=_gather_warm)
     return stream_tee_response(
         resp,
         guid=guid,
         range_header=range_header,
         coro_factory=None if info is not None else (lambda: _online_info(request, guid)),
-        client_to_close=stream_client,
+        # client 是共享的，不能在这里关（关了就把连接池拆了）；resp 由 tee 自己收尾
+        client_to_close=None,
         resolved_ext=resolved_ext,
         pre_info=info if isinstance(info, dict) else None,
     )
