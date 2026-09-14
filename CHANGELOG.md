@@ -3,6 +3,77 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.9.8] - 2026-09-14
+
+**修掉本地每日推荐「排不到歌单列表第一位」。**
+
+### 起因
+
+用户反馈：「你生成的歌单排序也不在第一」。2.9.5 明明已经把默认顺序改成了
+`localdaily,daily,...`，为什么还是沉底？顺着 `playlist/list` 的组装链路往回查，
+发现歌单最终顺序由**三处互斥逻辑**依次决定，任意一处漏掉都会前功尽弃：
+
+1. `channel_order()` 的大类顺序 —— 这里 `localdaily` 确实在第一 ✅
+2. `apply_explicit_order()` 的手动顺序 —— **对大类顺序是「整体覆盖」** ❌
+3. `stamp_display_order()` 按最终顺序盖时间戳
+
+问题出在第 2 步。看 `_key()`：
+
+```python
+def _key(it: dict) -> tuple[int, int]:
+    guid = str(it.get("guid") or "")
+    for idx, tok in enumerate(tokens):
+        if _token_matches(tok, guid):
+            return (0, idx)
+    return (1, 0)          # ← 匹配不上的一律丢到这里
+```
+
+匹配不上的条目全部拿到 `(1, 0)`，**排在所有已匹配条目之后**。而 `_token_matches`：
+
+```python
+def _token_matches(token: str, guid: str) -> bool:
+    if token == "daily":
+        return guid.startswith(DAILY_NS)
+    return token == guid          # ← localdaily 走的是这条
+```
+
+`daily` 有前缀特判（它的 guid 带日期，写死会失配），**`localdaily` 没有**。
+可本地日推的 guid 是 `online:playlist:localdaily:{日}:{用户}` —— **每天、每个用户
+都变**。于是：
+
+* 管理页「歌单顺序」里存的是**昨天**那个 guid → 今天匹配不上；
+* 或者用户压根没排过、token 列表里没有它 → 同样匹配不上；
+* 两种情况下它都被当成「没排到的新歌单」甩到列表末尾。
+
+这就解释了为什么「改了默认值也没用」：大类顺序算得再对，也会被手动顺序整段覆盖。
+
+顺带还发现第 4 处不一致：`env_merge.NEW_DEFAULTS` 里
+`FNMUSIC_NETEASE_CHANNEL_ORDER` 的默认值**还是 2.9.5 之前的 `daily,localdaily,...`**
+（改漏了），新装或补齐配置的用户会拿到 daily 在前。
+
+另外 2.9.5 的 setup.sh 迁移只认「值完全等于旧默认值」才改：用户只要在管理页
+保存过一次配置（哪怕只是勾掉一个 `fm`），值就再也不相等，迁移永远不触发。
+
+### 改动
+
+1. `_token_matches` 给 `localdaily` 加前缀特判（`LOCAL_DAILY_NS`），与 `daily` 对齐。
+2. 新增 `pin_local_daily_first()`：在 `apply_explicit_order()` 之后做最后兜底，
+   按大类顺序把本地日推放回它该在的位置；默认第一位，若用户在大类顺序里
+   **显式**给了位置（`local_daily_pinned_index()`）则以配置为准。
+3. `app.py` 列表组装处接入该兜底（在 `stamp_display_order` 之前）。
+4. `setup.sh` 迁移放宽为幂等的「把 `localdaily` 提到最前，其余相对顺序不变」，
+   不再依赖「完全等于旧默认值」。
+5. 补掉 `env_merge` 漏改的默认值，四处（`playlists.DEFAULT_CHANNEL_ORDER` /
+   `admin_ui` / `env_merge` / `setup.sh`）现在完全一致。
+
+### 回归测试
+
+* `test_local_daily_token_matches_by_prefix` —— token 按前缀认领带日期的 guid。
+* `test_local_daily_survives_explicit_order_without_its_token` —— **先断言问题确实
+  存在**（手动顺序下它沉到最后），再断言兜底后回到第一、其余顺序不变。
+* `test_pin_respects_explicit_channel_order_position` —— 显式配置的位置被尊重。
+* `test_channel_order_default_puts_local_daily_first` —— 四处默认值一致性。
+
 ## [2.9.7] - 2026-09-14
 
 **修掉本地每日推荐「有清单、能进播放器、但点下去不出声」的最后一环：曲目时长单位与 `audioSpec`。**

@@ -165,9 +165,25 @@ write_env_file() {
         # （本地每日推荐排第一）。只认"完全等于旧默认值"的情况——用户自己调过
         # 顺序的话原样保留，绝不覆盖。
         _cho="$(pick_env FNMUSIC_NETEASE_CHANNEL_ORDER "" localdaily,daily,mine,nrec,toplist,category,newalbum,fm)"
-        if [ "${_cho}" = "daily,localdaily,mine,nrec,toplist,category,newalbum,fm" ]; then
-            _cho="localdaily,daily,mine,nrec,toplist,category,newalbum,fm"
-        fi
+        # v2.9.8 迁移：把 localdaily 提到第一位，其余口径的相对顺序原样保留。
+        #
+        # v2.9.5 那版只认「完全等于旧默认值」才迁移，太脆弱：用户只要在管理页
+        # 保存过一次配置（哪怕只是勾掉一个 fm），值就再也不等于旧默认值，于是
+        # 本地每日推荐永远卡在第二位。这里改成幂等的"提到最前"，怎么改过都能
+        # 收敛到正确顺序；用户之后在管理页再调仍然以管理页为准。
+        case "${_cho}" in
+            localdaily,*|localdaily) : ;;   # 已经在第一位，不动
+            *)
+                _rest="$(printf '%s' "${_cho}" | tr ',' '\n' \
+                         | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+                         | grep -vx 'localdaily' | paste -sd, -)"
+                if [ -n "${_rest}" ]; then
+                    _cho="localdaily,${_rest}"
+                else
+                    _cho="localdaily"
+                fi
+                ;;
+        esac
         echo "FNMUSIC_NETEASE_CHANNEL_ORDER=$(dq "${_cho}")"
         # 手动歌单顺序（v2.5）：管理页「歌单顺序」卡片保存的 token 列表；空=按大类
         echo "FNMUSIC_NETEASE_PLAYLIST_ORDER=$(dq "$(pick_env FNMUSIC_NETEASE_PLAYLIST_ORDER "" "")")"

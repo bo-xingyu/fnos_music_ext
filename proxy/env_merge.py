@@ -41,7 +41,9 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_NETEASE_CHANNEL_LIMIT", "8"),
     ("FNMUSIC_NETEASE_CATEGORY", "华语"),
     # 歌单大类展示顺序（v2.4）：列表里各口径的先后，管理页可改
-    ("FNMUSIC_NETEASE_CHANNEL_ORDER", "daily,localdaily,mine,nrec,toplist,category,newalbum,fm"),
+    # ⚠️ v2.9.8：本地每日推荐默认排第一，必须与 playlists.DEFAULT_CHANNEL_ORDER、
+    # admin_ui 默认值、setup.sh 四处保持完全一致，否则用户改一次配置顺序就乱。
+    ("FNMUSIC_NETEASE_CHANNEL_ORDER", "localdaily,daily,mine,nrec,toplist,category,newalbum,fm"),
     # 手动歌单顺序（v2.5）：管理页逐个拖排的 token 列表；空=按大类顺序
     ("FNMUSIC_NETEASE_PLAYLIST_ORDER", ""),
     # 歌单曲目缓存（v2.6）：stale-while-revalidate + 每日定时刷新

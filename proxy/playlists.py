@@ -41,6 +41,10 @@ NETEASE_ALBUM_PREFIX = "online:playlist:nealbum:"
 NETEASE_FM_GUID = "online:playlist:nefm"
 CHANNEL_NS = "online:playlist:"
 DAILY_NS = "online:playlist:daily:"
+# 本地每日推荐（v2.9）。guid 形如 online:playlist:localdaily:{日}:{用户}——
+# **每天、每个用户都不一样**，所以凡是要"认出它"的地方都不能做全等比较，
+# 必须按前缀匹配，否则跨一天就失配（这正是它排不到第一的根因）。
+LOCAL_DAILY_NS = "online:playlist:localdaily:"
 
 # 注入歌单的展示时间戳基准。必须不大于任何真实歌单的时间戳（fnOS 2023 年
 # 才发布，正常歌单都是 1.7e9 级；官方自动创建的歌单理论上可能给 0/1 这类
@@ -167,9 +171,53 @@ def explicit_order_tokens() -> tuple[str, ...]:
 
 
 def _token_matches(token: str, guid: str) -> bool:
+    """token 是否能认领这个 guid。
+
+    ``daily`` / ``localdaily`` 这两个 guid **带日期（localdaily 还带用户）**，
+    每天都在变，写死进 token 列表第二天就失配，所以必须走前缀匹配。
+    v2.9.8 之前只给 daily 做了特判，localdaily 落到 ``token == guid`` 全等分支上
+    永远匹配不上，于是被 apply_explicit_order 当成"没排到的新歌单"甩到列表最后。
+    """
     if token == "daily":
         return guid.startswith(DAILY_NS)
+    if token == "localdaily":
+        return guid.startswith(LOCAL_DAILY_NS)
     return token == guid
+
+
+def local_daily_pinned_index() -> int:
+    """本地每日推荐应被钉住的位置；``None`` = 不干预（按大类/手动顺序自然排）。
+
+    * 用户在 ``FNMUSIC_NETEASE_CHANNEL_ORDER`` 里**显式**给了 localdaily 的位置
+      → 尊重配置，返回它的下标（哪怕用户故意把它排到后面）；
+    * 配置里没提它（含未配置）→ 返回 0，钉在第一位。
+    """
+    raw = (os.environ.get("FNMUSIC_NETEASE_CHANNEL_ORDER") or "").strip()
+    if raw:
+        for idx, part in enumerate(raw.replace(";", ",").split(",")):
+            if part.strip().lower() == "localdaily":
+                return idx
+    return 0
+
+
+def pin_local_daily_first(items: list[dict]) -> list[dict]:
+    """把本地每日推荐搬到它该在的位置（默认第一位），其余相对顺序不变。
+
+    为什么需要这一步：``apply_explicit_order()`` 是对大类顺序的**整体覆盖**，
+    凡匹配不到 token 的条目统一归到"未匹配"组排在最后。本地日推的 guid 天天变，
+    一旦用户的手动顺序里存的是旧 guid（或压根没 localdaily 这个 token），它就会
+    被甩到列表末尾——哪怕大类顺序里它明明排第一。这里做最后一道兜底。
+    """
+    if not items:
+        return items
+    target = local_daily_pinned_index()
+    cur = next((i for i, it in enumerate(items)
+                if str(it.get("guid") or "").startswith(LOCAL_DAILY_NS)), None)
+    if cur is None or cur == target:
+        return items
+    item = items.pop(cur)
+    items.insert(min(max(target, 0), len(items)), item)
+    return items
 
 
 def apply_explicit_order_with(items: list[dict], tokens: tuple[str, ...]) -> list[dict]:

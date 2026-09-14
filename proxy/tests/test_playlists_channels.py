@@ -726,3 +726,77 @@ def test_forget_stale_drops_tracks_cache(tmp_path, monkeypatch):
     assert n == 1
     assert pl.load_cached_tracks("online:playlist:ne:1") is None, \
         "注册表条目被清掉时，曲目缓存文件也该一起删"
+
+
+# ===========================================================================
+# 本地每日推荐的排序（v2.9.8）
+#
+# 它排在列表第几位，取决于三处互斥的逻辑，任何一处漏掉就会沉底：
+#   1. channel_order() 的大类顺序
+#   2. apply_explicit_order() 的手动顺序（对大类顺序是"整体覆盖"）
+#   3. pin_local_daily_first() 的最后兜底
+# ===========================================================================
+
+
+def test_local_daily_token_matches_by_prefix(monkeypatch):
+    """guid 带日期和用户，token 必须按前缀认领，不能全等比较。"""
+    guid = "online:playlist:localdaily:20260914:u-abc"
+    assert pl._token_matches("localdaily", guid), "写死 guid 第二天就失配，必须前缀匹配"
+    assert pl._token_matches("localdaily", "online:playlist:localdaily:20260915:u-abc")
+    assert not pl._token_matches("localdaily", "online:playlist:daily:20260914:u-abc")
+    assert not pl._token_matches("localdaily", "online:playlist:ne:123")
+
+
+def test_local_daily_survives_explicit_order_without_its_token(monkeypatch):
+    """手动顺序里没有 localdaily / 存的是昨天的 guid 时，它不能被甩到最后。"""
+    monkeypatch.delenv("FNMUSIC_NETEASE_CHANNEL_ORDER", raising=False)
+    items = [
+        {"guid": "online:playlist:daily:20260914:u1", "name": "每日推荐"},
+        {"guid": "online:playlist:ne:1", "name": "我的歌单"},
+        {"guid": "online:playlist:localdaily:20260914:u1", "name": "本地每日推荐"},
+    ]
+    # 手动顺序只认得网易云歌单：localdaily 匹配不上，会被归到"未匹配"组
+    out = pl.apply_explicit_order_with(items, ("online:playlist:daily:20260914:u1",
+                                               "online:playlist:ne:1"))
+    assert out[-1]["guid"].startswith(pl.LOCAL_DAILY_NS), "先确认问题确实存在"
+
+    pinned = pl.pin_local_daily_first(out)
+    assert pinned[0]["guid"].startswith(pl.LOCAL_DAILY_NS), "兜底后必须回到第一位"
+    assert [i["name"] for i in pinned[1:]] == ["每日推荐", "我的歌单"], "其余相对顺序不变"
+
+
+def test_pin_respects_explicit_channel_order_position(monkeypatch):
+    """用户在大类顺序里显式给了位置，就以配置为准（可以故意排后面）。"""
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNEL_ORDER",
+                       "daily,mine,localdaily,nrec,toplist,category,newalbum,fm")
+    assert pl.local_daily_pinned_index() == 2
+    items = [
+        {"guid": "online:playlist:daily:20260914:u1"},
+        {"guid": "online:playlist:ne:1"},
+        {"guid": "online:playlist:localdaily:20260914:u1"},
+    ]
+    out = pl.pin_local_daily_first(list(items))
+    assert out[2]["guid"].startswith(pl.LOCAL_DAILY_NS)
+
+
+def test_pin_defaults_to_head_when_order_unset(monkeypatch):
+    """没配置大类顺序（默认）时，本地每日推荐排第一。"""
+    monkeypatch.delenv("FNMUSIC_NETEASE_CHANNEL_ORDER", raising=False)
+    assert pl.local_daily_pinned_index() == 0
+    assert pl.channel_order()[0] == "localdaily"
+
+
+def test_pin_is_noop_without_local_daily():
+    items = [{"guid": "online:playlist:ne:1"}, {"guid": "online:playlist:ne:2"}]
+    assert pl.pin_local_daily_first(list(items)) == items
+    assert pl.pin_local_daily_first([]) == []
+
+
+def test_channel_order_default_puts_local_daily_first(monkeypatch):
+    """四处默认值必须一致，否则用户保存一次配置顺序就乱。"""
+    monkeypatch.delenv("FNMUSIC_NETEASE_CHANNEL_ORDER", raising=False)
+    assert pl.DEFAULT_CHANNEL_ORDER.split(",")[0] == "localdaily"
+    from proxy import env_merge
+    d = dict(env_merge.NEW_DEFAULTS)
+    assert d["FNMUSIC_NETEASE_CHANNEL_ORDER"].split(",")[0] == "localdaily", \
+        "env_merge 的默认值漏改了，新装用户会拿到 daily 在前"

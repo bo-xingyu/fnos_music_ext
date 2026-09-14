@@ -4430,6 +4430,10 @@ async def playlist_list(request: Request):
     # 手动顺序（管理页「歌单顺序」卡片保存的 token 列表）整体覆盖大类顺序；
     # 没排到的新歌单按大类相对顺序跟在后面。实时读 .env，保存后立即生效。
     head = playlists.apply_explicit_order([it for _ch, it in head_items])
+    # v2.9.8：本地每日推荐的 guid 天天变（online:playlist:localdaily:{日}:{用户}），
+    # apply_explicit_order 认不出它，会当成"没排到的新歌单"统一甩到列表末尾——
+    # 哪怕大类顺序里它明明排第一。这里做最后一道兜底，把它放回该在的位置。
+    head = playlists.pin_local_daily_first(head)
     head = playlists.stamp_display_order(head)
 
     # 列表注入完成后安排一次后台预热（冷却期 = 缓存 TTL）：用户打开飞牛音乐

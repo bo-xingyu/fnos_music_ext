@@ -329,7 +329,16 @@ def test_setup_upgrade_preserves_all_user_settings(tmp_path):
     assert env["FNMUSIC_NETEASE_CHANNELS"] == "mine,nrec,toplist,category,newalbum,fm"
     assert env["FNMUSIC_NETEASE_CHANNEL_LIMIT"] == "20"
     assert env["FNMUSIC_NETEASE_CATEGORY"] == "摇滚"
-    assert env["FNMUSIC_NETEASE_CHANNEL_ORDER"] == "toplist,mine,daily,category,nrec,newalbum,fm"
+    # 大类顺序：用户排好的**相对顺序**必须原样保留。
+    # 唯一允许的变化是 v2.9.8 的口径补齐——本地每日推荐（localdaily）是 2.9
+    # 才新增的口径，旧配置里根本没有它，升级时补在最前面（与 channel_order()
+    # 在"配置里没提 localdaily 时插到最前"的行为一致）。这不算覆盖用户设置：
+    # 其余七个口径的先后一点没动。
+    assert env["FNMUSIC_NETEASE_CHANNEL_ORDER"] == \
+        "localdaily,toplist,mine,daily,category,nrec,newalbum,fm"
+    assert env["FNMUSIC_NETEASE_CHANNEL_ORDER"].replace("localdaily,", "") == \
+        "toplist,mine,daily,category,nrec,newalbum,fm", \
+        "补齐新口径不能打乱用户排好的相对顺序"
     assert env["FNMUSIC_NETEASE_PLAYLIST_ORDER"] == "daily,online:playlist:ne:11", \
         "管理页手动排的歌单顺序绝不能被升级冲掉"
     assert env["FNMUSIC_PLAYLIST_TRACK_CACHE_TTL"] == "43200"
