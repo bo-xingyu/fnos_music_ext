@@ -252,3 +252,112 @@ def test_local_daily_tracks_duration_unit_matches_online(wired, monkeypatch):
         assert t["duration"] == 180000, "duration 必须是毫秒（与在线曲目一致）"
         assert t["duration_s"] == 180.0
         assert t["duration_ms"] == t["duration"]
+
+
+# ---------------------------------------------------------------------------
+# 本地每日推荐歌单封面：用歌单里的真实歌曲封面，而不是生成的占位图（v2.9.9）
+# ---------------------------------------------------------------------------
+
+
+def test_local_daily_playlist_cover_uses_real_track_cover(monkeypatch):
+    """歌单封面必须来自曲目本身——用户明确反馈生成的唱片图太丑。"""
+    from proxy import app as app_mod
+    from proxy import recommend as dailyrec
+
+    monkeypatch.setattr(
+        dailyrec, "load_local_daily_cache",
+        lambda user, day: {"tracks": [{"guid": "local:file:aaa"},
+                                      {"guid": "local:file:bbb"}]})
+    monkeypatch.setattr(app_mod, "_LOCAL_DAILY_COVER_SRC", {})
+
+    class _FakeLF:
+        @staticmethod
+        def cover(g):
+            # 第一首没有封面（无内嵌图、同目录也没有），第二首有
+            return (b"\xff\xd8\xff\xe0jpeg", "image/jpeg") if g == "local:file:bbb" else None
+
+    monkeypatch.setattr(app_mod, "local_files", _FakeLF)
+    hit = app_mod._local_daily_playlist_cover("online:playlist:localdaily:20260914:u1")
+    assert hit is not None and hit[1] == "image/jpeg", "取到的是歌曲的真实封面"
+    assert hit[0].startswith(b"\xff\xd8"), "返回的是原始图片字节，不是生成的 PNG"
+    assert app_mod._LOCAL_DAILY_COVER_SRC.get("online:playlist:localdaily:20260914:u1") == \
+        "local:file:bbb", "命中的曲目要记住，别每次请求都翻一遍歌单"
+
+
+def test_local_daily_playlist_cover_falls_back_when_no_track_has_cover(monkeypatch):
+    from proxy import app as app_mod
+    from proxy import recommend as dailyrec
+
+    monkeypatch.setattr(dailyrec, "load_local_daily_cache",
+                        lambda user, day: {"tracks": [{"guid": "local:file:aaa"}]})
+    monkeypatch.setattr(app_mod, "_LOCAL_DAILY_COVER_SRC", {})
+
+    class _FakeLF:
+        @staticmethod
+        def cover(g):
+            return None
+
+    monkeypatch.setattr(app_mod, "local_files", _FakeLF)
+    assert app_mod._local_daily_playlist_cover("online:playlist:localdaily:20260914:u1") is None, \
+        "一首都取不到时返回 None，由调用方回退到占位图（永远有图，不会 404）"
+
+
+def test_local_daily_playlist_cover_is_none_without_local_files(monkeypatch):
+    from proxy import app as app_mod
+    monkeypatch.setattr(app_mod, "local_files", None)
+    assert app_mod._local_daily_playlist_cover("online:playlist:localdaily:20260914:u1") is None
+
+
+def test_local_daily_cover_probe_tells_where_it_is_stuck(monkeypatch):
+    """用户说「封面不是真实图」时，必须能区分是索引没建还是文件真没图。"""
+    from proxy import app as app_mod
+    from proxy import recommend as dailyrec
+
+    monkeypatch.setattr(dailyrec, "load_local_daily_cache",
+                        lambda user, day: {"tracks": [{"guid": "local:file:aaa"}]})
+
+    class _FakeLF:
+        @staticmethod
+        def lookup(g):
+            return {"path": "/music/a.flac"}
+
+        @staticmethod
+        def _embedded_cover(p):
+            return None
+
+        @staticmethod
+        def _sibling_cover(p):
+            return None
+
+    monkeypatch.setattr(app_mod, "local_files", _FakeLF)
+    monkeypatch.setattr(app_mod.os.path, "isfile", lambda p: True)
+    r = app_mod._local_daily_cover_probe(5)
+    assert r["checked"] == 1 and r["indexed"] == 1, "曲目在索引里"
+    assert r["usable"] == 0
+    assert "内嵌封面" in (r["reason"] or ""), "要明确指出是文件里没图"
+
+
+def test_local_daily_cover_probe_reports_no_index(monkeypatch):
+    from proxy import app as app_mod
+    from proxy import recommend as dailyrec
+
+    monkeypatch.setattr(dailyrec, "load_local_daily_cache",
+                        lambda user, day: {"tracks": [{"guid": "local:file:aaa"}]})
+
+    class _FakeLF:
+        @staticmethod
+        def lookup(g):
+            return None
+
+        @staticmethod
+        def _embedded_cover(p):
+            return None
+
+        @staticmethod
+        def _sibling_cover(p):
+            return None
+
+    monkeypatch.setattr(app_mod, "local_files", _FakeLF)
+    r = app_mod._local_daily_cover_probe(5)
+    assert r["indexed"] == 0
+    assert "索引" in (r["reason"] or ""), "索引没建和文件没图是两种病，得分开说"

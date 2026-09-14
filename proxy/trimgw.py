@@ -61,8 +61,42 @@ _CACHE_TTL = 60.0
 
 
 def app_name() -> str:
-    """当前应用名（后端 API 请求体需要 appName）。"""
-    return str(os.environ.get(APP_NAME_ENV) or os.environ.get("TRIM_APP_NAME") or "fnmusicext").strip() or "fnmusicext"
+    """当前应用名（后端 API 请求体需要 appName）。
+
+    ⚠️ 真机实锤：``TRIM_APPNAME`` **并不总是被注入**。回退到硬编码 "fnmusicext"
+    时，如果系统内部登记的应用名不是这个写法，网关就会返回
+    ``code=200006 "Internal Error"``（业务模块内部错误）——因为它按 appName
+    找不到对应的授权记录。
+    """
+    return candidate_app_names()[0]
+
+
+def candidate_app_names() -> "list[str]":
+    """按可信度从高到低列出系统可能认的应用名，逐个试。
+
+    最权威的是**系统注入的应用数据目录**——形如 ``/vol1/@appdata/<appname>``，
+    最后一段就是系统登记的应用名，比任何硬编码都可靠。
+    """
+    out: list[str] = []
+
+    def _add(v: str) -> None:
+        v = str(v or "").strip()
+        if v and v not in out:
+            out.append(v)
+
+    for var in (APP_NAME_ENV, "TRIM_APP_NAME", "TRIM_APPID", "TRIM_APP_ID"):
+        _add(os.environ.get(var) or "")
+    # 系统注入的应用目录：末段即应用名
+    for var in ("TRIM_PKGVAR", "TRIM_PKGMETA", "TRIM_PKGETC", "TRIM_PKGHOME"):
+        base = str(os.environ.get(var) or "").strip().rstrip("/")
+        if base:
+            _add(os.path.basename(base))
+    # 末段若带 "fnnas." 之类前缀，也试一下去掉前缀的写法
+    for name in list(out):
+        if "." in name:
+            _add(name.rsplit(".", 1)[-1])
+    _add("fnmusicext")
+    return out
 
 
 def _cached(key: str):
@@ -135,28 +169,105 @@ def _http_post(payload: dict, timeout: float = DEFAULT_TIMEOUT) -> dict:
 
     raw = b"".join(chunks)
     if not raw:
+        _remember_raw("(空响应)")
         return {"code": -5, "msg": "网关返回空响应"}
     try:
         head, _, tail = raw.partition(b"\r\n\r\n")
         text = tail.decode("utf-8", "replace")
     except Exception as exc:  # noqa: BLE001
+        _remember_raw(f"解码失败: {exc}")
         return {"code": -6, "msg": f"响应解码失败: {exc}"}
+    # 状态行对排错很关键（Internal Error 可能是 200 也可能是 500），以前直接丢了
+    status_line = head.split(b"\r\n", 1)[0].decode("utf-8", "replace").strip()
+    _remember_raw(f"{status_line} | {text[:400]}")
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
     except Exception:  # noqa: BLE001
         snippet = text[:160].replace("\n", " ")
-        return {"code": -7, "msg": f"响应不是 JSON: {snippet}"}
+        return {"code": -7, "msg": f"响应不是 JSON: {snippet}", "http_status": status_line}
+    if isinstance(parsed, dict):
+        parsed.setdefault("http_status", status_line)
+        return parsed
+    return {"code": -7, "msg": f"响应不是 JSON 对象: {str(parsed)[:160]}",
+            "http_status": status_line}
 
 
 def call(req: str, data: dict | None = None, timeout: float = DEFAULT_TIMEOUT) -> dict:
-    """调用一个后端能力。req 形如 trim.file.getSharedAccessibleFolders。"""
-    payload = {
-        "reqId": uuid.uuid4().hex[:16],
-        "req": req,
-        "appName": app_name(),
-        "data": data or {},
-    }
-    return _http_post(payload, timeout=timeout)
+    """调用一个后端能力。req 形如 trim.file.getSharedAccessibleFolders。
+
+    appName 可能有多种写法（TRIM_APPNAME 常不注入），逐个试到通为止——
+    网关按 appName 查授权记录，名字对不上就 200006 Internal Error。
+    只有"内部错误/未知错误"才值得换名字重试；参数错、scope 不足、token 无效
+    这几类换了也一样，别浪费时间。
+    """
+    _NOT_WORTH_RETRY = {200001, 200003, 200004, 200005}  # 参数/Forbidden/Unauthorized/NotFound
+    names = candidate_app_names()
+    last: dict | None = None
+    for idx, name in enumerate(names):
+        payload = {
+            "reqId": uuid.uuid4().hex[:16],
+            "req": req,
+            "appName": name,
+            "data": data or {},
+        }
+        resp = _http_post(payload, timeout=timeout)
+        code = int(resp.get("code") or 0)
+        if code == 0:
+            resp["app_name_used"] = name
+            if idx:
+                logger.info("开放网关调用成功：appName 用的是 %r（第 %d 个候选）", name, idx + 1)
+            return resp
+        resp["app_name_used"] = name
+        last = resp
+        if code in _NOT_WORTH_RETRY:
+            break
+        if idx:
+            logger.debug("开放网关 appName=%r 失败(%s %s)，换下一个候选",
+                         name, code, resp.get("msg") or "")
+    if last is not None:
+        return last
+    return {"code": -1, "msg": "没有可用的 appName 候选"}
+
+
+# ---------------------------------------------------------------------------
+# 网关原始响应（排错用）
+#
+# Internal Error 是个笼统错误，光看 code/msg 完全无从下手。把状态行和响应体
+# 原文留一份给诊断页，用户贴日志时就能一眼看到真实原因。
+# ---------------------------------------------------------------------------
+
+_LAST_RAW: dict[str, str] = {}
+
+
+def _remember_raw(text: str) -> None:
+    _LAST_RAW["raw"] = str(text or "")[:600]
+
+
+def trim_env_report() -> dict:
+    """系统实际注入了哪些 TRIM_* 环境变量（值默认不展示，避免泄露 token）。
+
+    排 appName 全靠它：真机上 ``TRIM_APPNAME`` 常常压根不存在，只能从
+    ``TRIM_PKGVAR`` / ``TRIM_PKGMETA`` 这类**应用数据目录**的末段去推。
+    把清单列出来，一眼就能看出系统到底给了什么。
+    """
+    secret_markers = ("TOKEN", "SECRET", "PASS", "KEY", "CRED")
+    shown: dict[str, str] = {}
+    names: list[str] = []
+    for k in sorted(os.environ):
+        if not k.startswith("TRIM_"):
+            continue
+        names.append(k)
+        v = str(os.environ.get(k) or "")
+        if any(m in k.upper() for m in secret_markers):
+            shown[k] = f"★ 已注入（{len(v)} 字符，不展示）" if v else "（空）"
+        else:
+            shown[k] = v[:200]
+    return {"names": names, "values": shown}
+
+
+def last_raw_response() -> str:
+    """最近一次网关调用的原始响应（状态行 + 响应体片段）。"""
+    return str(_LAST_RAW.get("raw") or "")
 
 
 # ---------------------------------------------------------------------------
@@ -285,12 +396,15 @@ def authorized_report(force: bool = False) -> dict:
         "config_paths": _existing(config_share_paths()),
         "degraded": source != "gateway",
         "authorized": bool(shared),
+        "app_names": candidate_app_names(),
+        "last_raw": last_raw_response(),
+        "trim_env": trim_env_report(),
         "hint": _hint(shared, shared_err, gateway_present, token_present),
-        "note": _note(source, token_present, gateway_present),
+        "note": _note(source, token_present, gateway_present, shared_err),
     }
 
 
-def _note(source: str, token_present: bool, gateway_present: bool) -> str:
+def _note(source: str, token_present: bool, gateway_present: bool, shared_err: str = "") -> str:
     """非「网关直查」时的解释性说明。降级不该被当成故障报错——曲库照样读得动。"""
     if source == "gateway":
         return ""
@@ -302,6 +416,11 @@ def _note(source: str, token_present: bool, gateway_present: bool) -> str:
     if not token_present:
         return ("系统未向本进程注入 TRIM_API_TOKEN（系统版本较低或需重装应用以注册 api-scope），"
                 "无法自动查询授权目录；若你已在应用设置里授权，请重启本应用后重试。")
+    if shared_err and gateway_present:
+        return (f"网关已连通、token 已注入，但查询授权目录失败：{shared_err}。"
+                f"最常见的原因是 appName 与系统登记的不一致（已自动尝试 "
+                f"{'/'.join(candidate_app_names()[:3])} 等候选）。"
+                "若你在应用设置里已授权，可在管理页直接填写「本地曲库目录」，功能不受影响。")
     return ""
 
 

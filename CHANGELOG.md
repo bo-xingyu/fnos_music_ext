@@ -3,6 +3,113 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.9.10] - 2026-09-14
+
+**封面与网关两件事都补齐「可观测性」——不再靠猜。**
+
+### 起因
+
+2.9.9 装完，排序已经对了，但还剩两个说不清的问题：
+
+**① 封面不是真实图。** 可能原因至少三种，光看结果完全分不出来：
+
+* 本地文件索引没建 → `lookup()` 查不到路径；
+* 文件里确实没内嵌封面、同目录也没有 `cover.jpg`；
+* 只扫了前 12 首，恰好前 12 首都没图（整张歌单明明有封面，却被误判）。
+
+第 3 种是我自己埋的：为了不让封面请求变慢，只试前 12 首。曲库里前十几首
+若是没内嵌图的无损文件，就会直接回退占位图——用户看到的就是"封面不是真实图"。
+
+**② 网关 `Internal Error` 仍然无解。** 2.9.9 的诊断给出了关键新信息：
+
+```
+应用名候选     : fnmusicext          ← 只有一个候选
+网关原始响应   : HTTP/1.1 500 Internal Server Error
+                 {"reqId":"aab1c81f...","code":200006,"msg":"Internal Error","data":null}
+```
+
+**候选只有一个**，说明 `TRIM_PKGVAR` / `TRIM_PKGMETA` / `TRIM_APPNAME` 这些
+**一个都没注入**，只能退回硬编码。而 token 明明是注入了的——说明系统确实在
+按应用脚本的方式拉起进程，但没给应用名相关变量。要确定系统登记的应用名到底
+叫什么，就必须先看清楚系统**实际**注入了哪些 `TRIM_*`。
+
+顺带一提，HTTP 状态码是 **500**（不是 200），`data` 为 `null`——这是服务端
+处理请求时真的出了错，不是"没授权"那类业务拒绝。
+
+### 改动
+
+1. **封面选取范围 12 → 60**：先看前 12 首（快），都没有再扩大到 60 首，
+   避免"前十几首恰好没图"造成的误判。
+2. **封面探测诊断** `_local_daily_cover_probe()`：管理页诊断里直接给出
+   `曲目数 / 已查 / 有索引 / 内嵌图 / 同目录图 / 可用`，并**用一句话指出卡在哪**
+   （索引没建 / 文件里没图 / 曲目为空），不再让用户猜。
+3. **网关变量诊断** `trim_env_report()`：列出系统实际注入的全部 `TRIM_*`
+   变量名，值按 `TOKEN/SECRET/PASS/KEY/CRED` 脱敏；管理页诊断额外打印
+   `TRIM_PKGVAR` 等能反推应用名的那几个。
+4. 封面命中/落空都写日志（命中记曲目 guid 与字节数，落空记探测结论）。
+
+### 回归测试
+
+* `test_local_daily_cover_probe_tells_where_it_is_stuck` —— 有索引但没图时，
+  诊断必须明确指出是"文件里没内嵌封面"。
+* `test_local_daily_cover_probe_reports_no_index` —— 索引没建要单独说，
+  和"文件没图"是两种不同的病。
+* `test_trim_env_report_lists_names_but_hides_secrets` —— 变量要列全，token 不能露。
+
+## [2.9.9] - 2026-09-14
+
+**本地日推封面改用真实歌曲封面；开放网关 `Internal Error` 的排错能力补齐。**
+
+### 起因
+
+2.9.7 之后本地每日推荐**可以播放**了（日志里 `track/stream`、`track/transcode/heartbeat`
+都正常）。剩下三件事：
+
+**① 歌单封面太丑。** 2.9.4 为了防止客户端因为封面 404 而整条不渲染，给本地日推
+现生成了一张「唱片」PNG（zlib+struct 手搓，零依赖）。图能出来，但它是画的，
+跟歌单内容毫无关系。用户反馈"太丑了，随便找一张歌单里的歌曲封面"——合理，
+曲目本来就有封面（内嵌图或同目录 `cover.jpg`），没理由不用。
+
+**② 授权卡片一直显示"尚未授权任何目录"，网关返回 `Internal Error`。**
+按飞牛《错误码》文档，`Internal Error` 是 `code 200006`「具体业务模块内部错误」——
+一个笼统到无法定位的错误。而《调用方式》文档确认我们的请求格式是对的：
+
+```json
+{"reqId":"1","req":"trim.file.getSharedAccessibleFolders","appName":"...","data":{}}
+```
+
+排下来最可疑的是 `appName`。而 `app_name()` 只从 `TRIM_APPNAME` / `TRIM_APP_NAME`
+读，**这两个环境变量在真机上常常根本不注入**，于是回退到硬编码 `"fnmusicext"`。
+系统按 appName 查授权记录，名字对不上就 200006。
+
+更糟的是以前 `_http_post()` 把 **HTTP 状态行直接丢了**，只留 `code`/`msg`，
+等于把最有价值的排错信息扔掉了。
+
+### 改动
+
+1. **封面**：新增 `_local_daily_playlist_cover()`，从歌单曲目里取第一张能拿到的
+   真实封面（`local_files.cover()`：内嵌图 → 同目录 `cover.jpg`），命中过的曲目
+   guid 记在 `_LOCAL_DAILY_COVER_SRC` 里复用，不必每次请求翻一遍歌单；
+   一首都取不到才回退到生成的占位图（保证永远有图，客户端不会因 404 不渲染）。
+2. **appName 候选**：`candidate_app_names()` 按可信度排序——系统注入的应用数据
+   目录末段（`/vol1/@appdata/<appname>`，最权威）→ `TRIM_APPNAME` 等环境变量 →
+   去前缀写法 → 硬编码 `fnmusicext`；`call()` 遇到 200006 就换下一个候选重试，
+   参数错 / Forbidden / Unauthorized / NotFound 这几类换了也没用，不重试。
+3. **原始响应留档**：`_http_post()` 记下 HTTP 状态行 + 响应体片段
+   （`last_raw_response()`），并附在每个响应的 `http_status` 字段上。
+4. **管理页**：授权卡片补显示「应用名候选 / 网关原始响应 / 说明」，
+   用户把这段贴出来就能一眼判断是 appName 不对、scope 没生效还是系统版本问题。
+
+### 回归测试
+
+* `test_candidate_app_names_derives_from_system_pkgvar` —— 权威应用名取自系统目录末段。
+* `test_call_retries_next_app_name_on_internal_error` —— 200006 时换候选再试。
+* `test_call_does_not_retry_on_scope_or_token_errors` —— Forbidden 不重试。
+* `test_http_post_records_status_line_and_raw_body` —— 状态行与原文必须留档。
+* `test_local_daily_playlist_cover_uses_real_track_cover` —— 取到的是歌曲真实封面
+  （断言字节是 JPEG 而不是生成的 PNG），并记住命中的曲目。
+* `test_local_daily_playlist_cover_falls_back_when_no_track_has_cover` —— 回退到 None。
+
 ## [2.9.8] - 2026-09-14
 
 **修掉本地每日推荐「排不到歌单列表第一位」。**

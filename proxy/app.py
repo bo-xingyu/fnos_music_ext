@@ -2138,6 +2138,7 @@ async def ext_local_daily(request: Request):
                 "cache_exists": os.path.exists(cache_file),
                 "music_db": db,
                 "authorization": library_authorization_state(lib),
+                "cover_probe": _local_daily_cover_probe(),
                 "hint": (
                     "library_is_cache_fallback=true 表示没定位到曲库："
                     "到管理页填「本地曲库目录」，或到「应用设置 → 授权目录」授权你的音乐目录"
@@ -3325,6 +3326,143 @@ async def track_metadata(request: Request, subpath: str = ""):
 # ---------------------------------------------------------------------------
 
 _LOCAL_DAILY_COVER_CACHE: dict[int, bytes] = {}
+# 本地每日推荐歌单封面 -> 命中过的曲目 guid，避免每次请求都翻一遍歌单
+_LOCAL_DAILY_COVER_SRC: dict[str, str] = {}
+
+
+def _local_daily_cover_probe(sample: int = 20) -> dict:
+    """本地日推封面探测：歌单里到底有没有真实封面，卡在哪一步。
+
+    用户反馈「封面不是真实图」时，光看结果猜不出来：可能是本地文件索引没建、
+    可能是文件没有内嵌图、也可能是同目录没有 cover.jpg。这里把三层分别统计，
+    一次就能定位。
+    """
+    day = dailyrec.today_key()
+    tracks: list = []
+    users: list[str] = []
+    try:
+        users = dailyrec._known_cache_users() if hasattr(dailyrec, "_known_cache_users") else []
+    except Exception:  # noqa: BLE001
+        users = []
+    for u in (list(users) + ["shared"]):
+        try:
+            tracks = list((dailyrec.load_local_daily_cache(u, day) or {}).get("tracks") or [])
+        except Exception:  # noqa: BLE001
+            tracks = []
+        if tracks:
+            break
+    if not tracks:
+        try:
+            tracks = list((_load_local_daily_bundle("shared") or {}).get("tracks") or [])
+        except Exception:  # noqa: BLE001
+            tracks = []
+
+    indexed = embedded = sibling = 0
+    checked = 0
+    first_err = ""
+    for t in tracks[:max(1, sample)]:
+        if not isinstance(t, dict):
+            continue
+        g = str(t.get("guid") or "")
+        if not g.startswith("local:file:") or local_files is None:
+            continue
+        checked += 1
+        try:
+            ent = local_files.lookup(g)
+            if ent:
+                indexed += 1
+                path = str(ent.get("path") or "")
+                if path and os.path.isfile(path):
+                    if local_files._embedded_cover(path):
+                        embedded += 1
+                    elif local_files._sibling_cover(path):
+                        sibling += 1
+        except Exception as exc:  # noqa: BLE001
+            if not first_err:
+                first_err = f"{type(exc).__name__}: {exc}"
+
+    usable = embedded + sibling
+    if not tracks:
+        reason = "歌单曲目为空（缓存未生成）"
+    elif checked == 0:
+        reason = "曲目 guid 不是 local:file:（本地文件索引未参与）"
+    elif indexed == 0:
+        reason = "本地文件索引里查不到这些曲目——索引没建或已失效"
+    elif usable == 0:
+        reason = ("音频文件既没有内嵌封面，同目录也没有 cover.jpg/folder.jpg 等，"
+                  "只能回退到生成的占位图")
+    else:
+        reason = ""
+    return {
+        "tracks": len(tracks),
+        "checked": checked,
+        "indexed": indexed,
+        "embedded_cover": embedded,
+        "sibling_cover": sibling,
+        "usable": usable,
+        "reason": reason,
+        "error": first_err,
+    }
+
+
+def _local_daily_playlist_cover(guid: str) -> "tuple[bytes, str] | None":
+    """本地每日推荐歌单的封面：取**歌单里第一张能拿到的真实歌曲封面**。
+
+    命中过的曲目 guid 记在 ``_LOCAL_DAILY_COVER_SRC``，下次直接复用——不必每次
+    请求都把整个歌单的封面翻一遍。一首都取不到就返回 None，由调用方回退到
+    生成的占位图（保证永远有图，客户端不会因为 404 不渲染整条）。
+    """
+    if local_files is None:
+        return None
+    cached_track = _LOCAL_DAILY_COVER_SRC.get(guid)
+    if cached_track:
+        hit = local_files.cover(cached_track)
+        if hit:
+            return hit
+        _LOCAL_DAILY_COVER_SRC.pop(guid, None)
+
+    rest = str(guid or "")[len(dailyrec.LOCAL_DAILY_GUID_PREFIX):]
+    parts = rest.split(":")
+    day = parts[0] if parts and parts[0] else dailyrec.today_key()
+    user = parts[1] if len(parts) > 1 and parts[1] else "shared"
+
+    tracks: list = []
+    try:
+        tracks = list((dailyrec.load_local_daily_cache(user, day) or {}).get("tracks") or [])
+    except Exception:  # noqa: BLE001
+        tracks = []
+    if not tracks:
+        try:
+            tracks = list((_load_local_daily_bundle(user) or {}).get("tracks") or [])
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("本地日推封面：取不到曲目清单 %s", exc)
+            return None
+
+    # 先看前 12 首（绝大多数专辑目录在前几首就有图，快）；都没有再扩大到 60 首。
+    # 只扫 12 首就放弃的话，前十几首恰好是没内嵌图的无损文件时，会误判成"整张
+    # 歌单没封面"而回退占位图——用户看到的就是"封面不是真实图"。
+    for attempt in (0, 1):
+        pool = tracks[:12] if attempt == 0 else tracks[12:60]
+        if not pool:
+            break
+        for t in pool:
+            if not isinstance(t, dict):
+                continue
+            g = str(t.get("guid") or "")
+            if not g.startswith("local:file:"):
+                continue
+            try:
+                hit = local_files.cover(g)
+            except Exception:  # noqa: BLE001
+                hit = None
+            if hit:
+                _LOCAL_DAILY_COVER_SRC[guid] = g
+                logger.info("本地日推封面：命中曲目 %s（%s, %d 字节）",
+                            g[:24], hit[1], len(hit[0]))
+                return hit
+    logger.info("本地日推封面：前 %d 首曲目都没取到真实封面，回退占位图（%s）",
+                min(12, len(tracks)), _local_daily_cover_probe(12).get("reason") or "未知")
+    return None
 
 
 def _png_chunk(tag: bytes, data: bytes) -> bytes:
@@ -3408,11 +3546,18 @@ async def static_cover(request: Request, subpath: str = ""):
             headers={"Cache-Control": "public, max-age=86400"},
         )
     if dailyrec.is_local_daily_playlist_guid(guid):
-        # 本地每日推荐封面：本地文件没有封面 URL，早期版本直接返回 404 让客户端用
-        # 占位图。但真机上确实见过客户端因为歌单封面 404 而整条不渲染（日志里就是
-        # 一行 404，界面上则是"歌单凭空消失"），所以这里干脆现生成一张 PNG 封面：
-        # 零依赖（zlib+struct 手写 PNG）、按尺寸内存缓存，永远拿得到图。
+        # 本地每日推荐封面：**直接用歌单里第一张能取到的真实歌曲封面**。
+        #
+        # 早期版本是现生成一张唱片占位图——能拿到图（避免客户端因封面 404 而
+        # 整条不渲染），但那是"自己画的"，跟歌单内容没关系，用户反馈太丑。
+        # 现在改成从曲目里取真实封面（内嵌图 → 同目录 cover.jpg），
+        # 一首都取不到时才回退到占位图，保证永远有图可用。
         px = cover_resize_px(request.query_params.get("size")) or 300
+        found = _local_daily_playlist_cover(guid)
+        if found:
+            data, mime = found
+            return Response(content=data, media_type=mime,
+                            headers={"Cache-Control": "public, max-age=86400"})
         return Response(
             content=_local_daily_cover_png(px),
             media_type="image/png",

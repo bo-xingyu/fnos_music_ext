@@ -2280,6 +2280,14 @@ function runDiag(auto){
                  +(ld.library_is_cache_fallback?("  ★ 这就是歌单不出现的原因（cache 目录="+ld.cache_dir+"）"):""));
         out.push("  扫到音频文件数 : "+ld.scanned_files);
         (ld.sample_files||[]).forEach(function(f){ out.push("     例: "+f); });
+        var cp=ld.cover_probe;
+        if(cp){
+          out.push("  封面探测       : 曲目="+cp.tracks+"  已查="+cp.checked
+                   +"  有索引="+cp.indexed+"  内嵌图="+cp.embedded_cover
+                   +"  同目录图="+cp.sibling_cover+"  可用="+cp.usable);
+          if(cp.reason) out.push("                   ★ "+cp.reason);
+          if(cp.error) out.push("                   探测异常: "+cp.error);
+        }
         out.push("  music.db       : "+ld.music_db.resolved+"  存在="+ld.music_db.exists
                  +(ld.music_db.read_error?("  读取失败="+ld.music_db.read_error):""));
         (ld.music_db.shared_library||[]).slice(0,5).forEach(function(p){ out.push("     shared_library: "+p); });
@@ -2308,6 +2316,14 @@ function runDiag(auto){
         out.push("  当前曲库目录   : "+az.library_dir+"  被授权覆盖="+(!!az.authorized));
         out.push("  严格模式       : "+az.strict+"（true=只扫已授权目录）");
         if(az.shared_error) out.push("  网关返回       : "+az.shared_error);
+        if(az.last_raw) out.push("  网关原始响应   : "+az.last_raw);
+        var tenv=(az.trim_env&&az.trim_env.values)||{};
+        var tk=Object.keys(tenv);
+        out.push("  系统注入变量   : "+(tk.length?tk.join(", "):"★ 一个都没有（进程不是由系统脚本拉起？）"));
+        tk.forEach(function(k){
+          if(/PKGVAR|PKGMETA|PKGETC|PKGHOME|APPNAME|APPVER|SYS_VERSION|APP_STATUS/.test(k))
+            out.push("      "+k+" = "+tenv[k]);
+        });
         if(az.hint) out.push("  ★ "+az.hint);
       }
       out.push("");
@@ -2466,7 +2482,24 @@ function authRender(j){
   lines.push("已授权目录     : "+((j.shared_paths&&j.shared_paths.length)?j.shared_paths.join("\n                 "):"（无）"));
   lines.push("当前曲库目录   : "+(j.library_dir||"（未定位）")+"   被授权覆盖="+(j.authorized?"是":"★ 否"));
   if(j.source) lines.push("授权来源       : "+j.source+(j.degraded?"（降级，功能不受影响）":""));
+  if((j.app_names||[]).length) lines.push("应用名候选     : "+j.app_names.join(" / "));
   if(j.shared_error) lines.push("网关返回       : "+j.shared_error);
+  // Internal Error 太笼统，光看 code/msg 无法定位，把状态行与响应体原文一并列出，
+  // 用户把这段贴出来就能直接判断是 appName 不对、scope 没生效还是系统版本问题。
+  if(j.last_raw) lines.push("网关原始响应   : "+j.last_raw);
+  var env=(j.trim_env&&j.trim_env.values)||{};
+  var envKeys=Object.keys(env);
+  if(envKeys.length){
+    lines.push("系统注入变量   : "+envKeys.join(", "));
+    // 值里能看出系统登记的应用名（TRIM_PKGVAR=/vol1/@appdata/<appname>）
+    for(var i=0;i<envKeys.length;i++){
+      var k=envKeys[i];
+      if(/PKGVAR|PKGMETA|PKGETC|PKGHOME|APPNAME|APPVER|SYS_VERSION/.test(k)){
+        lines.push("                 "+k+" = "+env[k]);
+      }
+    }
+  } else { lines.push("系统注入变量   : ★ 一个都没有（进程不是由系统脚本拉起的？）"); }
+  if(j.note) lines.push("说明           : "+j.note);
   box.textContent=lines.join("\n");
   if(j.hint){ m.className="msg err"; m.textContent=j.hint; }
   else if(j.note){ m.className="msg"; m.textContent=j.note; }

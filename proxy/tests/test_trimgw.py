@@ -153,3 +153,121 @@ def test_existing_dirs_only(tmp_path, monkeypatch):
     monkeypatch.setenv(trimgw.TOKEN_ENV, "dummy")
     rep = trimgw.authorized_report(force=True)
     assert rep["shared_paths"] == [str(tmp_path)]
+
+
+# ---------------------------------------------------------------------------
+# appName 候选与 Internal Error 排错（v2.9.9）
+#
+# 真机实锤：TRIM_APPNAME 常常不注入，回退硬编码时如果系统登记的应用名不是
+# 这个写法，网关就按 appName 找不到授权记录，回一句笼统的
+# code=200006 "Internal Error"，光看 msg 完全无从下手。
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def _clean_app_env(monkeypatch):
+    for var in ("TRIM_APPNAME", "TRIM_APP_NAME", "TRIM_APPID", "TRIM_APP_ID",
+                "TRIM_PKGVAR", "TRIM_PKGMETA", "TRIM_PKGETC", "TRIM_PKGHOME"):
+        monkeypatch.delenv(var, raising=False)
+    yield
+
+
+def test_candidate_app_names_derives_from_system_pkgvar(_clean_app_env, monkeypatch):
+    monkeypatch.setenv("TRIM_PKGVAR", "/vol1/@appdata/fnnas.fnmusicext")
+    names = trimgw.candidate_app_names()
+    assert names[0] == "fnnas.fnmusicext", "系统注入的应用目录末段最权威，排第一"
+    assert "fnmusicext" in names, "带前缀的写法也要试，同时保留裸名"
+
+
+def test_candidate_app_names_falls_back_to_hardcoded(_clean_app_env):
+    names = trimgw.candidate_app_names()
+    assert names == ["fnmusicext"]
+
+
+def test_call_retries_next_app_name_on_internal_error(_clean_app_env, monkeypatch):
+    monkeypatch.setenv("TRIM_PKGVAR", "/vol1/@appdata/fnnas.fnmusicext")
+    tried: list[str] = []
+
+    def fake_post(payload, timeout=None):
+        tried.append(payload["appName"])
+        if payload["appName"] == "fnmusicext":
+            return {"code": 0, "data": {"paths": ["/vol1/1000/music"]}}
+        return {"code": 200006, "msg": "Internal Error"}
+
+    monkeypatch.setattr(trimgw, "_http_post", fake_post)
+    resp = trimgw.call("trim.file.getSharedAccessibleFolders")
+    assert resp.get("code") == 0
+    assert (resp.get("data") or {}).get("paths") == ["/vol1/1000/music"]
+    assert len(tried) >= 2 and tried[-1] == "fnmusicext", \
+        "第一个候选 Internal Error 时必须换下一个再试"
+
+
+def test_call_does_not_retry_on_scope_or_token_errors(_clean_app_env, monkeypatch):
+    monkeypatch.setenv("TRIM_PKGVAR", "/vol1/@appdata/fnnas.fnmusicext")
+    tried: list[str] = []
+
+    def fake_post(payload, timeout=None):
+        tried.append(payload["appName"])
+        return {"code": 200003, "msg": "Forbidden"}
+
+    monkeypatch.setattr(trimgw, "_http_post", fake_post)
+    resp = trimgw.call("trim.file.getSharedAccessibleFolders")
+    assert resp.get("code") == 200003
+    assert len(tried) == 1, "Forbidden 换 appName 也没用，别浪费时间"
+
+
+def test_http_post_records_status_line_and_raw_body(_clean_app_env, monkeypatch):
+    """Internal Error 光看 code/msg 无从下手，状态行和原文必须留档。"""
+    monkeypatch.setenv(trimgw.TOKEN_ENV, "tok")
+    monkeypatch.setattr(trimgw.os.path, "exists", lambda p: True)
+    body = b'{"code":200006,"msg":"Internal Error"}'
+    raw = (b"HTTP/1.1 500 Internal Server Error\r\n"
+           b"Content-Type: application/json\r\n\r\n" + body)
+
+    class _FakeSock:
+        def __init__(self):
+            self._buf = raw
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def settimeout(self, t):
+            pass
+
+        def connect(self, addr):
+            pass
+
+        def sendall(self, data):
+            pass
+
+        def recv(self, n):
+            chunk, self._buf = self._buf[:n], self._buf[n:]
+            return chunk
+
+    class _FakeSocket:
+        AF_UNIX = 1
+        SOCK_STREAM = 2
+        timeout = OSError
+
+        @staticmethod
+        def socket(*a, **kw):
+            return _FakeSock()
+
+    monkeypatch.setattr(trimgw, "socket", _FakeSocket)
+    resp = trimgw.call("trim.file.getSharedAccessibleFolders")
+    assert int(resp.get("code") or 0) == 200006
+    assert "500" in str(resp.get("http_status") or ""), "状态行以前被直接丢了"
+    assert "Internal Error" in trimgw.last_raw_response()
+
+
+def test_trim_env_report_lists_names_but_hides_secrets(monkeypatch):
+    monkeypatch.setenv(trimgw.TOKEN_ENV, "super-secret-token")
+    monkeypatch.setenv("TRIM_PKGVAR", "/vol1/@appdata/fnnas.fnmusicext")
+    rep = trimgw.trim_env_report()
+    assert "TRIM_PKGVAR" in rep["names"], "系统注入了什么必须列出来，否则只能靠猜应用名"
+    assert rep["values"]["TRIM_PKGVAR"] == "/vol1/@appdata/fnnas.fnmusicext"
+    assert "super-secret-token" not in str(rep["values"]["TRIM_API_TOKEN"]), "token 绝不能露"
+    assert "已注入" in str(rep["values"]["TRIM_API_TOKEN"])
