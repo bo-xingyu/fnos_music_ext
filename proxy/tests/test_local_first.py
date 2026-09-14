@@ -483,3 +483,45 @@ def test_file_missing_records_the_failing_path(tmp_path):
     assert L._LOOKUP_LOG[-1]["miss_path"] == gone
     # 命中时不带 miss_path，免得看着像出错
     L._LOOKUP_LOG.clear()
+
+
+# --------------------------------- v2.9.20 流量网络下本地无损让给在线省流档
+
+
+def test_cellular_skips_local_lossless(monkeypatch):
+    """本地 FLAC 30~40MB vs 在线 320k ~9MB：数据网络下必须让给在线。
+
+    真机反例：本地优先命中率修好之后用户反而反馈「比之前慢，等 7~8 秒」——
+    命中的全是 .flac，全都从 NAS 灌 30MB 到手机。
+    """
+    import proxy.local_library as L
+    assert L.serves_request({"ext": "flac"}, "exhigh", "cellular") is False
+    assert L._CELL_SKIPS["n"] == 1
+    # 有损体积与在线 320k 相当，本地仍更快（省掉外网往返），照旧走本地
+    assert L.serves_request({"ext": "mp3"}, "exhigh", "cellular") is True
+    assert L.serves_request({"ext": "m4a"}, "exhigh", "cellular") is True
+
+
+def test_wifi_and_lan_keep_using_local_lossless():
+    """WiFi / 局域网不受影响——流量规则只在窄管道下才有意义。"""
+    import proxy.local_library as L
+    assert L.serves_request({"ext": "flac"}, "jymaster", "wifi") is True
+    assert L.serves_request({"ext": "flac"}, "jymaster", "lan") is True
+    assert L.serves_request({"ext": "flac"}, "jymaster", "") is True
+
+
+def test_cellular_lossy_only_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("FNMUSIC_LOCAL_FIRST_CELLULAR_LOSSY_ONLY", "false")
+    import proxy.local_library as L
+    assert L.serves_request({"ext": "flac"}, "exhigh", "cellular") is True
+
+
+def test_status_reports_cellular_rule_and_skip_count(monkeypatch):
+    import proxy.local_library as L
+    from proxy.local_library import reset_for_test
+    reset_for_test()
+    L.serves_request({"ext": "flac"}, "exhigh", "cellular")
+    L.serves_request({"ext": "flac"}, "exhigh", "cellular")
+    st = L.status("", "")
+    assert st["cellular_lossy_only"] is True
+    assert st["cellular_skips"] == 2

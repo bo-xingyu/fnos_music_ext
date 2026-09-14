@@ -2385,6 +2385,9 @@ function runDiag(auto){
       if(!lf.reachable){ out.push("  取不到代理侧快照: "+JSON.stringify(lf)); }
       else{
         out.push("  开关           : "+lf.enabled+"（any_class="+lf.any_class+"：true=不看音质档位，本地有就播）");
+        if(lf.any_class&&lf.cellular_lossy_only)
+          out.push("  流量网络       : 本地无损让给在线省流档（已让 "+lf.cellular_skips+" 次）"
+                  +"——本地 FLAC 30~40MB vs 在线 320k ~9MB，数据网络下体积才是决定因素");
         var _fs = (lf.fs_scanned||0);
         out.push("  索引           : "+lf.entries+" 首 / "+lf.titles+" 个标题"
                  +"（music.db "+lf.from_db+" + 目录扫描新增 "+lf.from_fs+"）"

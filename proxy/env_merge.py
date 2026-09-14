@@ -39,6 +39,9 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     # 本地曲库优先（v2.8 引入 / v2.9.14 修好）与下一首预热（v2.9.14）
     ("FNMUSIC_LOCAL_FIRST", "true"),
     ("FNMUSIC_LOCAL_FIRST_ANY_CLASS", "true"),
+    # v2.9.20：流量网络下本地优先只吃有损——本地 FLAC 30~40MB，在线 320k 只有 ~9MB，
+    # 数据网络下体积才是决定因素（真机实测本地无损起步 7~8s）
+    ("FNMUSIC_LOCAL_FIRST_CELLULAR_LOSSY_ONLY", "true"),
     ("FNMUSIC_PREFETCH_NEXT", "true"),
     # --- 更多口径歌单 / 账户歌单（v2.2 新增）---
     ("FNMUSIC_NETEASE_CHANNELS", "mine,toplist,category"),
@@ -79,6 +82,9 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     # 在线曲目先匹配本地 music.db 同名文件，命中且音质类与策略一致时直接读本地
     ("FNMUSIC_LOCAL_FIRST", "true"),
     ("FNMUSIC_LOCAL_FIRST_ANY_CLASS", "true"),
+    # v2.9.20：流量网络下本地优先只吃有损——本地 FLAC 30~40MB，在线 320k 只有 ~9MB，
+    # 数据网络下体积才是决定因素（真机实测本地无损起步 7~8s）
+    ("FNMUSIC_LOCAL_FIRST_CELLULAR_LOSSY_ONLY", "true"),
     # 本地曲库索引的内存缓存时长（秒）
     ("FNMUSIC_LOCAL_INDEX_TTL", "300"),
     # 封面缩图边长（像素）：网易云 CDN 服务端缩图（?param=NyN）。原图几百 KB

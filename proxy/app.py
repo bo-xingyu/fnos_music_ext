@@ -2979,9 +2979,11 @@ async def stream_track(request: Request):
             return None
         local_hit = hit
         decision = quality.resolve(request, db_path=local_db)
-        if not local_library.serves_request(hit, decision.get("level") or ""):
-            logger.info("local-first skip: %s 本地 %s 不满足档位 %s",
-                        guid, hit.get("ext"), decision.get("level"))
+        if not local_library.serves_request(hit, decision.get("level") or "",
+                                            decision.get("network") or ""):
+            logger.info("local-first skip: %s 本地 %s 不适用（level=%s network=%s）",
+                        guid, hit.get("ext"), decision.get("level"),
+                        decision.get("network"))
             return None
         try:
             _log_play(f"local-first({phase},ext={hit.get('ext')},level={decision.get('level')})")

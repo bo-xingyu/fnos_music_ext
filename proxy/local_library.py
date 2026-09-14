@@ -186,6 +186,9 @@ _INDEX_META: dict[str, dict] = {}
 # 这就是第一现场：是没索引、还是索引里有但标题没对上。
 _LOOKUP_LOG: list[dict] = []
 _LOOKUP_LOG_MAX = 30
+# 流量网络下「本地有无损但让给在线」的次数——不记就只能靠用户描述快慢，
+# 没法确认这条规则到底生效了几次。
+_CELL_SKIPS: dict[str, int] = {"n": 0}
 
 _TITLE_COLS = ("title", "song_name", "name", "track_title", "songtitle")
 _ARTIST_COLS = ("artist", "artists", "singer", "singers", "artist_name", "author")
@@ -580,14 +583,42 @@ def suggest_similar(title: str, db_path: str, library_dir: str = "",
     return near[:n]
 
 
-def serves_request(entry: dict, level: str) -> bool:
+def cellular_lossy_only() -> bool:
+    """流量网络下，本地优先是否只吃**有损**文件（默认开）。
+
+    这条规则是 2.9.20 真机数据逼出来的。本地优先做到 14 查 10 中之后，用户反而反馈
+    「比之前还慢，播放《最后一首情歌》要等 7~8 秒」——诊断里命中的**全是 .flac**：
+
+        本地 FLAC 一首 30~40MB   在线 exhigh(320k) 一首 ~9MB
+
+    数据都从 NAS 传到手机，走的是同一条窄管道，**体积才是决定因素**。无条件「本地有
+    就播」在数据网络下等于把省流档的意图整个顶掉：以前本地优先几乎不命中，全都走
+    在线 320k；命中率修好之后反而开始灌 30MB 的本地无损，于是更慢了。
+
+    有损文件（mp3/m4a）体积与在线 320k 相当，本地仍然更快（省掉外网往返），所以
+    只在**本地是无损**时让给在线。WiFi / 局域网不受任何影响。
+    """
+    return str(os.environ.get("FNMUSIC_LOCAL_FIRST_CELLULAR_LOSSY_ONLY", "true")
+               or "true").strip().lower() in ("true", "1", "yes", "on")
+
+
+def serves_request(entry: dict, level: str, network: str = "") -> bool:
     """本地文件的音质类是否满足请求档位。
 
     默认要求**同类**：策略要 lossless 就只吃本地无损；策略要 320k 就不喂本地
     母带（那会把「省流量」的意图顶掉）。``FNMUSIC_LOCAL_FIRST_ANY_CLASS=true``
     时放开——只要本地有这首就播，不看档位。
+
+    **唯一例外**：流量网络下无损文件仍要让给在线（见 ``cellular_lossy_only``）。
+    这里不看档位、只看体积量级——档位说的是"想要多好"，而流量场景说的是"最多
+    能承受多大"，后者是硬约束。
     """
     if any_class_allowed():
+        if (str(network or "").strip().lower() == "cellular"
+                and cellular_lossy_only()
+                and klass_of_ext(entry.get("ext") or "") == "lossless"):
+            _CELL_SKIPS["n"] += 1
+            return False
         return True
     return klass_of_ext(entry.get("ext") or "") == klass_of_level(level)
 
@@ -615,6 +646,8 @@ def status(db_path: str, library_dir: str = "") -> dict:
     return {
         "enabled": local_first_enabled(),
         "any_class": any_class_allowed(),
+        "cellular_lossy_only": cellular_lossy_only(),
+        "cellular_skips": int(_CELL_SKIPS.get("n") or 0),
         "db_path": db_path,
         "library_dir": library_dir,
         # entries 按**唯一 path** 统计：一首歌会登记好几个键（标题变体），
@@ -642,3 +675,4 @@ def reset_for_test() -> None:
     _INDEX_CACHE.clear()
     _INDEX_META.clear()
     _LOOKUP_LOG.clear()
+    _CELL_SKIPS["n"] = 0
