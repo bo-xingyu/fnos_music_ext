@@ -335,6 +335,33 @@ def test_match_strips_parenthesised_suffix(tmp_path):
     assert ll.find_local_match("稻香", "周杰伦", db2)["path"] == live
 
 
+def test_db_title_that_is_actually_a_filename(tmp_path):
+    """真机 music.db 的 title 存的是完整文件名、artist 为空（v2.9.17 核心 bug）。
+
+    title = "Beyond - 光辉岁月.flac" / artist = None
+    之前直接拿它归一化 → "beyond光辉岁月flac"，而查询用的是网易云的纯标题
+    "光辉岁月" —— 915 首的索引一首都匹配不上，自测却显示「能匹配上自己」。
+    """
+    p = _write_audio("Beyond - 光辉岁月.flac")
+    db = _make_music_db(tmp_path, [("Beyond - 光辉岁月.flac", None, p)])
+
+    hit = ll.find_local_match("光辉岁月", "Beyond", db)
+    assert hit is not None and hit["path"] == p
+    assert hit["artist"] == "Beyond", "artist 也应从文件名里补出来"
+    # 不带艺术家也能中（网易云有时给的是 "Beyond / 黄家驹" 这类写法）
+    assert ll.find_local_match("光辉岁月", "", db) is not None
+
+
+def test_entry_variants_covers_filename_and_path():
+    v = ll.entry_variants("Beyond - 光辉岁月.flac", None, "/x/Beyond - 光辉岁月.flac")
+    titles = {t for t, _ in v}
+    assert "光辉岁月" in titles
+    assert "Beyond - 光辉岁月" in titles
+    # 纯标题 + 空 artist 时不该被拆坏
+    assert ("晴天", "周杰伦") in ll.entry_variants("晴天", "周杰伦", "/a/周杰伦 - 晴天.flac")
+    assert ll.entry_variants("", "", "") == []
+
+
 def test_title_keys():
     assert ll.title_keys("晴天") == ["晴天"]
     assert ll.title_keys("晴天 (Live)") == ["晴天live", "晴天"]

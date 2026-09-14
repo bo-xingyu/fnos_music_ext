@@ -205,6 +205,61 @@ def _pick_col(cols: list[str], candidates: tuple[str, ...]) -> str | None:
     return None
 
 
+def entry_variants(title: Any, artist: Any, path: Any) -> list[tuple[str, str]]:
+    """一行 music.db 记录可能对应的 (标题, 艺术家) 候选。
+
+    **这是 v2.9.17 修的核心 bug。** 真机 music.db 的 `title` 字段存的不是标题，
+    而是**完整文件名**，artist 是空的：
+
+        title = "Beyond - 光辉岁月.flac"    artist = None
+
+    之前的索引直接拿它当标题归一化 → ``beyond光辉岁月flac``；而查询用的是
+    网易云给的纯标题 ``光辉岁月`` —— 两个键永远对不上。索引看着有 915 首，
+    实际一首都匹配不了（自测之所以「能匹配上自己」，是因为它拿索引里自己的
+    title 去查自己，当然中）。
+
+    music.db 的字段语义各版本不一，所以不猜、而是把候选都登记：
+
+    1. title 字段去掉音频扩展名后的原样；
+    2. 上面这个再按 ``歌手 - 歌名`` 拆开（artist 也由此补上真实值）；
+    3. **path 的文件名**（最可靠——它一定是真实文件名）；
+    4. 文件名同样拆开。
+
+    代价只是索引大一点（900 首 × 4），换来的是不再静默失配。
+    """
+    out: list[tuple[str, str]] = []
+    t = str(title or "").strip()
+    a = str(artist or "").strip()
+
+    def _strip_ext(s: str) -> str:
+        stem, ext = os.path.splitext(s)
+        return stem if (ext and ext.lstrip(".").lower() in AUDIO_EXTS) else s
+
+    if t:
+        t2 = _strip_ext(t)
+        out.append((t2, a))
+        na, nt = _split_name(t2, a)
+        if nt and nt != t2:
+            out.append((nt, na or a))
+
+    p = str(path or "").strip()
+    if p:
+        fname = _strip_ext(os.path.basename(p)).strip()
+        if fname:
+            out.append((fname, a))
+            na2, nt2 = _split_name(fname, a)
+            if nt2 and nt2 != fname:
+                out.append((nt2, na2 or a))
+
+    seen: set[tuple[str, str]] = set()
+    res: list[tuple[str, str]] = []
+    for item in out:
+        if item[0] and item not in seen:
+            seen.add(item)
+            res.append(item)
+    return res
+
+
 def title_keys(title: Any) -> list[str]:
     """一个标题在索引里可能出现的归一化键。
 
@@ -263,14 +318,15 @@ def build_index(db_path: str) -> dict[str, list[dict]]:
                     ext = os.path.splitext(path)[1].lstrip(".").lower()
                     if ext not in AUDIO_EXTS:
                         continue
-                    for key in title_keys(title):
-                        index.setdefault(key, []).append({
-                            "title": str(title or ""),
-                            "artist": str(artist or ""),
-                            "path": path,
-                            "ext": ext,
-                            "klass": klass_of_ext(ext),
-                        })
+                    for vt, va in entry_variants(title, artist, path):
+                        for key in title_keys(vt):
+                            index.setdefault(key, []).append({
+                                "title": vt,
+                                "artist": va,
+                                "path": path,
+                                "ext": ext,
+                                "klass": klass_of_ext(ext),
+                            })
         finally:
             con.close()
     except Exception as exc:  # noqa: BLE001 - 索引失败不影响播放，只是不启用本地优先
@@ -377,7 +433,8 @@ def _get_index(db_path: str, library_dir: str = "") -> dict[str, list[dict]]:
     if fs_scanned:
         logger.info("本地曲库目录扫描：%d 个音频文件，其中 %d 首已是 music.db 之外的补充",
                     fs_scanned, fs_n)
-    db_n = sum(1 for e in index.values() for i in e if i.get("src") == "db")
+    db_n = len({str(i.get("path") or "")
+                for e in index.values() for i in e if i.get("src") == "db"})
     _INDEX_META[key] = {
         "db": db_n, "fs": fs_n, "fs_scanned": fs_scanned, "dir": library_dir,
         "ts": now, "key": key,
@@ -451,18 +508,37 @@ def suggest_similar(title: str, db_path: str, library_dir: str = "",
 
     「本地明明有这首歌为什么不走本地」只有两种可能：真没有，或者名字对不上。
     没有这个提示，诊断里一行 `title-not-in-index` 两种都可能，只能靠猜。
+
+    中文歌名普遍很短（「出山」两个字的相似度很难过 difflib 的 0.5 门槛），
+    所以先用**包含关系**捞，再用 difflib 补，两条路都给。
     """
     import difflib
 
-    key = norm_title(title)
+    raw = str(title or "").strip()
+    key = norm_title(raw)
     if not key:
         return []
-    titles = {str(e.get("title") or "")
-              for es in _get_index(db_path, library_dir).values() for e in es}
-    titles.discard("")
+    titles = sorted({str(e.get("title") or "")
+                     for es in _get_index(db_path, library_dir).values() for e in es} - {""})
     if not titles:
         return []
-    return difflib.get_close_matches(str(title or ""), sorted(titles), n=n, cutoff=0.5)
+
+    near: list[str] = []
+    # 1) 包含：查询词在标题里，或标题在查询词里（「出山」↔「出山 (Live)」）
+    for t in titles:
+        tk = norm_title(t)
+        if not tk:
+            continue
+        if (len(key) >= 2 and key in tk) or (len(tk) >= 2 and tk in key):
+            if t not in near:
+                near.append(t)
+        if len(near) >= n * 3:
+            break
+    # 2) difflib 兜底（放宽门槛，短标题也能给一点线索）
+    for t in difflib.get_close_matches(raw, titles, n=n * 3, cutoff=0.3):
+        if t not in near:
+            near.append(t)
+    return near[:n]
 
 
 def serves_request(entry: dict, level: str) -> bool:
@@ -502,8 +578,11 @@ def status(db_path: str, library_dir: str = "") -> dict:
         "any_class": any_class_allowed(),
         "db_path": db_path,
         "library_dir": library_dir,
+        # entries 按**唯一 path** 统计：一首歌会登记好几个键（标题变体），
+        # 直接数列表长度会翻好几倍，看着像索引爆炸了。titles 才是键的数量。
         "titles": len(idx),
-        "entries": sum(len(v) for v in idx.values()),
+        "entries": len({str(i.get("path") or "")
+                        for es in idx.values() for i in es if i.get("path")}),
         "from_db": int(meta.get("db") or 0),
         "from_fs": int(meta.get("fs") or 0),
         # fs_scanned 必须单独给：fs（新增）为 0 常常不是「没扫到」而是
