@@ -345,7 +345,14 @@ def is_local_daily_playlist_guid(guid: str | None) -> bool:
 
 
 def local_daily_playlist_name(day: str) -> str:
-    return f"本地每日推荐 {day[4:6]}-{day[6:8]}"
+    """本地每日推荐歌单的展示名。
+
+    v2.9.12 之前是 ``本地每日推荐 09-14``（带日期）。用户明确要求**不要日期**：
+    歌单名字里带日期，每天看上去像个新歌单，反而像是"昨天的过期了"；
+    内容每天自动换就够了，名字保持稳定即可（guid 里仍然带日期，用于跨天换血）。
+    ``day`` 参数保留只是兼容既有调用点，不再参与展示。
+    """
+    return "本地音乐每日推荐"
 
 
 def _local_track_guid(path: str) -> str:
@@ -502,6 +509,11 @@ def build_local_daily_tracks(library_dir: str, limit: int, user_guid: str,
             "genres": [],
             "accessStatus": 0,
             "_local_path": f["path"],   # 代理内部用；组装应答时剥掉
+            # 真实路径（对外可见）：客户端曲目详情的「文件位置」可能直接读列表里的
+            # 这份数据，之前只有 _local_path 且会被剥掉，用户看到的是
+            # local/<sha1>.mp3 这种假路径。缓存 schema 升到 4 让旧缓存重建。
+            "path": f["path"],
+            "filePath": f["path"],
         })
     return tracks
 
@@ -514,10 +526,11 @@ def local_daily_cache_path(user_guid: str, day: str) -> str:
 # 1 = v2.9.0~v2.9.4：tracks 里 duration / size 恒为 0，且没有写过本地文件索引；
 # 2 = v2.9.5：duration / size / bitrate 为真值，构建时写 local_files 索引。
 # 3 = v2.9.7：duration 单位改为毫秒（与在线曲目一致），并补 duration_s。
+# 4 = v2.9.12：曲目带真实 path/filePath（客户端「文件位置」显示用）。
 # ⚠️ 升级时旧缓存不会自动重扫（get_or_build 命中缓存就直接 return），于是
 # 「装了新版本但列表里时长还是旧单位/旧值、索引也没建」。靠版本号显式判废，
 # 让它在下一次拉歌单列表时静默重建——用户不需要点任何按钮。
-LOCAL_DAILY_SCHEMA = 3
+LOCAL_DAILY_SCHEMA = 4
 
 
 def _cache_is_stale(data: dict) -> bool:

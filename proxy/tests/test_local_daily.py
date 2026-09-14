@@ -55,7 +55,8 @@ def test_local_daily_guid_distinct_from_netease_daily():
     assert not dailyrec.is_daily_playlist_guid("online:playlist:localdaily:20260913:u1")
     assert dailyrec.local_daily_playlist_guid("20260913", "u1").startswith(
         "online:playlist:localdaily:20260913")
-    assert dailyrec.local_daily_playlist_name("20260913") == "本地每日推荐 09-13"
+    assert dailyrec.local_daily_playlist_name("20260913") == "本地音乐每日推荐", \
+        "歌单名不带日期：名字保持稳定，内容每天自动换（guid 里仍带日期）"
 
 
 def test_local_daily_random_stable_same_day_and_limit(wired, monkeypatch):
@@ -114,7 +115,7 @@ def test_playlist_list_injects_local_daily_and_stream_serves_file(wired):
         local = [it for it in items
                  if dailyrec.is_local_daily_playlist_guid(str(it.get("guid") or ""))]
         assert len(local) == 1
-        assert local[0]["name"].startswith("本地每日推荐")
+        assert local[0]["name"] == "本地音乐每日推荐"
         assert local[0]["trackCount"] == 50
         guid = local[0]["guid"]
 
@@ -136,7 +137,7 @@ def test_playlist_list_injects_local_daily_and_stream_serves_file(wired):
         # detail / batch-detail 回显
         r4 = client.get(f"/music/api/v1/playlist/detail?guid={guid}")
         assert r4.status_code == 200
-        assert r4.json()["data"]["name"].startswith("本地每日推荐")
+        assert r4.json()["data"]["name"] == "本地音乐每日推荐"
         r5 = client.get(f"/music/api/v1/playlist/batch-detail?guids={guid}")
         assert r5.status_code == 200
         assert any(dailyrec.is_local_daily_playlist_guid(str(x.get("guid") or ""))

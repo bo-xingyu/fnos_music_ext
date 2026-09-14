@@ -3,6 +3,46 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.9.12] - 2026-09-14
+
+**两处体验优化：歌单名去掉日期、文件位置显示真实路径。**
+
+### ① 本地每日推荐歌单名不带日期了
+
+之前的歌单名叫 `本地每日推荐 09-14`，每天一变。副作用是：客户端侧每天像多了一张新歌单，旧的几张看着又像「昨天过期的」，
+而用户其实只想每天打开同一张、内容自动换。现在固定为 **本地音乐每日推荐**。
+
+内容照样每天换：随机种子仍然是 `random.Random(f"{user_guid}:{day}")`，guid 仍带日期
+（`online:playlist:localdaily:{day}:{user}`），跨天自动重新抽签，无需任何手动操作。
+
+### ② 曲目「文件位置」显示真实路径
+
+之前点开曲目详情，文件位置是：
+
+```
+local/835b6c756ffb7c6b3fde7851883519206e458ab1.mp3
+```
+
+这是我们内部按绝对路径 sha1 造的假路径——后缀是真的（客户端靠它判断容器格式），路径是假的。
+现在改为写入**真实绝对路径**，并同时给出顶层 `path` / `filePath`，客户端无论读哪个字段都能拿到真实位置：
+
+```python
+real_path = str(entry.get("path") or "")
+spec_path = real_path or f"local/{_sha}.{play_format}"   # 索引里没存路径时回退
+audio_spec = {"path": spec_path, ...}
+track["path"]     = spec_path
+track["filePath"] = real_path or spec_path
+```
+
+播放链路不受影响：`/track/stream` 一直是按 guid 反查真实路径的，不依赖 audioSpec.path。
+本地日推缓存 schema 从 3 升到 4，旧缓存自动重建（缓存里的曲目也补上了 `path` / `filePath`）。
+
+### 测试
+
+- `test_local_daily.py`：歌单名断言改为 `本地音乐每日推荐`，并确认不同日期仍产出不同内容（名字不变、内容变）。
+- `test_local_files.py`：新增 `test_local_metadata_path_is_real_absolute_path`、
+  `test_local_metadata_path_falls_back_when_index_has_no_path`。
+
 ## [2.9.11] - 2026-09-14
 
 **修掉本地每日推荐「封面不是真实图」——真正的病根不在封面，在字段形状。**

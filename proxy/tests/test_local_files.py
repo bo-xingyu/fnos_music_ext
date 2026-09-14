@@ -186,3 +186,30 @@ def test_local_metadata_title_falls_back_to_filename(tmp_path):
     assert track["title"] == "歌手 - 歌"
     assert track["album"]["name"]
     assert isinstance(track["genres"], list)
+
+
+def test_local_metadata_path_is_real_absolute_path(tmp_path):
+    """客户端「文件位置」必须显示真实路径，不能是 local/<sha1>.mp3 这种假路径。
+
+    v2.9.12 之前 audioSpec.path 写的是 local/<sha1>.<ext>，后缀是真的但路径是
+    假的——用户点开歌曲详情看到的「文件位置」毫无意义。播放走 /track/stream
+    按 guid 反查路径，本来就不依赖这个字段，改成真实路径没有任何风险。
+    """
+    song = _mk(tmp_path, "许嵩 - 庐州月.flac")
+    guid = "local:file:" + local_files.sha1_of_path(song)
+    body = app.build_local_metadata_payload(guid, {
+        "path": song, "ext": "flac", "duration": 200,
+        "duration_ms": 200000, "size": 1024,
+    })
+    track = body["data"]["track"]
+    assert track["audioSpec"]["path"] == song, "必须是真实绝对路径"
+    assert track["path"] == song
+    assert track["filePath"] == song
+    assert not track["audioSpec"]["path"].startswith("local/"), "不能再是假路径"
+    assert track["audioSpec"]["path"].endswith(".flac"), "后缀仍要真实（ll() 靠它解析容器）"
+
+
+def test_local_metadata_path_falls_back_when_index_has_no_path():
+    """索引里没存路径时退回 local/<sha>.<ext>，绝不留空（空 path 拿不到容器格式）。"""
+    body = app.build_local_metadata_payload("local:file:deadbeef", {"ext": "mp3"})
+    assert body["data"]["track"]["audioSpec"]["path"] == "local/deadbeef.mp3"

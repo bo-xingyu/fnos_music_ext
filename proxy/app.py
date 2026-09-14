@@ -1812,8 +1812,18 @@ def build_local_metadata_payload(guid: str, entry: dict) -> dict:
     #      早期这里填秒，客户端把 240 读成 240 毫秒 → 判定不可播。
     #   2) audioSpec.path 必须带真实后缀（"飞牛 ll() 用 path 解析 extension"）；
     #      早期这里整个 audioSpec 是另起炉灶的简版，缺 path 就拿不到容器格式。
+    #
+    # v2.9.12：path 改用**真实绝对路径**（/vol1/.../许嵩 - 庐州月.flac），
+    # 不再用 local/<sha1>.<ext> 这种假路径。理由：
+    #   * 后缀照样真实，ll() 解析 extension 不受影响；
+    #   * 客户端「文件位置」显示的就是这个字段，假路径对用户毫无意义；
+    #   * 播放走 /track/stream 拦截（按 guid 反查路径），本来就不依赖它。
+    # 索引里万一没存路径，退回假路径保底，绝不留空（空 path = 拿不到容器格式）。
+    _sha = guid.split("local:file:", 1)[-1]
+    real_path = str(entry.get("path") or "")
+    spec_path = real_path or f"local/{_sha}.{play_format}"
     audio_spec = {
-        "path": f"local/{guid.split('local:file:', 1)[-1]}.{play_format}",
+        "path": spec_path,   # 真实绝对路径（客户端「文件位置」显示的就是它）
         "format": play_format,
         "codec": play_format,
         "container": play_format,
@@ -1829,6 +1839,10 @@ def build_local_metadata_payload(guid: str, entry: dict) -> dict:
     track = {
         "guid": guid,
         "id": guid,
+        # 顶层也给一份真实路径：不同版本客户端读的字段不一样，
+        # audioSpec.path / path / filePath 都给上，哪个被读到都是真实路径。
+        "path": spec_path,
+        "filePath": real_path or spec_path,
         "title": title,
         "name": title,
         "artist": artist,
