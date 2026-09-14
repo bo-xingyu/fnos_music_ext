@@ -834,6 +834,11 @@ async def _probe_proxy_hls() -> dict:
     return await _probe_proxy_path("/_ext/hls", timeout=10.0)
 
 
+async def _probe_proxy_playstart() -> dict:
+    """play-start 记账：实际播了几首、折叠掉多少续传。"""
+    return await _probe_proxy_path("/_ext/playstart", timeout=10.0)
+
+
 async def _probe_proxy_authorized() -> dict:
     """向代理进程取「飞牛应用授权目录」状态快照。
 
@@ -1039,6 +1044,7 @@ async def api_diag(request: Request):
         "local_first": await _probe_proxy_local_first(),
         "prefetch": await _probe_proxy_prefetch(),
         "hls": await _probe_proxy_hls(),
+        "playstart": await _probe_proxy_playstart(),
         "musicbox": {
             "url": MUSICBOX_URL,
             "healthz": mb,
@@ -2468,6 +2474,19 @@ function runDiag(auto){
                  +(hs.bypass_enabled?"":"——打开后跳过转码直出原始流；本地多为 FLAC，"
                   +"放不出来就关掉，且直出不省流量"));
         if(!hs.sessions) out.push("  （还没有 HLS 播放记录：播一首飞牛本地曲库的歌再来看）");
+      }
+      out.push("");
+      out.push("-- 播放起步日志（play-start 去重）--");
+      var ps=d.playstart||{};
+      if(!ps.reachable){ out.push("  取不到代理侧快照: "+JSON.stringify(ps)); }
+      else{
+        out.push("  实际播放       : "+ps.plays+" 首（日志里的 play-start 行数）");
+        out.push("  折叠续传       : "+ps.folded+" 次（同一首歌的 Range 续传，不再刷屏）");
+        out.push("  每次播放请求数 : "+ps.requests_per_play+"（窗口 "+ps.window_s+"s 内合并）");
+        out.push("  ★ 怎么读：一次播放本来就要分几个 Range 拉，比值 2~10 都正常；"
+                +"到几十就说明客户端在反复重开连接，那才是卡顿信号。"
+                +"标记 local 表示音频走本地文件（不吃预热），cold/warm 只用于走网易云的播放。");
+        if(!ps.plays) out.push("  （还没有播放记录：播一首歌再来看）");
       }
       out.push("");
       out.push("-- 飞牛应用授权目录（开放能力 / api-scope）--");

@@ -2256,6 +2256,21 @@ async def ext_hls():
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
 
 
+@app.get("/_ext/playstart")
+async def ext_playstart():
+    """play-start 的记账（v2.9.24）：实际播了几首、折叠掉多少续传请求。
+
+    日志里 grep 'play-start' 以前一首歌能刷出十行（全是同一次播放的 Range 续传），
+    「播了几首」被放大十倍、冷/热标记也失真。这里给出折叠前后的对比，用来确认
+    去重有没有生效、以及一次播放到底产生了几个请求。
+    """
+    try:
+        return {"ok": True, "data": play_start_stats()}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("playstart diag failed: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
+
+
 @app.get("/_ext/authorized")
 async def ext_authorized(request: Request):
     """飞牛「应用授权目录」状态快照（v2.9.4）。
@@ -2901,6 +2916,74 @@ def _schedule_list_prefetch(request: Request, context_guid: str) -> None:
                      context_guid, type(exc).__name__, exc)
 
 
+# ---------------------------------------------------------------------------
+# play-start 日志去重（v2.9.24）
+#
+# 一次播放客户端会连发十几个 Range 请求（ijk 起播探测 + 续传），每一个都完整走
+# 一遍 /track/stream。真机上看到同一首歌 600ms 内刷出 10 行 play-start，全是
+# 同一次播放的续传——「播了几首」被放大十倍，冷/热标记也跟着失真（本地直出压根
+# 没联网、不吃预热，却一律被标成 cold，读起来像「因为没预热所以慢」）。
+#
+# 这里按「同一 guid 的时间窗」折叠：窗口内第一次落日志并计 plays，续传只累加
+# folded。口径与 prefetch.note_play 的 PLAY_DEDUPE_WINDOW 一致（默认 600s），
+# 于是日志里的 play-start 行数 ≈ 实际播放首数。
+# ---------------------------------------------------------------------------
+_PLAY_START_AT: dict[str, float] = {}
+_PLAY_START_STATS: dict[str, Any] = {"logged": 0, "folded": 0}
+_PLAY_START_MAX = 512
+
+
+def play_start_window() -> float:
+    """同一首歌多久内的重复请求算「同一次播放」（秒）；0 = 不去重。
+
+    调小可以更真实地反映「重复播放同一首」的次数，代价是续传又会刷屏。
+    """
+    return max(0.0, _float("FNMUSIC_PLAY_START_DEDUPE_S", 600.0))
+
+
+def _play_start_fresh(guid: str, now: float | None = None, consume: bool = True) -> bool:
+    """这次请求是不是这首歌「新的一次播放」。
+
+    consume=False 时只窥探、不占位——用来决定同一次播放里的旁路日志（比如
+    local-first skip）要不要重复打，而不影响主 play-start 行的去重。
+    """
+    g = str(guid or "").strip()
+    if not g:
+        return True
+    now = time.monotonic() if now is None else now
+    window = play_start_window()
+    last = float(_PLAY_START_AT.get(g) or 0.0)
+    if last and window > 0 and (now - last) < window:
+        if consume:
+            _PLAY_START_STATS["folded"] = int(_PLAY_START_STATS.get("folded", 0)) + 1
+        return False
+    if consume:
+        _PLAY_START_AT[g] = now
+        if len(_PLAY_START_AT) > _PLAY_START_MAX:
+            for k in sorted(_PLAY_START_AT, key=lambda kk: _PLAY_START_AT[kk])[:_PLAY_START_MAX // 2]:
+                _PLAY_START_AT.pop(k, None)
+        _PLAY_START_STATS["logged"] = int(_PLAY_START_STATS.get("logged", 0)) + 1
+    return True
+
+
+def play_start_stats() -> dict[str, Any]:
+    """play-start 的记账：落了几行、折叠掉多少续传。
+
+    requests_per_play 是「一次播放平均产生几个 stream 请求」。它大于 1 是**正常**
+    的（客户端本来就要分 Range 拉），但异常大（几十）就说明客户端在反复重开连接
+    ——那才是真正的卡顿信号。
+    """
+    logged = int(_PLAY_START_STATS.get("logged", 0))
+    folded = int(_PLAY_START_STATS.get("folded", 0))
+    return {
+        "plays": logged,
+        "folded": folded,
+        "window_s": round(play_start_window(), 1),
+        "tracked": len(_PLAY_START_AT),
+        "requests_per_play": round((logged + folded) / logged, 2) if logged else 0.0,
+    }
+
+
 @app.get("/music/api/v1/track/stream")
 @app.get("/music/api/v1/track/stream/{subpath:path}")
 async def stream_track(request: Request):
@@ -2917,8 +3000,12 @@ async def stream_track(request: Request):
             or local_files.resolve(guid)
         if local_path and os.path.isfile(local_path):
             ext = os.path.splitext(local_path)[1].lstrip(".") or "mp3"
-            logger.info("play-start local-daily %s %.0fms", guid,
-                        (time.monotonic() - started) * 1000.0)
+            # v2.9.24：只在本次播放的第一个请求落一行（续传 Range 不再刷屏），
+            # 且标 local——本地文件直出没有联网、也不吃预热，标 cold 会读成
+            # 「因为没预热才慢」，而实际上它压根没走网络。
+            if _play_start_fresh(guid):
+                logger.info("play-start local-daily %s %.0fms local", guid,
+                            (time.monotonic() - started) * 1000.0)
             return serve_file_with_range(local_path, request.headers.get("range"),
                                          media_type_for_ext(ext))
         return await forward_to_upstream(
@@ -2931,23 +3018,36 @@ async def stream_track(request: Request):
             request, get_upstream_client(request.app),
             timeout=PLAYBACK_FORWARD_TIMEOUT_S, label="local-stream")
 
-    def _log_play(source: str) -> None:
-        """播放起步留证：来源 + 总耗时 + 是否吃到预热。
+    def _log_play(source: str, tag: str | None = None) -> bool:
+        """播放起步留证：来源 + 总耗时 + 音频到底走了哪条路。
 
         cold/warm 直接写在 play-start 行里 —— 想评估预热有没有用，
         grep 'play-start' 就能按这个标记把两组耗时分开比，不用再去对日志。
+
+        v2.9.24 两处修正：
+          ① 一次播放客户端会连发十几个 Range 请求，以前每个都落一行，日志里
+             「播了几首」被放大十倍；现在窗口内只记第一次（见 _play_start_fresh）。
+          ② 本地直出（local-first / local-daily / tee-cache / local-fallback）
+             没有联网、也不吃预热，以前一律被标 cold，读起来像「因为没预热才慢」；
+             现在显式标 local，cold/warm 只留给真正走网易云的播放。
+
+        返回是否真的落了行——调用方据此决定旁路日志（如 local-first hit）要不要跟。
         """
-        _w = prefetch.warming_seconds(guid) if prefetch.enabled() else None
-        _tag = " warm" if _w is not None else " cold"
+        if not _play_start_fresh(guid):
+            return False
+        if tag is None:
+            _w = prefetch.warming_seconds(guid) if prefetch.enabled() else None
+            tag = " warm" if _w is not None else " cold"
         logger.info("play-start %s %s %.0fms%s", source, guid,
-                    (time.monotonic() - started) * 1000.0, _tag)
+                    (time.monotonic() - started) * 1000.0, tag)
+        return True
 
     range_header = request.headers.get("range")
     cached = find_cache_file(guid)
     if cached:
         cached = promote_cache_hit(guid, cached)
         ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
-        _log_play("tee-cache")
+        _log_play("tee-cache", " local")
         return serve_file_with_range(cached, range_header, media_type_for_ext(ext))
 
     src = source_from_online_guid(guid)
@@ -2996,13 +3096,19 @@ async def stream_track(request: Request):
         decision = quality.resolve(request, db_path=local_db)
         if not local_library.serves_request(hit, decision.get("level") or "",
                                             decision.get("network") or ""):
-            logger.info("local-first skip: %s 本地 %s 不适用（level=%s network=%s）",
-                        guid, hit.get("ext"), decision.get("level"),
-                        decision.get("network"))
+            # 同一次播放里的十几个 Range 请求只提示一次（consume=False：不占用
+            # play-start 的去重额度，在线链路那行仍会正常落）
+            if _play_start_fresh(guid, consume=False):
+                logger.info("local-first skip: %s 本地 %s 不适用（level=%s network=%s）",
+                            guid, hit.get("ext"), decision.get("level"),
+                            decision.get("network"))
+            else:
+                logger.debug("local-first skip（续传）: %s", guid)
             return None
         try:
-            _log_play(f"local-first({phase},ext={hit.get('ext')},level={decision.get('level')})")
-            logger.info("local-first hit: %s -> %s", guid, hit.get("path"))
+            if _log_play(f"local-first({phase},ext={hit.get('ext')},"
+                         f"level={decision.get('level')})", " local"):
+                logger.info("local-first hit: %s -> %s", guid, hit.get("path"))
             return serve_file_with_range(hit["path"], range_header,
                                          media_type_for_ext(hit.get("ext") or "mp3"))
         except Exception as exc:  # noqa: BLE001 - 本地文件异常则回落在线链路
@@ -3041,7 +3147,7 @@ async def stream_track(request: Request):
             return late
 
     def _serve_local_fallback(reason: str):
-        _log_play(f"local-fallback({reason})")
+        _log_play(f"local-fallback({reason})", " local")
         logger.info("local-first fallback (%s): %s -> %s", reason, guid,
                     (local_hit or {}).get("path"))
         return serve_file_with_range(
