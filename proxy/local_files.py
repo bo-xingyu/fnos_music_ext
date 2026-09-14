@@ -145,6 +145,27 @@ def lookup(guid: str) -> dict | None:
     return ent
 
 
+def known(guid: str) -> bool:
+    """索引里有没有这个 guid（不碰文件系统，用于快速判断要不要补写）。"""
+    sha = str(guid or "").split("local:file:", 1)[-1].strip()
+    return bool(sha) and sha in _load()
+
+
+def record_tracks(tracks: "list[dict]") -> None:
+    """从已构建好的曲目列表（带 _local_path）补写索引，已有则跳过。"""
+    if not tracks:
+        return
+    first = str((tracks[0] or {}).get("guid") or "")
+    if known(first):
+        return
+    record_files([{
+        "path": str(t.get("_local_path") or ""),
+        "title": str(t.get("title") or ""),
+        "artist": str(t.get("artist") or ""),
+        "ext": str(t.get("ext") or t.get("format") or "").lstrip(".").lower(),
+    } for t in tracks if t.get("_local_path")])
+
+
 def resolve(guid: str) -> str | None:
     ent = lookup(guid)
     return str(ent.get("path") or "") if ent else None

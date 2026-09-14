@@ -203,3 +203,33 @@ def test_scan_ignores_non_audio_and_empty_files(tmp_path):
     got = dailyrec._scan_library_audio_files(str(lib))
     assert [f["title"] for f in got] == ["真歌"]
     assert got[0]["artist"] == "歌手"
+
+
+def test_old_schema_cache_is_discarded_and_rebuilt(wired, monkeypatch):
+    """升级后旧格式缓存必须自动重建，而不是继续喂 duration=0 的旧数据。
+
+    这不是洁癖：get_or_build 命中缓存就直接 return、不再扫描，于是
+    v2.9.5 新加的本地文件索引永远写不上、列表里时长还是 0。
+    """
+    day = dailyrec.today_key()
+    b1 = dailyrec.get_or_build_local_daily("u1", wired)
+    assert b1["status"] == "ready"
+
+    # 手工伪造一份 v2.9.4 时代的缓存（无 schema 字段 + duration 全 0）
+    legacy = dict(b1)
+    legacy.pop("schema", None)
+    legacy["tracks"] = [{**t, "duration": 0, "size": 0} for t in b1["tracks"]]
+    dailyrec.save_local_daily_cache("u1", day, legacy)
+
+    b2 = dailyrec.get_or_build_local_daily("u1", wired)
+    assert b2["schema"] == dailyrec.LOCAL_DAILY_SCHEMA, "必须重建为新格式"
+    assert all(t["duration"] > 0 or t["size"] > 0 for t in b2["tracks"]), \
+        "重建后的曲目必须带真时长/体积"
+
+    # 重建顺带把本地文件索引补上——metadata / cover 全靠它反查真实文件
+    try:
+        from proxy import local_files
+    except ImportError:
+        import local_files  # type: ignore
+    assert local_files.resolve(str(b2["tracks"][0]["guid"])), \
+        "重建后必须能在索引里查到首曲的真实路径"

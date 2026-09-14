@@ -416,11 +416,7 @@ def _record_local_files(files: "list[dict]") -> None:
     找回真实文件。写失败不影响歌单生成（退化成当天 bundle 内查找）。
     """
     try:
-        try:
-            from . import local_files  # type: ignore
-        except ImportError:  # 扁平运行形态
-            import local_files  # type: ignore
-        local_files.record_files(files)
+        _local_files_mod().record_files(files)
     except Exception as exc:  # noqa: BLE001
         logger.warning("写入本地文件索引失败: %s: %s", type(exc).__name__, exc)
 
@@ -445,10 +441,7 @@ def build_local_daily_tracks(library_dir: str, limit: int, user_guid: str,
 
     # 时长/体积必须是真值：客户端拿 duration=0 会判定「不可播」，点了没反应，
     # 而且列表里也不显示时长。只给入选的这几首读标签（每天一次，成本可忽略）。
-    try:  # 作为包导入（proxy.recommend）
-        from . import local_files  # type: ignore
-    except ImportError:  # 扁平运行形态（uvicorn --app-dir proxy）
-        import local_files  # type: ignore
+    local_files = _local_files_mod()
 
     tracks: list[dict] = []
     for f in pool[:limit]:
@@ -512,6 +505,20 @@ def local_daily_cache_path(user_guid: str, day: str) -> str:
     return os.path.join(recommend_cache_dir(), _safe_user_name(user_guid), f"local-{day}.json")
 
 
+# 缓存格式版本。
+# 1 = v2.9.0~v2.9.4：tracks 里 duration / size 恒为 0，且没有写过本地文件索引；
+# 2 = v2.9.5：duration / size / bitrate 为真值，构建时写 local_files 索引。
+# ⚠️ 升级时旧缓存不会自动重扫（get_or_build 命中缓存就直接 return），于是
+# 「装了新版本但列表里时长还是 0、索引也没建」。靠版本号显式判废，让它在
+# 下一次拉歌单列表时静默重建——用户不需要点任何按钮。
+LOCAL_DAILY_SCHEMA = 2
+
+
+def _cache_is_stale(data: dict) -> bool:
+    """旧格式缓存判废：缺 schema 字段，或版本落后。"""
+    return int(data.get("schema") or 1) < LOCAL_DAILY_SCHEMA
+
+
 def load_local_daily_cache(user_guid: str, day: str) -> dict | None:
     path = local_daily_cache_path(user_guid, day)
     if not os.path.exists(path):
@@ -524,6 +531,10 @@ def load_local_daily_cache(user_guid: str, day: str) -> dict | None:
         if str(data.get("day") or "") != day:
             return None
         if not isinstance(data.get("tracks"), list) or not data.get("tracks"):
+            return None
+        if _cache_is_stale(data):
+            logger.info("local daily 缓存为旧格式(schema=%s< %s)，丢弃重建: %s",
+                        data.get("schema") or 1, LOCAL_DAILY_SCHEMA, path)
             return None
         return data
     except Exception as e:
@@ -565,6 +576,22 @@ def empty_local_daily_bundle(user_guid: str, reason: str = "") -> dict:
     }
 
 
+def _local_files_mod():
+    try:  # 作为包导入（proxy.recommend）
+        from . import local_files  # type: ignore
+    except ImportError:  # 扁平运行形态（uvicorn --app-dir proxy）
+        import local_files  # type: ignore
+    return local_files
+
+
+def _ensure_index_from_cache(tracks: list[dict]) -> None:
+    """缓存命中时补写本地文件索引（幂等；失败不影响歌单返回）。"""
+    try:
+        _local_files_mod().record_tracks(tracks)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("补写本地文件索引失败: %s: %s", type(exc).__name__, exc)
+
+
 def get_or_build_local_daily(user_guid: str, library_dir: str) -> dict:
     """返回当天的本地每日推荐 bundle（同步——只扫本地磁盘，零网络）。"""
     day = today_key()
@@ -573,6 +600,9 @@ def get_or_build_local_daily(user_guid: str, library_dir: str) -> dict:
 
     cached = load_local_daily_cache(user_guid, day)
     if cached and cached.get("tracks"):
+        # 缓存命中不会重新扫描，索引却可能不在（清过缓存目录 / 换过运行目录）。
+        # 顺手补一次：已存在则直接返回，几乎零成本。
+        _ensure_index_from_cache(cached["tracks"])
         return cached
 
     if not local_daily_enabled():
@@ -602,9 +632,12 @@ def get_or_build_local_daily(user_guid: str, library_dir: str) -> dict:
         ),
         "tracks": tracks,
         "source": "local_daily",
+        "schema": LOCAL_DAILY_SCHEMA,
         "builtAt": int(time.time()),
     }
     save_local_daily_cache(user_guid, day, payload)
+    # 顺手把扫描结果写进本地文件索引的兜底：即使上面的缓存读路径被绕过
+    # （例如清了缓存但索引还在），metadata / cover 也能反查到真实文件。
     logger.info("local daily recommend %s tracks=%d (library=%s)",
                 guid, len(tracks), library_dir)
     return payload
