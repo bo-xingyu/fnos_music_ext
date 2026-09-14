@@ -42,6 +42,9 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     # v2.9.20：流量网络下本地优先只吃有损——本地 FLAC 30~40MB，在线 320k 只有 ~9MB，
     # 数据网络下体积才是决定因素（真机实测本地无损起步 7~8s）
     ("FNMUSIC_LOCAL_FIRST_CELLULAR_LOSSY_ONLY", "true"),
+    # v2.9.23：播飞牛本地曲库时是否跳过官方实时转码（伪 HLS 直出原始流）。
+    # 默认 false——客户端主动要 HLS 通常意味着它吃不下原始容器/编码（本地多为 FLAC）。
+    ("FNMUSIC_HLS_LOCAL_BYPASS", "false"),
     ("FNMUSIC_PREFETCH_NEXT", "true"),
     # --- 更多口径歌单 / 账户歌单（v2.2 新增）---
     ("FNMUSIC_NETEASE_CHANNELS", "mine,toplist,category"),
@@ -85,6 +88,9 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     # v2.9.20：流量网络下本地优先只吃有损——本地 FLAC 30~40MB，在线 320k 只有 ~9MB，
     # 数据网络下体积才是决定因素（真机实测本地无损起步 7~8s）
     ("FNMUSIC_LOCAL_FIRST_CELLULAR_LOSSY_ONLY", "true"),
+    # v2.9.23：播飞牛本地曲库时是否跳过官方实时转码（伪 HLS 直出原始流）。
+    # 默认 false——客户端主动要 HLS 通常意味着它吃不下原始容器/编码（本地多为 FLAC）。
+    ("FNMUSIC_HLS_LOCAL_BYPASS", "false"),
     # 本地曲库索引的内存缓存时长（秒）
     ("FNMUSIC_LOCAL_INDEX_TTL", "300"),
     # 封面缩图边长（像素）：网易云 CDN 服务端缩图（?param=NyN）。原图几百 KB
@@ -133,7 +139,7 @@ NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOCAL_DAILY", "FN
                 "FNMUSIC_DOWNLOAD_", "FNMUSIC_FAV_",
                 "FNMUSIC_QUALITY_", "FNMUSIC_WATCHDOG_", "FNMUSIC_URL_CACHE_",
                 "FNMUSIC_CHANNEL_LIST_", "FNMUSIC_REMOTE_AS_", "FNMUSIC_LOCAL_",
-                "FNMUSIC_PREFETCH_", "FNMUSIC_COVER_", "FNMUSIC_UNKNOWN_AS_")
+                "FNMUSIC_PREFETCH_", "FNMUSIC_COVER_", "FNMUSIC_UNKNOWN_AS_", "FNMUSIC_HLS_")
 
 # v2.0 已废弃的配置项：升级合并时从 .env 中清理，避免残留误导。
 # 只删「确定已无代码读取」的键；FNMUSIC_MODE / BASE_IMAGE / PIP_INDEX 等 docker 相关项保留。

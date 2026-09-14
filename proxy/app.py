@@ -2241,6 +2241,21 @@ async def ext_prefetch():
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
 
 
+@app.get("/_ext/hls")
+async def ext_hls():
+    """官方 HLS 实时转码的耗时观测（v2.9.23）。
+
+    播飞牛本地曲库时官方后端会把 FLAC 实时转码成 fMP4 分片。用户反馈「慢」时，
+    关键是分清**转码启动慢**（first_ms，点下去要等）还是**播出后跟不上**
+    （seg_ms，有尖刺就说明转码吞吐不够）。两者解法完全不同。
+    """
+    try:
+        return {"ok": True, "data": hls_stats()}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("hls diag failed: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
+
+
 @app.get("/_ext/authorized")
 async def ext_authorized(request: Request):
     """飞牛「应用授权目录」状态快照（v2.9.4）。
@@ -3097,6 +3112,107 @@ async def stream_track(request: Request):
     )
 
 
+# ---------------------------------------------------------------------------
+# 官方 HLS 实时转码的观测（v2.9.23）
+#
+# 播飞牛本地曲库的歌时，客户端会带 x-trim-ijk-transcode-hls，官方后端把 FLAC
+# **实时转码成 fMP4 分片**再一片片喂给客户端。这条路径以前完全是黑盒：只知道
+# 「慢」，不知道是**转码启动慢**（点下去要等）还是**播出后跟不上**（分片耗时）。
+# 两者的解法完全不同，没有这个区分就只能瞎猜。
+# ---------------------------------------------------------------------------
+_HLS_STATS: dict[str, Any] = {
+    "sessions": 0,       # 拉过多少次 m3u8（≈ 建立了多少个转码会话）
+    "segments": 0,       # 转发了多少个分片
+    "seg_ms_sum": 0.0,   # 分片转发总耗时（看平均）
+    "seg_ms_max": 0.0,   # 最慢的那一片（看抖动，转码跟不上就体现为尖刺）
+    "first_ms_sum": 0.0,  # 「m3u8 → 首个分片」间隔 = 转码启动开销
+    "first_ms_max": 0.0,
+    "first_n": 0,
+    "bypassed": 0,       # 绕过官方转码、直出原始流的次数
+}
+_HLS_PLAYLIST_AT: dict[str, float] = {}
+# 绕过转码时 m3u8 需要时长，而我们没有官方曲目的 info；先记下见过的 guid → 时长
+_HLS_DURATION: dict[str, int] = {}
+
+
+def hls_local_bypass() -> bool:
+    """是否绕过官方实时转码，用单分片伪 HLS 直接出原始流。
+
+    **默认关**：客户端主动要求 HLS 转码，通常意味着它不能直接吃这个容器/编码
+    （本地多为 FLAC）。直出有可能直接放不出来。但转码启动有固定开销，窄管道上
+    用户感知就是「点下去要等好几秒」，所以给一个开关自己试：能播就留着，放不出
+    来就关掉。另外直出是原始码率（无损 30MB 起），数据网络下并不会省流量。
+    """
+    return str(os.environ.get("FNMUSIC_HLS_LOCAL_BYPASS", "false") or "false") \
+        .strip().lower() in ("true", "1", "yes", "on")
+
+
+def _hls_known_duration(guid: str) -> int:
+    return int(_HLS_DURATION.get(str(guid or "")) or 0) or 240
+
+
+def _hls_direct_playlist(guid: str, duration_s: int) -> Response:
+    """单分片伪 HLS：整首作为一个分片指回 /track/stream，跳过转码。"""
+    stream_url = f"/music/api/v1/track/stream?guid={quote(str(guid), safe='')}"
+    return Response(
+        content=(
+            "#EXTM3U\n"
+            "#EXT-X-VERSION:3\n"
+            f"#EXT-X-TARGETDURATION:{max(int(duration_s), 1)}\n"
+            "#EXT-X-PLAYLIST-TYPE:VOD\n"
+            "#EXT-X-MEDIA-SEQUENCE:0\n"
+            f"#EXTINF:{int(duration_s):.3f},\n"
+            f"{stream_url}\n"
+            "#EXT-X-ENDLIST\n"
+        ),
+        media_type="application/vnd.apple.mpegurl",
+    )
+
+
+def _hls_note_segment(guid: str, filename: str, ms: float) -> None:
+    """记一笔分片耗时；首个分片额外记「距 m3u8 多久」= 转码启动开销。"""
+    st = _HLS_STATS
+    st["segments"] = int(st.get("segments", 0)) + 1
+    st["seg_ms_sum"] = float(st.get("seg_ms_sum", 0.0)) + ms
+    if ms > float(st.get("seg_ms_max", 0.0)):
+        st["seg_ms_max"] = ms
+    name = str(filename or "")
+    # 必须先去掉扩展名再取数字：`00000.m4s` 里那个 `4` 也是数字，直接 whole-string
+    # 取会变成序号 4，首个分片就永远识别不出来（启动开销恒为 0，等于白测）。
+    digits = "".join(ch for ch in os.path.splitext(name)[0] if ch.isdigit())
+    try:
+        seq = int(digits) if digits else -1
+    except ValueError:
+        seq = -1
+    if seq >= 0 and seq <= 1:
+        started = float(_HLS_PLAYLIST_AT.get(str(guid)) or 0.0)
+        if started:
+            gap = (time.time() - started) * 1000.0
+            st["first_n"] = int(st.get("first_n", 0)) + 1
+            st["first_ms_sum"] = float(st.get("first_ms_sum", 0.0)) + gap
+            if gap > float(st.get("first_ms_max", 0.0)):
+                st["first_ms_max"] = gap
+            _HLS_PLAYLIST_AT.pop(str(guid), None)
+
+
+def hls_stats() -> dict[str, Any]:
+    st = _HLS_STATS
+    segs = int(st.get("segments", 0))
+    first_n = int(st.get("first_n", 0))
+    return {
+        "sessions": int(st.get("sessions", 0)),
+        "segments": segs,
+        "seg_ms_avg": round(float(st.get("seg_ms_sum", 0.0)) / segs, 1) if segs else 0.0,
+        "seg_ms_max": round(float(st.get("seg_ms_max", 0.0)), 1),
+        # 这个数字就是「点下去到出声」的等待：官方后端初始化转码器的开销
+        "first_ms_avg": round(float(st.get("first_ms_sum", 0.0)) / first_n, 1) if first_n else 0.0,
+        "first_ms_max": round(float(st.get("first_ms_max", 0.0)), 1),
+        "first_n": first_n,
+        "bypassed": int(st.get("bypassed", 0)),
+        "bypass_enabled": hls_local_bypass(),
+    }
+
+
 @app.get("/music/api/v1/track/hls/{guid}/preset.m3u8")
 @app.get("/music/api/v1/track/hls/{guid}/{filename}")
 async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
@@ -3118,15 +3234,28 @@ async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
         )
         return Response(content=playlist, media_type="application/vnd.apple.mpegurl")
     if not is_online_guid(guid):
+        # 飞牛**官方本地曲目**（32 位 hex guid）：转发给官方后端做**实时转码**
+        # （FLAC → fMP4 分片）。这条路径以前完全没有观测，慢在哪一步只能靠猜。
+        if hls_local_bypass() and str(filename).lower().endswith(".m3u8"):
+            _HLS_STATS["bypassed"] = int(_HLS_STATS.get("bypassed", 0)) + 1
+            return _hls_direct_playlist(guid, _hls_known_duration(guid))
         client = get_upstream_client(request.app)
         if str(filename).lower().endswith(".m3u8"):
+            _HLS_PLAYLIST_AT[guid] = time.time()
+            if len(_HLS_PLAYLIST_AT) > 64:
+                _HLS_PLAYLIST_AT.clear()
+            _HLS_STATS["sessions"] = int(_HLS_STATS.get("sessions", 0)) + 1
             # m3u8 很小且是排障关键：整包透传 + 日志留证（见 forward_buffered）
             return await forward_buffered(
                 request, client, timeout=PLAYBACK_FORWARD_TIMEOUT_S,
                 label="hls-playlist", body_sniff=240)
         # 分片可能很大，流式转发 + 状态码留证
-        return await forward_to_upstream(
-            request, client, timeout=PLAYBACK_FORWARD_TIMEOUT_S, label="hls-segment")
+        t0 = time.time()
+        try:
+            return await forward_to_upstream(
+                request, client, timeout=PLAYBACK_FORWARD_TIMEOUT_S, label="hls-segment")
+        finally:
+            _hls_note_segment(guid, filename, (time.time() - t0) * 1000.0)
 
     info = await _online_info(request, guid)
     duration_s = 0

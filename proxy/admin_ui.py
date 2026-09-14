@@ -829,6 +829,11 @@ async def _probe_proxy_prefetch() -> dict:
     return await _probe_proxy_path("/_ext/prefetch", timeout=10.0)
 
 
+async def _probe_proxy_hls() -> dict:
+    """官方 HLS 实时转码耗时（区分「转码启动慢」与「播出后跟不上」）。"""
+    return await _probe_proxy_path("/_ext/hls", timeout=10.0)
+
+
 async def _probe_proxy_authorized() -> dict:
     """向代理进程取「飞牛应用授权目录」状态快照。
 
@@ -1033,6 +1038,7 @@ async def api_diag(request: Request):
         "authorized": await _probe_proxy_authorized(),
         "local_first": await _probe_proxy_local_first(),
         "prefetch": await _probe_proxy_prefetch(),
+        "hls": await _probe_proxy_hls(),
         "musicbox": {
             "url": MUSICBOX_URL,
             "healthz": mb,
@@ -2444,6 +2450,24 @@ function runDiag(auto){
           out.push("     "+(r.ok?"[ok] ":"[fail] ")+r.guid+" "+r.ms+"ms"+(r.detail?(" "+r.detail):""));
         });
         if(!pf.plays) out.push("  （还没有在线播放记录：播一首网易云的歌再来看）");
+      }
+      out.push("");
+      out.push("-- 官方 HLS 实时转码（播飞牛本地曲库时）--");
+      var hs=d.hls||{};
+      if(!hs.reachable){ out.push("  取不到代理侧快照: "+JSON.stringify(hs)); }
+      else{
+        out.push("  会话/分片      : "+hs.sessions+" 次会话 / "+hs.segments+" 个分片");
+        out.push("  转码启动开销   : 平均 "+hs.first_ms_avg+"ms  最大 "+hs.first_ms_max+"ms"
+                 +"（= 从客户端拿到 m3u8 到取回第一个分片的间隔）");
+        out.push("  分片转发耗时   : 平均 "+hs.seg_ms_avg+"ms  最大 "+hs.seg_ms_max+"ms");
+        out.push("  ★ 怎么读：first_ms 大 = 「点下去要等」（转码器初始化慢）；"
+                +"seg_ms 最大远大于平均 = 「播起来断断续续」（转码吞吐跟不上）。"
+                +"两者解法不同，先分清是哪一个。");
+        out.push("  直出绕过       : "+hs.bypass_enabled+"（FNMUSIC_HLS_LOCAL_BYPASS，已绕过 "
+                 +hs.bypassed+" 次）"
+                 +(hs.bypass_enabled?"":"——打开后跳过转码直出原始流；本地多为 FLAC，"
+                  +"放不出来就关掉，且直出不省流量"));
+        if(!hs.sessions) out.push("  （还没有 HLS 播放记录：播一首飞牛本地曲库的歌再来看）");
       }
       out.push("");
       out.push("-- 飞牛应用授权目录（开放能力 / api-scope）--");
