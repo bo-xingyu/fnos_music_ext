@@ -130,6 +130,72 @@ def test_no_next_counter():
 
 
 # ---------------------------------------------------------------------------
+# 多首预热
+# ---------------------------------------------------------------------------
+
+
+def test_next_n_returns_following_tracks():
+    pf.remember_context("pl:1", _tracks("a", "b", "c", "d", "e"))
+    assert pf.next_n("a", 3) == ["b", "c", "d"]
+    assert pf.next_n("d", 3) == ["e"], "不足 n 首时给多少算多少"
+    assert pf.next_n("e", 3) == []
+    assert pf.next_n("zzz", 3) == []
+    assert pf.next_n("a", 0) == []
+
+
+def test_lookahead_env(monkeypatch):
+    assert pf._lookahead() == 3
+    monkeypatch.setenv("FNMUSIC_PREFETCH_LOOKAHEAD", "5")
+    assert pf._lookahead() == 5
+    monkeypatch.setenv("FNMUSIC_PREFETCH_LOOKAHEAD", "99")
+    assert pf._lookahead() == 5, "上限 5，防止一次打爆 musicbox"
+    monkeypatch.setenv("FNMUSIC_PREFETCH_LOOKAHEAD", "0")
+    assert pf._lookahead() == 1
+
+
+def test_first_of_prefetches_list_head():
+    pf.remember_context("pl:1", _tracks("a", "b", "c"))
+    assert pf.first_of("pl:1", 1) == ["a"]
+    assert pf.first_of("pl:1", 2) == ["a", "b"]
+    assert pf.first_of("pl:nope", 1) == []
+
+
+def test_on_list_enabled(monkeypatch):
+    assert pf.on_list_enabled() is True
+    monkeypatch.setenv("FNMUSIC_PREFETCH_ON_LIST", "false")
+    assert pf.on_list_enabled() is False
+
+
+# ---------------------------------------------------------------------------
+# 统计口径：一次播放 = 一首歌，不能被 Range 请求重复计数
+# ---------------------------------------------------------------------------
+
+
+def test_repeated_range_requests_are_collapsed():
+    """一次流式播放客户端会连发好几个 Range 请求，全算进去命中率与均值都失真。"""
+    pf.note_result("a", True, 10.0)
+    assert pf.note_play("a", 20.0, warm=True) is True
+    assert pf.note_play("a", 25.0, warm=True) is False, "重复请求不应计入"
+    assert pf.note_play("a", 30.0, warm=True) is False
+
+    st = pf.status()
+    assert st["plays"] == 1, "3 次请求只应算 1 次播放"
+    assert st["hits"] == 1
+    assert st["hit_rate"] == 1.0
+    assert st["repeat_plays"] == 2
+    assert st["warm_ms"] == 20.0, "耗时均值只取首次，不能被重复请求稀释"
+
+
+def test_play_dedupe_expires_after_window(monkeypatch):
+    real = pf.time.time
+    pf.note_play("a", 10.0, warm=False)
+    monkeypatch.setattr(pf.time, "time",
+                        lambda: real() + pf.PLAY_DEDUPE_WINDOW + 1)
+    assert pf.note_play("a", 40.0, warm=False) is True
+    assert pf.status()["plays"] == 2
+
+
+# ---------------------------------------------------------------------------
 # 开关
 # ---------------------------------------------------------------------------
 

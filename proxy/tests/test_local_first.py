@@ -19,8 +19,7 @@ from proxy import app as P
 # ---------------------------------------------------------------------------
 
 
-def _make_music_db(tmp_path, rows):
-    db = str(tmp_path / "music.db")
+def _make_music_db_at(db: str, rows):
     con = sqlite3.connect(db)
     con.execute("CREATE TABLE track (id INTEGER PRIMARY KEY, title TEXT, "
                 "artist TEXT, path TEXT, duration INTEGER)")
@@ -30,6 +29,10 @@ def _make_music_db(tmp_path, rows):
     con.commit()
     con.close()
     return db
+
+
+def _make_music_db(tmp_path, rows):
+    return _make_music_db_at(str(tmp_path / "music.db"), rows)
 
 
 @pytest.fixture(autouse=True)
@@ -292,6 +295,30 @@ def test_split_name_separators():
     assert ll._split_name("周杰伦 - 晴天") == ("周杰伦", "晴天")
     assert ll._split_name("许嵩 _ 庐州月") == ("许嵩", "庐州月")
     assert ll._split_name("庐州月", "许嵩") == ("许嵩", "庐州月")
+
+
+def test_match_strips_parenthesised_suffix(tmp_path):
+    """网易云「晴天 (Live)」「演员（伴奏）」在本地库里往往就叫「晴天」「演员」。
+
+    注意必须在归一化**之前**剥括号：_STRIP_RE 只去掉括号字符、留下里面的词，
+    "晴天 (Live)" 会归一化成 "晴天live"，仍然对不上。
+    """
+    flac = _write_audio("周杰伦 - 晴天.flac")
+    db = _make_music_db(tmp_path, [("晴天", "周杰伦", flac)])
+
+    assert ll.find_local_match("晴天 (Live)", "周杰伦", db)["path"] == flac
+    assert ll.find_local_match("晴天（现场版）", "周杰伦", db)["path"] == flac
+    # 反向：本地文件名带括号，网易云是干净标题
+    live = _write_audio("周杰伦 - 稻香 (Live).flac")
+    db2 = str(tmp_path / "music2.db")
+    _make_music_db_at(db2, [("稻香 (Live)", "周杰伦", live)])
+    assert ll.find_local_match("稻香", "周杰伦", db2)["path"] == live
+
+
+def test_title_keys():
+    assert ll.title_keys("晴天") == ["晴天"]
+    assert ll.title_keys("晴天 (Live)") == ["晴天live", "晴天"]
+    assert ll.title_keys("") == []
 
 
 def test_status_reports_empty_reason_when_nothing_indexed(tmp_path):

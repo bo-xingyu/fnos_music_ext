@@ -55,10 +55,31 @@ MAX_TRACKS = 3000
 # 上下文多久算过期（秒）。太久没播放过说明用户早就不在这个列表里了。
 CONTEXT_TTL = 3 * 3600.0
 
+def _lookahead() -> int:
+    """一次预热几首（含紧邻的下一首）。"""
+    try:
+        return max(1, min(5, int(float(os.environ.get("FNMUSIC_PREFETCH_LOOKAHEAD", "3") or 3))))
+    except (TypeError, ValueError):
+        return 3
+
+
+def on_list_enabled() -> bool:
+    """歌单列表一下发就预热它的前几首（用户点开时第一首已经热了）。"""
+    return str(os.environ.get("FNMUSIC_PREFETCH_ON_LIST", "true") or "true") \
+        .strip().lower() in ("true", "1", "yes", "on")
+
+
+# 同一个 guid 的重复 Range 请求多久内只算「一次播放」。
+# 一次流式播放客户端会发好几个 Range 请求，不去重的话命中率与冷/热耗时
+# 全被重复请求污染（真机 3 分钟里「78 次播放」其实是十几首歌）。
+PLAY_DEDUPE_WINDOW = 600.0
+
 _CONTEXTS: list[dict] = []
 _INFLIGHT: dict[str, float] = {}
 # guid -> 预热完成时间戳。用于判断「这次播放的直链是不是我们提前取回来的」
 _WARMED: dict[str, float] = {}
+# guid -> 首次播放时间戳（用于把重复 Range 请求折叠成一次播放）
+_PLAY_SEEN: dict[str, float] = {}
 _RECENT: list[dict] = []
 _RECENT_MAX = 20
 
@@ -69,7 +90,8 @@ _STATS: dict[str, float] = {
     "no_next": 0,       # 推断不出下一首（没有上下文 / 已是最后一首）
     "already": 0,       # 已经预热过或正在预热，跳过
     "hits": 0,          # 播放时命中预热成果
-    "plays": 0,         # 在线播放总次数
+    "plays": 0,         # 在线播放总次数（已折叠重复 Range 请求）
+    "repeat_plays": 0,  # 同一首歌的重复 Range 请求（不计入冷/热对比，否则均值失真）
     "cold_ms_sum": 0.0,  # 冷启动（未预热）gather 耗时累计
     "cold_ms_n": 0,
     "warm_ms_sum": 0.0,  # 命中预热后的 gather 耗时累计
@@ -133,6 +155,35 @@ def next_of(guid: str) -> tuple[str, str] | None:
     return None
 
 
+def next_n(guid: str, n: int = 1) -> list[str]:
+    """当前 guid 之后的 n 首（按上下文顺序）。不足 n 首就给多少算多少。"""
+    g = str(guid or "").strip()
+    if not g or n <= 0:
+        return []
+    _prune()
+    for c in reversed(_CONTEXTS):
+        tracks = list(c.get("tracks") or [])
+        try:
+            i = tracks.index(g)
+        except ValueError:
+            continue
+        return [str(x) for x in tracks[i + 1: i + 1 + n]]
+    return []
+
+
+def first_of(context_guid: str, n: int = 1) -> list[str]:
+    """某个上下文（歌单）的头 n 首。用于「列表一下发就预热」。"""
+    cg = str(context_guid or "").strip()
+    if not cg or n <= 0:
+        return []
+    _prune()
+    for c in reversed(_CONTEXTS):
+        if str(c.get("ctx") or "") != cg:
+            continue
+        return [str(x) for x in list(c.get("tracks") or [])[:n]]
+    return []
+
+
 def context_report() -> list[dict]:
     _prune()
     return [{"ctx": str(c.get("ctx") or ""), "tracks": len(c.get("tracks") or []),
@@ -180,8 +231,24 @@ def note_result(guid: str, ok: bool, ms: float, detail: str = "") -> None:
     logger.info("prefetch %s %s %.0fms %s", "ok" if ok else "fail", guid, ms, detail)
 
 
-def note_play(guid: str, gather_ms: float, warm: bool) -> None:
-    """一次在线播放的 gather 耗时记账：预热过的走 warm，否则走 cold。"""
+def note_play(guid: str, gather_ms: float, warm: bool) -> bool:
+    """一次在线播放的 gather 耗时记账：预热过的走 warm，否则走 cold。
+
+    返回是否计入统计——**同一首歌的重复 Range 请求会被折叠掉**。一次流式播放
+    客户端会连发好几个 Range，全算进去的话「播放次数」是「曲目数」的好几倍，
+    命中率与冷/热均值也就都失真了（真机 3 分钟 78 次「播放」其实是十几首歌）。
+    """
+    g = str(guid or "").strip()
+    now = time.time()
+    last = float(_PLAY_SEEN.get(g) or 0.0)
+    if last and (now - last) < PLAY_DEDUPE_WINDOW:
+        _STATS["repeat_plays"] += 1
+        return False
+    _PLAY_SEEN[g] = now
+    if len(_PLAY_SEEN) > 500:
+        for k in sorted(_PLAY_SEEN, key=lambda kk: _PLAY_SEEN[kk])[:200]:
+            _PLAY_SEEN.pop(k, None)
+
     _STATS["plays"] += 1
     if warm:
         _STATS["hits"] += 1
@@ -193,6 +260,7 @@ def note_play(guid: str, gather_ms: float, warm: bool) -> None:
     if warm:
         logger.info("prefetch hit: %s（预热于 %.1fs 前，本次 gather %.0fms）",
                     guid, float(warming_seconds(guid) or 0.0), gather_ms)
+    return True
 
 
 def bump(key: str, n: int = 1) -> None:
@@ -208,6 +276,8 @@ def status() -> dict:
     warm = _avg("warm_ms_sum", "warm_ms_n")
     return {
         "enabled": enabled(),
+        "lookahead": _lookahead(),
+        "on_list": on_list_enabled(),
         "scheduled": int(_STATS.get("scheduled") or 0),
         "done": int(_STATS.get("done") or 0),
         "failed": int(_STATS.get("failed") or 0),
@@ -215,6 +285,7 @@ def status() -> dict:
         "already": int(_STATS.get("already") or 0),
         "plays": int(_STATS.get("plays") or 0),
         "hits": int(_STATS.get("hits") or 0),
+        "repeat_plays": int(_STATS.get("repeat_plays") or 0),
         "hit_rate": (round(float(_STATS.get("hits") or 0) / float(_STATS["plays"]), 3)
                      if _STATS.get("plays") else 0.0),
         "cold_ms": cold,
@@ -229,6 +300,7 @@ def reset_for_test() -> None:
     _CONTEXTS.clear()
     _INFLIGHT.clear()
     _WARMED.clear()
+    _PLAY_SEEN.clear()
     _RECENT.clear()
     for k in _STATS:
         _STATS[k] = 0.0

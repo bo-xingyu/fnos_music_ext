@@ -126,6 +126,8 @@ def klass_of_level(level: str) -> str:
 
 _STRIP_RE = re.compile(r"[\s\-–—·・_.,，、。.!！?？:：;；'\"`~@#$%^&*()（）\[\]【】{}<>《》/\\|+…]+")
 _ARTIST_SPLIT_RE = re.compile(r"\s*[/;,，、&\+]\s*")
+# 括号尾巴：「晴天 (Live)」「演员（伴奏）」「千本樱[MMD]」→ 主体名
+_PAREN_RE = re.compile(r"[（(\[【][^）)\]】]{0,20}[）)\]】]\s*$")
 
 
 def _norm_text(s: Any) -> str:
@@ -193,6 +195,27 @@ def _pick_col(cols: list[str], candidates: tuple[str, ...]) -> str | None:
     return None
 
 
+def title_keys(title: Any) -> list[str]:
+    """一个标题在索引里可能出现的归一化键。
+
+    除了原样，还登记**剥掉括号尾巴**的版本——网易云的「晴天 (Live)」「演员（伴奏）」
+    在本地库里往往就叫「晴天」「演员」，反之亦然。只在建索引和查询两端都用同一
+    套键，两边才对得上。注意必须在归一化**之前**剥：_STRIP_RE 会把括号字符去掉
+    但留下里面的词（"晴天 (Live)" → "晴天live"），那仍然对不上。
+    """
+    raw = str(title or "").strip()
+    keys: list[str] = []
+    k = norm_title(raw)
+    if k:
+        keys.append(k)
+    stripped = _PAREN_RE.sub("", raw).strip()
+    if stripped and stripped != raw:
+        k2 = norm_title(stripped)
+        if k2 and k2 not in keys:
+            keys.append(k2)
+    return keys
+
+
 def build_index(db_path: str) -> dict[str, list[dict]]:
     """扫描 music.db，构建 {归一化标题: [条目…]}。
 
@@ -230,16 +253,14 @@ def build_index(db_path: str) -> dict[str, list[dict]]:
                     ext = os.path.splitext(path)[1].lstrip(".").lower()
                     if ext not in AUDIO_EXTS:
                         continue
-                    key = norm_title(title)
-                    if not key:
-                        continue
-                    index.setdefault(key, []).append({
-                        "title": str(title or ""),
-                        "artist": str(artist or ""),
-                        "path": path,
-                        "ext": ext,
-                        "klass": klass_of_ext(ext),
-                    })
+                    for key in title_keys(title):
+                        index.setdefault(key, []).append({
+                            "title": str(title or ""),
+                            "artist": str(artist or ""),
+                            "path": path,
+                            "ext": ext,
+                            "klass": klass_of_ext(ext),
+                        })
         finally:
             con.close()
     except Exception as exc:  # noqa: BLE001 - 索引失败不影响播放，只是不启用本地优先
@@ -302,17 +323,18 @@ def build_fs_index(library_dir: str) -> dict[str, list[dict]]:
                 except OSError:
                     continue
                 artist, title = _split_name(os.path.splitext(name)[0].strip(), fallback)
-                key = norm_title(title)
-                if not key:
+                keys = title_keys(title)
+                if not keys:
                     continue
-                index.setdefault(key, []).append({
-                    "title": title,
-                    "artist": artist,
-                    "path": path,
-                    "ext": ext,
-                    "klass": klass_of_ext(ext),
-                    "src": "fs",
-                })
+                for key in keys:
+                    index.setdefault(key, []).append({
+                        "title": title,
+                        "artist": artist,
+                        "path": path,
+                        "ext": ext,
+                        "klass": klass_of_ext(ext),
+                        "src": "fs",
+                    })
                 if sum(len(v) for v in index.values()) >= max_files:
                     return index
     except Exception as exc:  # noqa: BLE001 - 扫不动就只用 music.db 的部分
@@ -332,17 +354,22 @@ def _get_index(db_path: str, library_dir: str = "") -> dict[str, list[dict]]:
         for item in e:
             item.setdefault("src", "db")
     fs_n = 0
+    fs_scanned = 0
     if library_dir:
         seen = {str(i.get("path") or "") for e in index.values() for i in e}
         for k, entries in build_fs_index(library_dir).items():
             for e in entries:
+                fs_scanned += 1
                 if str(e.get("path") or "") in seen:
                     continue
                 index.setdefault(k, []).append(e)
                 fs_n += 1
+    if fs_scanned:
+        logger.info("本地曲库目录扫描：%d 个音频文件，其中 %d 首已是 music.db 之外的补充",
+                    fs_scanned, fs_n)
     db_n = sum(1 for e in index.values() for i in e if i.get("src") == "db")
     _INDEX_META[key] = {
-        "db": db_n, "fs": fs_n, "dir": library_dir,
+        "db": db_n, "fs": fs_n, "fs_scanned": fs_scanned, "dir": library_dir,
         "ts": now, "key": key,
         "empty_reason": ("" if (db_n or fs_n) else
                          ("music.db 没有可索引的曲目表" if not library_dir else
@@ -360,16 +387,20 @@ def find_local_match(title: str, artist: str, db_path: str,
     """找本地同名曲；命中返回 {path, ext, klass, …}，文件必须真实存在。
 
     同名多首（翻唱/伴奏等）时按「艺术家匹配 > 无损优先」排序取第一。
-    ``library_dir`` 给了就把曲库目录的文件系统索引并进来一起匹配——真机的
-    music.db 常常根本没有曲目表，**只靠它会永远命中不了**。
+    ``library_dir`` 给了就把曲库目录的文件系统索引并进来一起匹配——真机上
+    music.db 与目录扫描常常各管一段，缺一边就会漏掉真命中。
     """
-    key = norm_title(title)
-    if not key:
+    if not title_keys(title):
         return None
-    entries = _get_index(db_path, library_dir).get(key)
+    idx = _get_index(db_path, library_dir)
     hit: dict | None = None
     reason = "title-not-in-index"
-    if entries:
+    for ki, key in enumerate(title_keys(title)):
+        entries = idx.get(key)
+        if not entries:
+            continue
+        reason = "title-not-in-index"
+
         def _rank(e: dict) -> tuple[int, int]:
             return (0 if artist_compatible(e.get("artist"), artist) else 1,
                     0 if e.get("klass") == "lossless" else 1)
@@ -382,11 +413,13 @@ def find_local_match(title: str, artist: str, db_path: str,
             try:
                 if os.path.isfile(path) and os.path.getsize(path) > 0:
                     hit = e
-                    reason = "hit"
+                    reason = "hit" if ki == 0 else "hit-stripped"
                     break
             except OSError:
                 continue
             reason = "file-missing"
+        if hit is not None:
+            break
     _LOOKUP_LOG.append({
         "ts": time.time(), "title": str(title or ""), "artist": str(artist or ""),
         "hit": hit is not None, "reason": reason,
@@ -439,6 +472,9 @@ def status(db_path: str, library_dir: str = "") -> dict:
         "entries": sum(len(v) for v in idx.values()),
         "from_db": int(meta.get("db") or 0),
         "from_fs": int(meta.get("fs") or 0),
+        # fs_scanned 必须单独给：fs（新增）为 0 常常不是「没扫到」而是
+        # 「扫到的全在 music.db 里已有」——真机第一次看到 0 会以为扫描坏了。
+        "fs_scanned": int(meta.get("fs_scanned") or 0),
         "built_at": float(meta.get("ts") or 0.0),
         "empty_reason": str(meta.get("empty_reason") or ""),
         "lookups": len(_LOOKUP_LOG),

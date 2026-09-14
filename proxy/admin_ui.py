@@ -281,6 +281,7 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     "local_first": ("FNMUSIC_LOCAL_FIRST", _as_bool, False),
     # --- 下一首预热（v2.9.14 T1）：提前取回下一首的直链与元数据 ---
     "prefetch_next": ("FNMUSIC_PREFETCH_NEXT", _as_bool, False),
+    "prefetch_lookahead": ("FNMUSIC_PREFETCH_LOOKAHEAD", _int_range(1, 5), False),
     "pushplus_enabled": ("FNMUSIC_PUSHPLUS_ENABLED", _as_bool, False),
     "pushplus_token": ("FNMUSIC_PUSHPLUS_TOKEN", _token, True),
     "pushplus_topic": ("FNMUSIC_PUSHPLUS_TOPIC", _free_text(64), True),
@@ -332,6 +333,7 @@ DEFAULTS = {
     "library_dir": "",
     "local_first": "true",
     "prefetch_next": "true",
+    "prefetch_lookahead": "3",
     "pushplus_enabled": "true",
     "pushplus_token": "",
     "pushplus_topic": "",
@@ -1907,6 +1909,11 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
           <span class="ht">自动探测依赖飞牛的 music.db；各版本目录布局不统一，猜不中时本地每日推荐
             会一首歌都扫不到（界面上表现为「不出现」）。此时在这里直接填曲库目录即可，
             例如 /vol1/1000/music。填错会在保存时直接报错，不会静默失败。</span></label>
+
+        <label><span class="lb">预热首数（1–5）</span>
+          <input name="prefetch_lookahead" inputmode="numeric" placeholder="3">
+          <span class="ht">一次预热当前曲之后的几首。只取 JSON、不下载音频，多预热几首几乎不额外
+            耗流量；但每台 NAS 的 musicbox 并发能力不同，卡的话调回 1。</span></label>
       </div>
 
       <div class="sw"><input type="checkbox" name="pushplus_enabled" id="c_push">
@@ -2356,8 +2363,14 @@ function runDiag(auto){
       if(!lf.reachable){ out.push("  取不到代理侧快照: "+JSON.stringify(lf)); }
       else{
         out.push("  开关           : "+lf.enabled+"（any_class="+lf.any_class+"：true=不看音质档位，本地有就播）");
+        var _fs = (lf.fs_scanned||0);
         out.push("  索引           : "+lf.entries+" 首 / "+lf.titles+" 个标题"
-                 +"（music.db "+lf.from_db+" + 目录扫描 "+lf.from_fs+"）");
+                 +"（music.db "+lf.from_db+" + 目录扫描新增 "+lf.from_fs+"）");
+        // fs_scanned 必须单独给：新增为 0 常常不是「没扫到」而是「扫到的
+        // 全在 music.db 里已有」，只显示 0 会让人误判成扫描坏了。
+        out.push("  目录扫描       : "+(lf.library_dir?("扫到 "+_fs+" 个音频文件，"
+                 +(_fs?("其中 "+lf.from_fs+" 首是 music.db 之外的补充"):"（目录不存在或扫不动）"))
+                 :"（未给曲库目录，跳过）"));
         out.push("  曲库目录       : "+(lf.library_dir||"（未定位）"));
         var st=lf.selftest||{};
         out.push("  自测           : "+(st.ok?("能匹配上自己（"+st.title+" → "+st.path+"）")
@@ -2375,11 +2388,12 @@ function runDiag(auto){
       var pf=d.prefetch||{};
       if(!pf.reachable){ out.push("  取不到代理侧快照: "+JSON.stringify(pf)); }
       else{
-        out.push("  开关           : "+pf.enabled);
+        out.push("  开关           : "+pf.enabled+"（预热 "+pf.lookahead+" 首，列表下发即预热头首="+pf.on_list+"）");
         out.push("  调度/成功/失败 : "+pf.scheduled+" / "+pf.done+" / "+pf.failed
                  +"（推断不出下一首 "+pf.no_next+" 次，已预热过跳过 "+pf.already+" 次）");
-        out.push("  在线播放       : "+pf.plays+" 次，命中预热 "+pf.hits+" 次（命中率 "
-                 +Math.round((pf.hit_rate||0)*100)+"%）");
+        out.push("  在线播放       : "+pf.plays+" 首，命中预热 "+pf.hits+" 首（命中率 "
+                 +Math.round((pf.hit_rate||0)*100)+"%）"
+                 +(pf.repeat_plays?("，另有 "+pf.repeat_plays+" 次是同一首的续传请求（不计入）"):""));
         out.push("  取链耗时       : 未预热 "+pf.cold_ms+"ms → 命中预热 "+pf.warm_ms+"ms"
                  +(pf.saved_ms?("  ★ 省下约 "+pf.saved_ms+"ms"):""));
         (pf.contexts||[]).forEach(function(c){

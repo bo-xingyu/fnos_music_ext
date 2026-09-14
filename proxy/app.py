@@ -2814,26 +2814,50 @@ async def _prefetch_one(request: Request, guid: str) -> None:
 
 
 def _schedule_prefetch(request: Request, guid: str) -> None:
-    """为「下一首」安排一次预热。同步返回，失败静默，绝不阻塞当前播放。"""
+    """为「下 N 首」安排预热。同步返回，失败静默，绝不阻塞当前播放。"""
     try:
         if not prefetch.enabled():
             return
-        found = prefetch.next_of(guid)
-        if not found:
+        targets = prefetch.next_n(guid, prefetch._lookahead())
+        if not targets:
             prefetch.bump("no_next")
             return
-        _ctx, next_guid = found
-        if not is_online_guid(next_guid) or next_guid == guid:
-            prefetch.bump("no_next")
-            return
-        if prefetch.warming_seconds(next_guid) is not None or not prefetch.claim(next_guid):
-            prefetch.bump("already")
-            return
-        prefetch.bump("scheduled")
-        logger.info("prefetch schedule: %s -> %s", guid, next_guid)
-        _PREFETCH_TASKS[next_guid] = asyncio.create_task(_prefetch_one(request, next_guid))
+        _sched = 0
+        for next_guid in targets:
+            _sched += _prefetch_if_needed(request, guid, next_guid)
+        if _sched:
+            logger.info("prefetch schedule: %s -> %s", guid, ", ".join(targets))
     except Exception as exc:  # noqa: BLE001
         logger.debug("prefetch schedule failed for %s: %s: %s", guid, type(exc).__name__, exc)
+
+
+def _prefetch_if_needed(request: Request, from_guid: str, next_guid: str) -> int:
+    """给单首歌安排预热，返回 1 表示真的排了、0 表示跳过（已在预热/非在线）。"""
+    if not is_online_guid(next_guid) or next_guid == from_guid:
+        prefetch.bump("no_next")
+        return 0
+    if prefetch.warming_seconds(next_guid) is not None or not prefetch.claim(next_guid):
+        prefetch.bump("already")
+        return 0
+    prefetch.bump("scheduled")
+    _PREFETCH_TASKS[next_guid] = asyncio.create_task(_prefetch_one(request, next_guid))
+    return 1
+
+
+def _schedule_list_prefetch(request: Request, context_guid: str) -> None:
+    """歌单列表一下发就预热它的头几首——用户点开时第一首的直链已经热了。
+
+    只预热头 1 首：真机 musicbox 会同时收到十几个歌单的列表请求（客户端刷
+    歌单页 + 我们自己的歌单缓存预热），一首歌单预热多了反而把它自己堵住。
+    """
+    try:
+        if not prefetch.enabled() or not prefetch.on_list_enabled():
+            return
+        for g in prefetch.first_of(context_guid, 1):
+            _prefetch_if_needed(request, "", g)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("list prefetch failed for %s: %s: %s",
+                     context_guid, type(exc).__name__, exc)
 
 
 @app.get("/music/api/v1/track/stream")
@@ -2867,9 +2891,15 @@ async def stream_track(request: Request):
             timeout=PLAYBACK_FORWARD_TIMEOUT_S, label="local-stream")
 
     def _log_play(source: str) -> None:
-        """播放起步留证：来源 + 总耗时。真机上「点开到出声几秒」从此可量化。"""
-        logger.info("play-start %s %s %.0fms", source, guid,
-                    (time.monotonic() - started) * 1000.0)
+        """播放起步留证：来源 + 总耗时 + 是否吃到预热。
+
+        cold/warm 直接写在 play-start 行里 —— 想评估预热有没有用，
+        grep 'play-start' 就能按这个标记把两组耗时分开比，不用再去对日志。
+        """
+        _w = prefetch.warming_seconds(guid) if prefetch.enabled() else None
+        _tag = " warm" if _w is not None else " cold"
+        logger.info("play-start %s %s %.0fms%s", source, guid,
+                    (time.monotonic() - started) * 1000.0, _tag)
 
     range_header = request.headers.get("range")
     cached = find_cache_file(guid)
@@ -5027,6 +5057,8 @@ async def playlist_track_list(request: Request):
         _n = prefetch.remember_context(guid, tracks)
         if _n:
             logger.info("prefetch context: %s（%d 首）", guid, _n)
+            # 列表刚下发就预热头一首：用户点开时它的直链已经是热的
+            _schedule_list_prefetch(request, guid)
     except Exception as exc:  # noqa: BLE001 - 记不住只是不能预热，不影响打开歌单
         logger.debug("prefetch context failed for %s: %s: %s", guid, type(exc).__name__, exc)
     # 打开耗时留证：真机上「歌单打开几秒」从此可量化（cache=miss 是上游链路，
