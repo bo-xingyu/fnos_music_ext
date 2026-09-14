@@ -2312,9 +2312,16 @@ function runDiag(auto){
         out.push("  客户端音质/网络线索 : "+(hk.length?hk.length+" 种":"暂未观察到任何带音质或网络语义的键"));
         var cip=qy.client_ips||{};
         out.push("  客户端 IP 线索(XFF) : 局域网="+(cip.lan||0)+" 次  远程(公网)="+(cip.remote||0)+" 次"+
-                ((cip.samples&&cip.samples.length)
-                  ?("  例: "+cip.samples.slice(0,3).join(" | "))
-                  :"（未观察到 X-Forwarded-For——可能 nginx 未透传，远程识别不可用，建议用固定音质策略）"));
+                 "  本机转发(回环)="+(cip.relay||0)+" 次");
+        out.push("    远程样例        : "+((cip.remote_samples&&cip.remote_samples.length)
+                  ?cip.remote_samples.join(" | ")+("（最近一次 "+cip.remote_last+"s 前）")
+                  :"（一次都没观察到公网 IP）"));
+        out.push("    局域网样例      : "+((cip.lan_samples&&cip.lan_samples.length)
+                  ?cip.lan_samples.join(" | ")+("（最近一次 "+cip.lan_last+"s 前）")
+                  :"（无）"));
+        out.push("  ★ 怎么读出「现在是 WiFi 还是数据」：远程样例是真公网 IP 且 remote_last 很小"
+                +"= 正在远程/数据访问；局域网样例是 192.168/10.x 且 lan_last 很小 = 正在家里 WiFi；"
+                +"relay 次数很大 = 请求由本机中继转发，源 IP 证明不了客户端在哪（这种最容易被误判成局域网）");
         out.push("  （远程(公网)访问默认按流量场景走省流档，可用 FNMUSIC_REMOTE_AS_CELLULAR=false 关闭）");
         var nj=qy.network_judgements||{}, nk=Object.keys(nj);
         out.push("  网络判定计数    : "+(nk.length?nk.map(function(k){return k+"="+nj[k];}).join("  "):"（尚无）"));

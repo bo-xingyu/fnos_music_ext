@@ -235,12 +235,23 @@ def network_of(request: Any) -> str:
     ips = forwarded_client_ips(request)
     if ips:
         public = [ip for ip in ips if is_public_ip(ip)]
-        _record_client_ip_evidence(ips, bool(public))
+        # XFF 全是回环地址 = 请求由**本机**（nginx / 飞牛远程中继）转发过来：这个 IP
+        # 说明的是"转发者在本机"，**不是**"客户端在局域网"。当成局域网，数据网络下
+        # 就会照发母带。这类请求本质是"来源不明"，走与 unknown 相同的兜底逻辑。
+        relay = (not public) and all(is_loopback_ip(ip) for ip in ips)
+        _record_client_ip_evidence(ips, bool(public), relay=relay)
         if public and remote_as_cellular():
             return _remember_network("cellular")
+        if relay:
+            return _unknown_verdict()
         return _remember_network("lan")
-    # 这次没线索：先沿用最近的明确结论（并记一笔「被粘性救回」，否则 unknown 的
-    # 真实占比永远看不见）；再退到「未知当流量」开关；最后才是真的 unknown。
+    return _unknown_verdict()
+
+
+def _unknown_verdict() -> str:
+    """判不出网络时的统一兜底，并把 unknown 计进证据（见 _count_judgement）。"""
+    # 先沿用最近的明确结论（并记一笔「被粘性救回」，否则 unknown 的真实占比看不见）；
+    # 再退到「未知当流量」开关；最后才是真的 unknown。
     _count_judgement("unknown")
     return _sticky_network() or ("cellular" if unknown_as_cellular() else "unknown")
 
@@ -360,16 +371,42 @@ def remote_as_cellular() -> bool:
         .strip().lower() in ("true", "1", "yes", "on")
 
 
-def _record_client_ip_evidence(ips: list[str], has_public: bool) -> None:
-    rec = _OBSERVED.setdefault("client_ips", {"lan": 0, "remote": 0, "samples": []})
-    if has_public:
-        rec["remote"] = int(rec.get("remote", 0)) + 1
-    else:
-        rec["lan"] = int(rec.get("lan", 0)) + 1
+def is_loopback_ip(raw: str) -> bool:
+    """是否回环 / 本机地址（127.0.0.1、::1）。"""
+    import ipaddress
+
+    try:
+        return bool(ipaddress.ip_address(str(raw).strip()).is_loopback)
+    except ValueError:
+        return False
+
+
+def _record_client_ip_evidence(ips: list[str], has_public: bool, relay: bool = False) -> None:
+    """记录一次 IP 判定证据。
+
+    样例**必须按类分开存**：局域网请求一天几千次、远程几十次，混在一个最多 6 条的
+    列表里（还先到先得），远程样例必然被局域网的挤掉——而远程才是我们唯一需要看清
+    的那 21 次。真机上因此长期看不到"远程 IP 到底长什么样"，也就无从判断飞牛的
+    远程访问到底有没有把客户端真实 IP 透传过来。
+
+    时间戳同理：只有次数没有时间，"我刚才明明用数据播了"这句话无法和证据对上。
+    """
+    rec = _OBSERVED.setdefault(
+        "client_ips",
+        {"lan": 0, "remote": 0, "relay": 0, "lan_samples": [],
+         "remote_samples": [], "lan_last": 0.0, "remote_last": 0.0},
+    )
+    now = time.time()
+    bucket = "relay" if relay else ("remote" if has_public else "lan")
+    rec[bucket] = int(rec.get(bucket, 0)) + 1
+    rec[f"{bucket}_last" if bucket in ("lan", "remote") else "relay_last"] = now
     sample = str(ips[0])[:64] if ips else ""
-    if sample and sample not in (rec.get("samples") or []):
-        rec.setdefault("samples", []).insert(0, sample)
-        del rec["samples"][6:]
+    if sample:
+        key = f"{bucket}_samples"
+        samples = rec.setdefault(key, [])
+        if sample not in samples:
+            samples.insert(0, sample)
+            del samples[4:]
 
 
 # ---------------------------------------------------------------------------
@@ -566,13 +603,34 @@ def report(db_path: str = "") -> dict[str, Any]:
 
 
 def _client_ip_report() -> dict[str, Any]:
-    """客户端 IP 证据（远程访问识别的判定依据，诊断页展示）。"""
+    """客户端 IP 证据（远程识别的判定依据，诊断页展示）。
+
+    样例按类分开（局域网/远程各自留 4 条）并带"最近一次"的时间戳——混在一起时
+    远程样例会被几千条局域网记录挤掉，而远程恰恰是唯一需要看清的那一类。
+    """
     rec = _OBSERVED.get("client_ips")
     if not rec:
-        return {"lan": 0, "remote": 0, "samples": [],
+        return {"lan": 0, "remote": 0, "relay": 0, "samples": [],
+                "lan_samples": [], "remote_samples": [],
+                "lan_last": 0, "remote_last": 0,
                 "note": "未观察到 X-Forwarded-For / X-Real-IP（可能 nginx 未透传，远程识别不可用）"}
-    return {"lan": int(rec.get("lan", 0)), "remote": int(rec.get("remote", 0)),
-            "samples": list(rec.get("samples") or [])[:6]}
+    now = time.time()
+
+    def age(ts: float) -> int:
+        return int(now - float(ts or 0.0)) if ts else 0
+
+    return {
+        "lan": int(rec.get("lan", 0)),
+        "remote": int(rec.get("remote", 0)),
+        "relay": int(rec.get("relay", 0)),
+        "lan_samples": list(rec.get("lan_samples") or [])[:4],
+        "remote_samples": list(rec.get("remote_samples") or [])[:4],
+        "lan_last": age(rec.get("lan_last", 0.0)),
+        "remote_last": age(rec.get("remote_last", 0.0)),
+        # 老字段保留：只给合并样例，兼容旧版诊断页/脚本
+        "samples": (list(rec.get("remote_samples") or [])
+                    + list(rec.get("lan_samples") or []))[:6],
+    }
 
 
 def reset_for_test() -> None:

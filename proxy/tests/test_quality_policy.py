@@ -211,6 +211,50 @@ def test_unknown_reuses_recent_cellular_verdict():
     assert q.network_of(_fake_request()) == "cellular"
 
 
+def test_loopback_xff_is_not_lan_evidence():
+    """XFF 全是 127.0.0.1 = 请求由本机 nginx/远程中继转发，证明不了客户端在局域网。
+
+    当成局域网，飞牛官方远程中继（fnConnect）过来的播放就会一直按 WiFi 档发母带——
+    用户在数据网络下卡顿，而我们这边显示「局域网」，永远对不上。
+    """
+    q.reset_for_test()
+    assert q.network_of(_fake_request(headers={"x-forwarded-for": "127.0.0.1"})) == "unknown"
+    assert q.network_of(_fake_request(headers={"x-real-ip": "::1"})) == "unknown"
+    # 必须单独计数，否则它会被算进 lan，把 823:21 这类比例彻底带偏
+    rep = q.report()
+    assert rep["client_ips"]["relay"] == 2
+    assert rep["client_ips"]["lan"] == 0
+
+
+def test_loopback_xff_falls_back_to_sticky_cellular():
+    """最近明确判出过流量，则本机中继的那次也跟着降档。"""
+    q.reset_for_test()
+    q.network_of(_fake_request(headers={"x-forwarded-for": "114.114.114.9"}))
+    assert q.network_of(_fake_request(headers={"x-forwarded-for": "127.0.0.1"})) == "cellular"
+
+
+def test_remote_samples_survive_lan_flood():
+    """远程样例不能被几千条局域网记录挤掉——它才是唯一需要看清的那一类。"""
+    q.reset_for_test()
+    q.network_of(_fake_request(headers={"x-forwarded-for": "114.114.114.9"}))
+    for i in range(30):
+        q.network_of(_fake_request(headers={"x-forwarded-for": f"192.168.1.{i + 1}"}))
+    cip = q.report()["client_ips"]
+    assert cip["remote_samples"] == ["114.114.114.9"]
+    assert cip["remote"] == 1
+    assert cip["lan"] == 30
+    assert len(cip["lan_samples"]) <= 4
+
+
+def test_client_ip_report_has_recency_timestamps():
+    """只有次数没有时间，"我刚才明明用数据播了"这句话和证据对不上。"""
+    q.reset_for_test()
+    q.network_of(_fake_request(headers={"x-forwarded-for": "114.114.114.9"}))
+    q.network_of(_fake_request(headers={"x-forwarded-for": "192.168.1.50"}))
+    cip = q.report()["client_ips"]
+    assert cip["remote_last"] >= 0 and cip["lan_last"] >= 0
+
+
 def test_sticky_cellular_outlives_lan():
     """粘性有效期刻意不对称：误判成 lan 会卡，误判成 cellular 只是音质低一档。"""
     q.reset_for_test()
