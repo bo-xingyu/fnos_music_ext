@@ -2316,6 +2316,13 @@ function runDiag(auto){
                   ?("  例: "+cip.samples.slice(0,3).join(" | "))
                   :"（未观察到 X-Forwarded-For——可能 nginx 未透传，远程识别不可用，建议用固定音质策略）"));
         out.push("  （远程(公网)访问默认按流量场景走省流档，可用 FNMUSIC_REMOTE_AS_CELLULAR=false 关闭）");
+        var nj=qy.network_judgements||{}, nk=Object.keys(nj);
+        out.push("  网络判定计数    : "+(nk.length?nk.map(function(k){return k+"="+nj[k];}).join("  "):"（尚无）"));
+        var ln=qy.last_network||{};
+        out.push("  粘性结论        : "+(ln.network?((ln.network==="cellular"?"流量/远程":"局域网")+"（"+ln.age_s+"s 前判出，判不出的请求沿用它）"):"无（近期没有任何一次能明确判出网络）"));
+        out.push("  ★ 判不出来的请求才会卡顿：它们不走降档分支，照发母带。"
+                +"「unknown」次数远大于 lan/remote 时，把 FNMUSIC_UNKNOWN_AS_CELLULAR 设为 true"
+                +"（当前="+qy.unknown_as_cellular+"）即可让所有判不出的请求一律走省流档");
         hk.slice(0,8).forEach(function(k){
           out.push("     "+k+"  x"+hits[k].count+"  样例="+JSON.stringify(hits[k].samples));
         });

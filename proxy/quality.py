@@ -202,6 +202,21 @@ def network_of(request: Any) -> str:
 
     采信的 IP 与判定结果全部进 report() 证据区——nginx 是否透传这些头在真机上
     一眼可见，透传不了也知道该换 fixed 策略而不是瞎猜。
+
+    **v2.9.18 加「粘性」**：XFF 在真机上是时有时无的（走官方后端/组网通道转发过来
+    的那次就没有），于是同一个网络环境下会交替出现 ``cellular`` 和 ``unknown``。
+    而 ``by_network`` 策略里只有 ``network == "cellular"`` 才降档——**判成 unknown
+    的那一次会照旧发 jymaster（Hi-Res 母带）**。用户体感就是「数据网络下时不时卡
+    一下」：卡顿的就是这些漏判的请求。
+
+    现在明确判出 cellular/lan 就记下来，后续 unknown 沿用最近一次结论。有效期刻意
+    **不对称**：判成 cellular 记 30 分钟，判成 lan 只记 5 分钟——因为两种误判的代价
+    不对等（见 `_LAN_TTL` 处注释）。宁可在判不出时多降一档（音质低一点），也不能在
+    窄管道上发母带。
+
+    **v2.9.18 补**：判定结果按类计数（含 unknown 与「被粘性救回」的次数）进证据区。
+    没有这个计数，unknown 是隐形的——它既不落到 lan 也不落到 remote，于是「到底有
+    多少请求压根判不出网络」这个问题永远没有答案，只能靠猜。
     """
     parts: list[str] = []
     for items in (_kv(getattr(request, "query_params", None)),
@@ -213,18 +228,95 @@ def network_of(request: Any) -> str:
     text = " | ".join(parts)
     if text:
         if any(k in text for k in _CELLULAR):
-            return "cellular"
+            return _remember_network("cellular")
         if any(k in text for k in _WIFI):
-            return "wifi"
+            return _remember_network("wifi")
 
     ips = forwarded_client_ips(request)
     if ips:
         public = [ip for ip in ips if is_public_ip(ip)]
         _record_client_ip_evidence(ips, bool(public))
         if public and remote_as_cellular():
-            return "cellular"
-        return "lan"
-    return "unknown"
+            return _remember_network("cellular")
+        return _remember_network("lan")
+    # 这次没线索：先沿用最近的明确结论（并记一笔「被粘性救回」，否则 unknown 的
+    # 真实占比永远看不见）；再退到「未知当流量」开关；最后才是真的 unknown。
+    _count_judgement("unknown")
+    return _sticky_network() or ("cellular" if unknown_as_cellular() else "unknown")
+
+
+# ---------------------------------------------------------------------------
+# 网络判定的粘性（v2.9.18）
+# ---------------------------------------------------------------------------
+
+_LAST_NETWORK: dict[str, Any] = {"network": "", "ts": 0.0}
+# 粘性有效期**刻意不对称**：
+#   - 误判成 cellular：只是音质低一档（320k），用户可能根本听不出来；
+#   - 误判成 lan：窄管道上照发 jymaster 母带（≈1MB/s），直接卡成幻灯片。
+# 两种错误的代价完全不对等，所以「上次是流量」记 30 分钟，而「上次是局域网」只记
+# 5 分钟——用户在家里播得好好的，出门用流量，5 分钟后就能自动降档，不用等半小时。
+_LAN_TTL = 300.0
+_CELLULAR_TTL = 1800.0
+
+
+def unknown_as_cellular() -> bool:
+    """完全判不出网络时，是否按流量场景处理（宁可音质低一档也不卡）。
+
+    默认关：家里若恰好一次 XFF 都没透传，开着会让 WiFi 也长期停在省流档。
+    真机上如果诊断页显示「判不出来」的次数很多，把它打开即可立刻见效。
+    """
+    return str(os.environ.get("FNMUSIC_UNKNOWN_AS_CELLULAR", "false") or "false") \
+        .strip().lower() in ("true", "1", "yes", "on")
+
+
+def _ttl_for(network: str) -> float:
+    return _CELLULAR_TTL if network == "cellular" else _LAN_TTL
+
+
+def _remember_network(network: str) -> str:
+    """记下这次明确判出的网络环境，供判不出来的请求沿用。"""
+    n = str(network or "").strip().lower()
+    if n in ("cellular", "lan", "wifi"):
+        _LAST_NETWORK["network"] = n
+        _LAST_NETWORK["ts"] = time.time()
+        _count_judgement(n)
+    return str(network or "")
+
+
+def _count_judgement(network: str) -> None:
+    """统计各类判定出现的次数——「判不出来」到底占多少，必须能看出来。
+
+    没有这个计数，诊断页只能显示「局域网 823 / 远程 21」，而真正的元凶（unknown）
+    是隐形的：它既不落 lan 也不落 remote，于是我们永远不知道该不该修。
+    """
+    rec = _OBSERVED.setdefault("network_judgements", {})
+    key = str(network or "unknown")
+    rec[key] = int(rec.get(key, 0)) + 1
+    if key == "unknown" and _sticky_network():
+        rec["unknown_rescued"] = int(rec.get("unknown_rescued", 0)) + 1
+
+
+def _sticky_network() -> str:
+    """最近一次明确判出的网络环境（过期返回空串）。"""
+    n = str(_LAST_NETWORK.get("network") or "")
+    ts = float(_LAST_NETWORK.get("ts") or 0.0)
+    if n and ts and (time.time() - ts) < _ttl_for(n):
+        return n
+    return ""
+
+
+def reset_network_memory() -> None:
+    """忘掉粘性结论（测试用；也可在切换网络后由外部调用）。"""
+    _LAST_NETWORK["network"] = ""
+    _LAST_NETWORK["ts"] = 0.0
+
+
+def last_network_evidence() -> dict[str, Any]:
+    """诊断用：粘性判定当前认为是什么网络、多久前判出来的。"""
+    n = _sticky_network()
+    if not n:
+        return {"network": "", "age_s": 0}
+    return {"network": n, "age_s": int(time.time() - float(_LAST_NETWORK.get("ts") or 0.0))}
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +492,12 @@ def resolve(request: Any = None, db_path: str = "") -> dict[str, str]:
     否则那个策略可能是从未生效过的空话。``auto:*`` = 读到了；``fallback:*`` = 没读到。
     """
     pol = policy()
-    network = network_of(request) if request is not None else "unknown"
+    if request is not None:
+        network = network_of(request)
+    else:
+        # 诊断页这种没有 request 的场景也要反映真实判定——否则页面永远显示
+        # unknown + wifi 档，而实际播放在降档，看起来像策略没生效。
+        network = _sticky_network() or "unknown"
     fallback = _default_level()
 
     if pol == "fixed":
@@ -447,6 +544,9 @@ def report(db_path: str = "") -> dict[str, Any]:
         "observed_paths_with_hints": dict(sorted(_OBSERVED["paths"].items(),
                                                  key=lambda kv: -kv[1])[:8]),
         "client_ips": _client_ip_report(),
+        "last_network": last_network_evidence(),
+        "network_judgements": dict(_OBSERVED.get("network_judgements") or {}),
+        "unknown_as_cellular": unknown_as_cellular(),
         "db_scan": ({
             "available": True,
             "path": scan.get("path", db_path),
@@ -483,3 +583,5 @@ def reset_for_test() -> None:
     _OBSERVED["db_path"] = ""
     _OBSERVED["db_scanned_at"] = 0.0
     _OBSERVED.pop("client_ips", None)
+    _OBSERVED.pop("network_judgements", None)
+    reset_network_memory()

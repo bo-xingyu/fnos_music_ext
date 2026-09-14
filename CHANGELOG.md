@@ -3,6 +3,37 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.9.18] - 2026-09-14
+
+**「WiFi 还行、数据网络卡顿」的元凶是音质档位没降下来，不是延迟。**
+
+诊断页这行是关键线索：
+
+```
+当前判定 : level=jymaster  network=unknown  source=manual:wifi
+```
+
+`by_network` 策略里**只有** `network == "cellular"` 才会走省流档；而 `network_of()`
+在请求里既没有网络类型提示、又没有 `X-Forwarded-For` 时返回 `unknown`——**unknown
+不等于 cellular，于是照旧发 jymaster（Hi-Res 母带）**。jymaster 实测约 1 MB/s，
+320k 只有 40 KB/s，差 25 倍；在移动数据 + 远程中继的窄管道上，前者必然断断续续。
+日志里 `GET /api/v1/song/167705/url?quality=jymaster` 就是实锤。
+
+本次改动：
+
+1. **网络判定带「粘性」，且有效期刻意不对称。** 明确判出过 cellular/lan 就记下来，
+   后续判不出的请求沿用；但**「上次是流量」记 30 分钟，「上次是局域网」只记 5 分钟**。
+   两种误判的代价完全不对等——误判成流量只是音质低一档，你可能根本听不出来；误判成
+   局域网就是在窄管道上照发母带，直接卡成幻灯片。所以宁可偏保守。
+2. **判定结果按类计数并显示在诊断页**（新增「网络判定计数」与「粘性结论」两行）。
+   以前 unknown 是隐形的：它既不落进 `client_ips.lan` 也不落进 `remote`，于是「到底
+   有多少请求压根判不出网络」永远没有答案，只能靠猜。现在数字直接摆出来。
+3. **新增 `FNMUSIC_UNKNOWN_AS_CELLULAR`**（默认 false）：一条线索都没有时一律按流量
+   档处理。若诊断页显示 unknown 占大头，把它打开即可立刻见效。默认关是因为家里若
+   恰好一次 XFF 都没透传，开着会让 WiFi 也长期停在省流档。
+4. **诊断页没有 request 时不再写死 unknown**（`resolve(None)` 以前硬编码，于是页面
+   永远显示 WiFi 档 + jymaster，而实际播放已经在降档——看起来像策略没生效）。
+
 ## [2.9.17] - 2026-09-14
 
 **本地优先几乎从不命中的根因：music.db 的 `title` 字段存的是完整文件名，不是标题。**

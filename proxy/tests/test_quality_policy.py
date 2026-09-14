@@ -190,6 +190,87 @@ def test_by_network_policy_uses_cellular_tier_for_remote(monkeypatch):
     assert q.network_of(_fake_request(query={"net": "无线"})) == "wifi"
 
 
+# --------------------------------------------------------- v2.9.18 网络判定粘性
+
+
+def _age_sticky(seconds: float) -> None:
+    """把粘性结论的时间戳往前推，模拟「多久之前判出来的」。"""
+    q._LAST_NETWORK["ts"] = q.time.time() - seconds
+
+
+def test_unknown_reuses_recent_cellular_verdict():
+    """真机上 XFF 时有时无：判不出的那一次必须沿用最近的「流量」结论。
+
+    否则同一个网络环境下会交替出现 cellular / unknown，而 by_network 只有
+    network == "cellular" 才降档——unknown 那次照发 jymaster 母带。用户体感
+    「数据网络下时不时卡一下」，卡的就是这些漏判的请求。
+    """
+    q.reset_for_test()
+    assert q.network_of(_fake_request(
+        headers={"x-forwarded-for": "114.114.114.9"})) == "cellular"
+    assert q.network_of(_fake_request()) == "cellular"
+
+
+def test_sticky_cellular_outlives_lan():
+    """粘性有效期刻意不对称：误判成 lan 会卡，误判成 cellular 只是音质低一档。"""
+    q.reset_for_test()
+    q.network_of(_fake_request(headers={"x-forwarded-for": "114.114.114.9"}))
+    _age_sticky(q._LAN_TTL + 60)                     # 远超 lan 有效期，但仍在 cellular 内
+    assert q._sticky_network() == "cellular"
+
+    q.reset_for_test()
+    q.network_of(_fake_request(headers={"x-forwarded-for": "192.168.1.50"}))
+    _age_sticky(q._LAN_TTL + 60)                     # 同样的时长，局域网结论已过期
+    assert q._sticky_network() == ""
+
+
+def test_unknown_without_any_evidence_stays_unknown_by_default(monkeypatch):
+    """一条线索都没有时默认不降档——否则家里 XFF 没透传会长期停在省流档。"""
+    monkeypatch.delenv("FNMUSIC_UNKNOWN_AS_CELLULAR", raising=False)
+    q.reset_for_test()
+    assert q.network_of(_fake_request()) == "unknown"
+
+
+def test_unknown_as_cellular_switch(monkeypatch):
+    monkeypatch.setenv("FNMUSIC_UNKNOWN_AS_CELLULAR", "true")
+    q.reset_for_test()
+    assert q.network_of(_fake_request()) == "cellular"
+
+
+def test_judgement_counts_expose_invisible_unknown():
+    """unknown 既不落 lan 也不落 remote，不单独计数就永远看不见它有多少。"""
+    q.reset_for_test()
+    q.network_of(_fake_request(headers={"x-forwarded-for": "114.114.114.9"}))
+    q.network_of(_fake_request())          # 无线索 → 被粘性救回
+    q.network_of(_fake_request())          # 再来一次
+    counts = q.report()["network_judgements"]
+    assert counts["cellular"] == 1
+    assert counts["unknown"] == 2
+    assert counts["unknown_rescued"] == 2
+
+
+def test_resolve_without_request_reflects_sticky(monkeypatch):
+    """诊断页没有 request：以前写死 unknown，页面永远显示 WiFi 档，
+    而实际播放在降档——看起来像策略没生效。"""
+    monkeypatch.setenv("FNMUSIC_QUALITY_POLICY", "by_network")
+    monkeypatch.setenv("FNMUSIC_QUALITY_WIFI", "jymaster")
+    monkeypatch.setenv("FNMUSIC_QUALITY_CELLULAR", "exhigh")
+    q.reset_for_test()
+    q.network_of(_fake_request(headers={"x-forwarded-for": "114.114.114.9"}))
+    d = q.resolve(None, db_path="")
+    assert d["network"] == "cellular"
+    assert d["level"] == "exhigh"
+    assert q.report()["last_network"]["network"] == "cellular"
+
+
+def test_reset_for_test_clears_network_memory():
+    q.reset_for_test()
+    q.network_of(_fake_request(headers={"x-forwarded-for": "114.114.114.9"}))
+    assert q._sticky_network() == "cellular"
+    q.reset_for_test()
+    assert q._sticky_network() == ""
+
+
 # --------------------------------------------------------------------- 被动观察
 
 

@@ -72,6 +72,10 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     # 公网客户端 IP（X-Forwarded-For）视同流量场景走省流档；false = 关闭。
     # 飞牛客户端从不发送网络类型键，不识别的话「流量档」永远不会触发。
     ("FNMUSIC_REMOTE_AS_CELLULAR", "true"),
+    # v2.9.18：XFF 时有时无，完全判不出网络时是否一律按流量场景走省流档。
+    # 默认 false（家里若一次 XFF 都没透传，开着会让 WiFi 也长期停在省流档）；
+    # 诊断页「网络判定计数」里 unknown 占大头时再打开。
+    ("FNMUSIC_UNKNOWN_AS_CELLULAR", "false"),
     # 在线曲目先匹配本地 music.db 同名文件，命中且音质类与策略一致时直接读本地
     ("FNMUSIC_LOCAL_FIRST", "true"),
     ("FNMUSIC_LOCAL_FIRST_ANY_CLASS", "true"),
@@ -123,7 +127,7 @@ NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOCAL_DAILY", "FN
                 "FNMUSIC_DOWNLOAD_", "FNMUSIC_FAV_",
                 "FNMUSIC_QUALITY_", "FNMUSIC_WATCHDOG_", "FNMUSIC_URL_CACHE_",
                 "FNMUSIC_CHANNEL_LIST_", "FNMUSIC_REMOTE_AS_", "FNMUSIC_LOCAL_",
-                "FNMUSIC_PREFETCH_", "FNMUSIC_COVER_")
+                "FNMUSIC_PREFETCH_", "FNMUSIC_COVER_", "FNMUSIC_UNKNOWN_AS_")
 
 # v2.0 已废弃的配置项：升级合并时从 .env 中清理，避免残留误导。
 # 只删「确定已无代码读取」的键；FNMUSIC_MODE / BASE_IMAGE / PIP_INDEX 等 docker 相关项保留。
