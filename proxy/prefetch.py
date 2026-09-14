@@ -64,9 +64,30 @@ def _lookahead() -> int:
 
 
 def on_list_enabled() -> bool:
-    """歌单列表一下发就预热它的前几首（用户点开时第一首已经热了）。"""
-    return str(os.environ.get("FNMUSIC_PREFETCH_ON_LIST", "true") or "true") \
+    """歌单列表一下发就预热它的前几首（用户点开时第一首已经热了）。
+
+    **默认关**（v2.9.16）：后台批量刷新歌单时（十几个歌单一起拉 tracks）会
+    顺带触发十几次预热，请求全堆到 musicbox 上——真机实测预热耗时从 400ms
+    涨到 1100ms，等于自己把自己堵死。只在用户真的点开歌单时预热才有意义。
+    """
+    return str(os.environ.get("FNMUSIC_PREFETCH_ON_LIST", "false") or "false") \
         .strip().lower() in ("true", "1", "yes", "on")
+
+
+def max_concurrent() -> int:
+    """同时最多几个预热在跑。真机 musicbox 是单进程，并发多了全变慢。"""
+    try:
+        return max(1, min(4, int(float(os.environ.get("FNMUSIC_PREFETCH_CONCURRENCY", "1") or 1))))
+    except (TypeError, ValueError):
+        return 1
+
+
+def timeout_seconds() -> float:
+    """单次预热最多等多久。超时就放弃（不重试），绝不能拖住别的请求。"""
+    try:
+        return max(1.0, min(15.0, float(os.environ.get("FNMUSIC_PREFETCH_TIMEOUT", "6") or 6)))
+    except (TypeError, ValueError):
+        return 6.0
 
 
 # 同一个 guid 的重复 Range 请求多久内只算「一次播放」。

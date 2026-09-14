@@ -279,6 +279,7 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     "library_dir": ("FNMUSIC_LIBRARY_DIR", _as_library_dir, False),
     # --- 本地曲库优先（v2.8 引入 / v2.9.14 修好）：播网易云歌单时优先读本地同名文件 ---
     "local_first": ("FNMUSIC_LOCAL_FIRST", _as_bool, False),
+    "local_first_any_class": ("FNMUSIC_LOCAL_FIRST_ANY_CLASS", _as_bool, False),
     # --- 下一首预热（v2.9.14 T1）：提前取回下一首的直链与元数据 ---
     "prefetch_next": ("FNMUSIC_PREFETCH_NEXT", _as_bool, False),
     "prefetch_lookahead": ("FNMUSIC_PREFETCH_LOOKAHEAD", _int_range(1, 5), False),
@@ -332,6 +333,7 @@ DEFAULTS = {
     "local_daily_limit": "50",
     "library_dir": "",
     "local_first": "true",
+    "local_first_any_class": "true",
     "prefetch_next": "true",
     "prefetch_lookahead": "3",
     "pushplus_enabled": "true",
@@ -1890,8 +1892,14 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
       <div class="sw"><input type="checkbox" name="local_first" id="c_local_first">
         <div class="t"><span class="lb">本地曲库优先</span>
           <span class="ht">播网易云歌单时，若 NAS 曲库里已有同一首歌就直接读本地文件（零外网、起步最快）；
-            没有再走网易云。是否采用本地文件受音质策略约束：策略要无损就只吃本地无损，
-            策略要 320k 就不喂本地母带。诊断页「本地曲库优先」一栏能看到索引条数与命中情况。</span></div></div>
+            没有再走网易云。诊断页「本地曲库优先」一栏能看到索引条数与命中情况。</span></div></div>
+
+      <div class="sw"><input type="checkbox" name="local_first_any_class" id="c_lf_any">
+        <div class="t"><span class="lb">本地优先：不挑音质档位</span>
+          <span class="ht"><b>推荐开启</b>：本地只要有同名曲就播，不再要求音质档位同类。
+            真机上策略要无损（jymaster）时，严格模式会把本地 MP3 拒掉、转头去网易云要无损——
+            <b>而网易云给的往往也是 MP3</b>，白出一趟外网。同名多首时仍然优先取无损那一条。
+            关掉则恢复严格：策略要无损就只吃本地无损，策略要省流量就不喂本地母带。</span></div></div>
 
       <div class="sw"><input type="checkbox" name="prefetch_next" id="c_prefetch">
         <div class="t"><span class="lb">下一首预热</span>
@@ -2017,7 +2025,7 @@ var $=function(s){return document.querySelector(s)};
 //     而给 checkbox 赋 value 不会改变勾选外观；
 //   - 提交时下面那句 `el.type==="checkbox"` 会把未登记的 checkbox 整个跳过，
 //     该字段不会出现在 values 里。
-var BOOLS=["free_only_on_logout","daily_enabled","local_daily_enabled","local_first","prefetch_next","pushplus_enabled","download_on_favorite","fav_sync_like"];
+var BOOLS=["free_only_on_logout","daily_enabled","local_daily_enabled","local_first","local_first_any_class","prefetch_next","pushplus_enabled","download_on_favorite","fav_sync_like"];
 var pollTimer=null, qrUnikey="", expireTimer=null;
 
 // 服务端注入的绝对前缀（形如 /app/fnmusicext/）。
@@ -2379,6 +2387,11 @@ function runDiag(auto){
         (lf.recent||[]).slice(-5).forEach(function(r){
           out.push("     "+(r.hit?"[命中] ":"[未中] ")+r.title+" - "+r.artist
                    +(r.hit?(" → "+r.path):(" （"+r.reason+"）")));
+          // 未命中时给出索引里最像的标题：一眼分清「本地真没这首歌」
+          // 和「名字写法的差异」——没有这个就只能靠猜。
+          if(!r.hit && r.near && r.near.length){
+            out.push("       索引里最接近: "+r.near.join(" / "));
+          }
         });
         if(lf.hint) out.push("  ★ "+lf.hint);
       }

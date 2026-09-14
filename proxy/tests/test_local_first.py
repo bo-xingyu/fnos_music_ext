@@ -105,7 +105,7 @@ def test_db_missing_returns_none(tmp_path):
     assert ll.find_local_match("晴天", "周杰伦", str(tmp_path / "nope.db")) is None
 
 
-def test_klass_helpers():
+def test_klass_helpers(monkeypatch):
     assert ll.klass_of_ext("flac") == "lossless"
     assert ll.klass_of_ext(".wav") == "lossless"
     assert ll.klass_of_ext("mp3") == "lossy"
@@ -113,9 +113,28 @@ def test_klass_helpers():
     assert ll.klass_of_level("lossless") == "lossless"
     assert ll.klass_of_level("exhigh") == "lossy"
     assert ll.klass_of_level("standard") == "lossy"
-    assert ll.serves_request({"ext": "flac"}, "lossless") is True
-    assert ll.serves_request({"ext": "flac"}, "exhigh") is False   # 省流量不吃本地母带
-    assert ll.serves_request({"ext": "mp3"}, "lossless") is False  # 320k 冒充不了无损
+
+
+def test_serves_request_default_is_any_class(monkeypatch):
+    """v2.9.16 起默认「本地有就播」。
+
+    真机 level=jymaster + 本地 mp3 被严格同类拒掉 → 转去网易云要无损，
+    **而网易云给的其实也是 MP3**（proxy.log 实锤）。绕一圈出外网拿回同样的
+    东西，所以默认改成不挑档位（同名多首时仍优先无损）。
+    """
+    monkeypatch.delenv("FNMUSIC_LOCAL_FIRST_ANY_CLASS", raising=False)
+    assert ll.any_class_allowed() is True
+    assert ll.serves_request({"ext": "mp3"}, "jymaster") is True
+    assert ll.serves_request({"ext": "flac"}, "exhigh") is True
+
+
+def test_serves_request_strict_mode(monkeypatch):
+    """设成 false 才要求同类：非无损不播 / 省流量时不喂母带。"""
+    monkeypatch.setenv("FNMUSIC_LOCAL_FIRST_ANY_CLASS", "false")
+    assert ll.any_class_allowed() is False
+    assert ll.serves_request({"ext": "flac"}, "jymaster") is True
+    assert ll.serves_request({"ext": "flac"}, "exhigh") is False   # 省流量不喂本地母带
+    assert ll.serves_request({"ext": "mp3"}, "jymaster") is False  # 320k 冒充不了无损
     assert ll.serves_request({"ext": "mp3"}, "exhigh") is True
 
 
@@ -189,7 +208,7 @@ def test_stream_local_first_serves_local_when_class_matches(monkeypatch, tmp_pat
 
 
 def test_stream_local_first_skipped_when_policy_wants_lower(monkeypatch, tmp_path):
-    """策略要 exhigh（省流量）、本地只有 Hi-Res/无损 → 不用本地，仍走网易云。"""
+    """严格模式下：策略要 exhigh（省流量）、本地只有 Hi-Res/无损 → 不用本地。"""
     local_flac = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.flac")
     with open(local_flac, "wb") as f:
         f.write(b"LOCAL_FLAC" * 300)
@@ -197,6 +216,7 @@ def test_stream_local_first_skipped_when_policy_wants_lower(monkeypatch, tmp_pat
     monkeypatch.setitem(CONF, "music_db", db)
     monkeypatch.setenv("FNMUSIC_QUALITY_POLICY", "by_network")
     monkeypatch.setenv("FNMUSIC_QUALITY_WIFI", "exhigh")
+    monkeypatch.setenv("FNMUSIC_LOCAL_FIRST_ANY_CLASS", "false")
 
     cdn_audio = b"NETEASE_320K" * 300
     _wire(monkeypatch, play_url="http://cdn.test/song.mp3", cdn=(200, cdn_audio))

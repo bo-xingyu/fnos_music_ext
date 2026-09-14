@@ -161,9 +161,20 @@ def test_first_of_prefetches_list_head():
 
 
 def test_on_list_enabled(monkeypatch):
-    assert pf.on_list_enabled() is True
-    monkeypatch.setenv("FNMUSIC_PREFETCH_ON_LIST", "false")
+    """默认关：后台批量刷歌单时会连带触发十几次预热，把 musicbox 自己堵死。"""
     assert pf.on_list_enabled() is False
+    monkeypatch.setenv("FNMUSIC_PREFETCH_ON_LIST", "true")
+    assert pf.on_list_enabled() is True
+
+
+def test_concurrency_and_timeout(monkeypatch):
+    """预热必须限并发、设超时——宁可不预热也不能拖慢正在播的那首。"""
+    assert pf.max_concurrent() == 1
+    monkeypatch.setenv("FNMUSIC_PREFETCH_CONCURRENCY", "4")
+    assert pf.max_concurrent() == 4
+    monkeypatch.setenv("FNMUSIC_PREFETCH_CONCURRENCY", "99")
+    assert pf.max_concurrent() == 4, "上限 4，musicbox 是单进程"
+    assert 1.0 <= pf.timeout_seconds() <= 15.0
 
 
 # ---------------------------------------------------------------------------

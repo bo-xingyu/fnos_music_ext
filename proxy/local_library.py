@@ -75,8 +75,18 @@ def local_first_enabled() -> bool:
 
 
 def any_class_allowed() -> bool:
-    """true = 只要本地有同名曲就播，不看音质档位是否同类。"""
-    return str(os.environ.get("FNMUSIC_LOCAL_FIRST_ANY_CLASS", "false") or "false") \
+    """true = 只要本地有同名曲就播，不看音质档位是否同类。**默认就是 true**。
+
+    为什么改默认（v2.9.16）：真机 `level=jymaster`（无损类）+ 本地是 mp3 时，
+    严格同类会把本地 mp3 一刀切拒掉、转头去网易云要无损——**而网易云给的其实
+    也是 MP3**（proxy.log 实锤：`CDN 回的是 audio/mpeg，曲目却声明无损`）。
+    绕一圈出了外网、多花几百毫秒，拿到的还是同样的 MP3。
+
+    所以「本地有就播」才是合理解：零外网、起步最快，且同名多首时仍然优先
+    取无损那条（见 find_local_match 的排序）。真正坚持「非无损不播」的用户
+    把它设成 false 即可。
+    """
+    return str(os.environ.get("FNMUSIC_LOCAL_FIRST_ANY_CLASS", "true") or "true") \
         .strip().lower() in ("true", "1", "yes", "on")
 
 
@@ -424,11 +434,35 @@ def find_local_match(title: str, artist: str, db_path: str,
         "ts": time.time(), "title": str(title or ""), "artist": str(artist or ""),
         "hit": hit is not None, "reason": reason,
         "path": str((hit or {}).get("path") or ""),
+        # 未命中时给出索引里最像的标题：区分「真没有」和「名字对不上」
+        "near": [] if hit is not None else suggest_similar(title, db_path, library_dir),
     })
     del _LOOKUP_LOG[:-_LOOKUP_LOG_MAX]
     if hit is None:
-        logger.debug("local-first miss (%s): title=%r artist=%r", reason, title, artist)
+        near = suggest_similar(str(title or ""), db_path, library_dir)
+        logger.debug("local-first miss (%s): title=%r artist=%r 相近标题=%s",
+                     reason, title, artist, near or "（无）")
     return hit
+
+
+def suggest_similar(title: str, db_path: str, library_dir: str = "",
+                    n: int = 3) -> list[str]:
+    """索引里跟这个标题最像的 n 个真实标题。
+
+    「本地明明有这首歌为什么不走本地」只有两种可能：真没有，或者名字对不上。
+    没有这个提示，诊断里一行 `title-not-in-index` 两种都可能，只能靠猜。
+    """
+    import difflib
+
+    key = norm_title(title)
+    if not key:
+        return []
+    titles = {str(e.get("title") or "")
+              for es in _get_index(db_path, library_dir).values() for e in es}
+    titles.discard("")
+    if not titles:
+        return []
+    return difflib.get_close_matches(str(title or ""), sorted(titles), n=n, cutoff=0.5)
 
 
 def serves_request(entry: dict, level: str) -> bool:

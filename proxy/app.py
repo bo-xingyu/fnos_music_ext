@@ -2787,30 +2787,56 @@ def stream_tee_response(
 # ---------------------------------------------------------------------------
 
 _PREFETCH_TASKS: dict[str, asyncio.Task] = {}
+# 预热并发闸门。musicbox 是单进程，同时塞给它一堆请求只会让**所有**请求变慢
+# （真机实测并发上去后单次预热从 400ms 涨到 1100ms），串起来反而更快。
+_PREFETCH_GATE: asyncio.Semaphore | None = None
+
+
+def _prefetch_gate() -> asyncio.Semaphore:
+    global _PREFETCH_GATE
+    if _PREFETCH_GATE is None:
+        _PREFETCH_GATE = asyncio.Semaphore(prefetch.max_concurrent())
+    return _PREFETCH_GATE
 
 
 async def _prefetch_one(request: Request, guid: str) -> None:
-    """后台把一首歌的直链与元数据取回来，只填缓存、不下载任何音频字节。"""
+    """后台把一首歌的直链与元数据取回来，只填缓存、不下载任何音频字节。
+
+    全程受并发闸门与超时双重约束：宁可这次不预热，也不能把 musicbox 拖慢
+    —— 那会让**正在播的那首**也跟着卡。
+    """
     started = time.monotonic()
     try:
-        song_id = song_id_from_online_guid(guid).split(":")[-1]
-        if not song_id:
-            prefetch.note_result(guid, False, 0.0, "no song id")
-            return
-        client = get_musicbox_client(request.app)
-        url, _info = await asyncio.gather(
-            resolve_netease_url(client, song_id, request),
-            _online_info(request, guid),
-            return_exceptions=True,
-        )
-        ok = bool(url) and not isinstance(url, Exception)
-        prefetch.note_result(guid, ok, (time.monotonic() - started) * 1000.0,
-                             "" if ok else f"url={url!r}")
+        async with _prefetch_gate():
+            try:
+                await asyncio.wait_for(_prefetch_inner(request, guid),
+                                       timeout=prefetch.timeout_seconds())
+            except asyncio.TimeoutError:
+                prefetch.bump("timeout")
+                prefetch.note_result(guid, False, (time.monotonic() - started) * 1000.0,
+                                     f"timeout>{prefetch.timeout_seconds():.0f}s")
     except Exception as exc:  # noqa: BLE001 - 预热失败只记日志，绝不影响播放
         prefetch.note_result(guid, False, (time.monotonic() - started) * 1000.0,
                              f"{type(exc).__name__}: {exc}")
     finally:
         _PREFETCH_TASKS.pop(guid, None)
+
+
+async def _prefetch_inner(request: Request, guid: str) -> None:
+    song_id = song_id_from_online_guid(guid).split(":")[-1]
+    if not song_id:
+        prefetch.note_result(guid, False, 0.0, "no song id")
+        return
+    started = time.monotonic()
+    client = get_musicbox_client(request.app)
+    url, _info = await asyncio.gather(
+        resolve_netease_url(client, song_id, request),
+        _online_info(request, guid),
+        return_exceptions=True,
+    )
+    ok = bool(url) and not isinstance(url, Exception)
+    prefetch.note_result(guid, ok, (time.monotonic() - started) * 1000.0,
+                         "" if ok else f"url={url!r}")
 
 
 def _schedule_prefetch(request: Request, guid: str) -> None:
