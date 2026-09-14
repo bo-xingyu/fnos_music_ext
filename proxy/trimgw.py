@@ -50,9 +50,14 @@ GATEWAY_PATH = "/api/v1/trimapp"
 TOKEN_ENV = "TRIM_API_TOKEN"
 APP_NAME_ENV = "TRIM_APPNAME"
 
-# 老版本 fnOS 没有 apiscope 网关，会把管理员授权的目录直接塞进这个环境变量
+# 老版本 fnOS 没有 apiscope 网关，会把管理员授权的目录直接塞进环境变量
 # （分号或冒号分隔）。一并读取，兼容 1.1.x / 1.2.x 两种形态。
 SHARE_PATHS_ENV = "TRIM_DATA_SHARE_PATHS"
+# 真机（fnOS 1.2.0604）环境变量清单里确实有这两个键：
+#   TRIM_DATA_SHARE_PATHS      管理员在「应用设置 → 授权目录」里授权的共享目录
+#   TRIM_DATA_ACCESSIBLE_PATHS 应用实际可访问的路径
+# 网关查不动时，它们就是授权状态最权威的兜底来源，两个都要读。
+ACCESSIBLE_PATHS_ENV = "TRIM_DATA_ACCESSIBLE_PATHS"
 
 DEFAULT_TIMEOUT = 3.0
 
@@ -284,8 +289,9 @@ def _split_paths(raw: str) -> list[str]:
 
 
 def env_share_paths() -> list[str]:
-    """兼容老版本：TRIM_DATA_SHARE_PATHS 里的管理员授权目录。"""
-    return _split_paths(os.environ.get(SHARE_PATHS_ENV) or "")
+    """兼容老版本/网关故障：环境变量里的管理员授权目录。"""
+    return _split_paths(os.environ.get(SHARE_PATHS_ENV) or "") + \
+        _split_paths(os.environ.get(ACCESSIBLE_PATHS_ENV) or "")
 
 
 def config_share_paths() -> list[str]:

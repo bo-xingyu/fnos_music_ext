@@ -3405,21 +3405,21 @@ def _local_daily_cover_probe(sample: int = 20) -> dict:
     }
 
 
-def _local_daily_playlist_cover(guid: str) -> "tuple[bytes, str] | None":
-    """本地每日推荐歌单的封面：取**歌单里第一张能拿到的真实歌曲封面**。
+def _local_daily_cover_track(guid: str) -> str:
+    """歌单里**第一张有真实封面**的曲目 guid；一首都取不到则返回空串。
 
-    命中过的曲目 guid 记在 ``_LOCAL_DAILY_COVER_SRC``，下次直接复用——不必每次
-    请求都把整个歌单的封面翻一遍。一首都取不到就返回 None，由调用方回退到
-    生成的占位图（保证永远有图，客户端不会因为 404 不渲染整条）。
+    为什么要它：真机日志里 ``ne:*`` 每个歌单都请求了封面，
+    ``static/cover?coverId=online:playlist:localdaily:...`` 却**一次都没出现**——
+    客户端压根不来要，界面上永远是飞牛自带的默认占位图。与其继续跟客户端的
+    封面策略较劲，不如直接把歌单的 ``coverId`` 指向某首**确实有内嵌封面**的
+    曲目（``local:file:<sha1>``）：这条路径已被真机验证能出图，而且正是用户
+    要的效果——"随便找一张歌单里的歌曲封面"。
     """
     if local_files is None:
-        return None
-    cached_track = _LOCAL_DAILY_COVER_SRC.get(guid)
-    if cached_track:
-        hit = local_files.cover(cached_track)
-        if hit:
-            return hit
-        _LOCAL_DAILY_COVER_SRC.pop(guid, None)
+        return ""
+    cached = _LOCAL_DAILY_COVER_SRC.get(guid)
+    if cached:
+        return cached
 
     rest = str(guid or "")[len(dailyrec.LOCAL_DAILY_GUID_PREFIX):]
     parts = rest.split(":")
@@ -3434,13 +3434,11 @@ def _local_daily_playlist_cover(guid: str) -> "tuple[bytes, str] | None":
     if not tracks:
         try:
             tracks = list((_load_local_daily_bundle(user) or {}).get("tracks") or [])
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("本地日推封面：取不到曲目清单 %s", exc)
-            return None
+        except Exception:  # noqa: BLE001
+            tracks = []
 
-    # 先看前 12 首（绝大多数专辑目录在前几首就有图，快）；都没有再扩大到 60 首。
-    # 只扫 12 首就放弃的话，前十几首恰好是没内嵌图的无损文件时，会误判成"整张
-    # 歌单没封面"而回退占位图——用户看到的就是"封面不是真实图"。
+    # 先看前 12 首（快）；都没有再扩大到 60 首，避免前十几首恰好是没内嵌图的
+    # 无损文件时误判成"整张歌单没封面"。
     for attempt in (0, 1):
         pool = tracks[:12] if attempt == 0 else tracks[12:60]
         if not pool:
@@ -3459,10 +3457,38 @@ def _local_daily_playlist_cover(guid: str) -> "tuple[bytes, str] | None":
                 _LOCAL_DAILY_COVER_SRC[guid] = g
                 logger.info("本地日推封面：命中曲目 %s（%s, %d 字节）",
                             g[:24], hit[1], len(hit[0]))
-                return hit
-    logger.info("本地日推封面：前 %d 首曲目都没取到真实封面，回退占位图（%s）",
-                min(12, len(tracks)), _local_daily_cover_probe(12).get("reason") or "未知")
-    return None
+                return g
+    logger.info("本地日推封面：前 %d 首曲目都没取到真实封面（%s）",
+                min(60, len(tracks)), _local_daily_cover_probe(12).get("reason") or "未知")
+    return ""
+
+
+def _local_daily_playlist_cover(guid: str) -> "tuple[bytes, str] | None":
+    """本地每日推荐歌单封面：返回命中曲目的真实封面字节（取不到则 None）。"""
+    g = _local_daily_cover_track(guid)
+    if not g or local_files is None:
+        return None
+    try:
+        return local_files.cover(g)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _apply_local_daily_cover(rec: dict) -> dict:
+    """把歌单条目的封面字段指向「歌单里真实有封面的那首歌」。
+
+    字段形状与网易云伪歌单（``_channel_public_fields``）对齐：``coverUrl`` /
+    ``cover_url`` 一并给上；并且**绝不能**标 ``source: "local"``——那会让客户端
+    把它当成本地歌单、转去 music.db 找封面，结果就是永远不请求 static/cover。
+    """
+    g = _local_daily_cover_track(str(rec.get("guid") or ""))
+    rec["source"] = "localdaily"
+    if g:
+        url = f"/music/api/v1/static/cover?coverId={quote(g, safe='')}&size=400"
+        rec["coverId"] = g
+        rec["coverUrl"] = url
+        rec["cover_url"] = url
+    return rec
 
 
 def _png_chunk(tag: bytes, data: bytes) -> bytes:
@@ -4556,7 +4582,9 @@ async def playlist_list(request: Request):
         local_rec["name"] = dailyrec.local_daily_playlist_name(local_bundle.get("day") or dailyrec.today_key())
         local_rec["trackCount"] = len(local_tracks)
         local_rec["isDaily"] = False
-        local_rec["source"] = "local"
+        # 封面字段指向歌单里真实有封面的那首歌（并避免标 source="local"，
+        # 那会让客户端转去 music.db 找封面、永远不请求 static/cover）
+        _apply_local_daily_cover(local_rec)
         head_items.append(("localdaily", local_rec))
     else:
         # 不注入的原因必须落日志：真机最常见的两类是「开关关着」和「曲库没扫到
@@ -4623,6 +4651,7 @@ async def playlist_detail(request: Request):
         if reg_ts:
             rec["createdAt"] = int(reg_ts)
             rec["updatedAt"] = int(reg_ts)
+        _apply_local_daily_cover(rec)
         return JSONResponse(content={"code": 0, "msg": "ok", "data": rec})
     if not dailyrec.is_daily_playlist_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
@@ -4709,6 +4738,7 @@ async def playlist_batch_detail(request: Request):
                 if reg_ts:
                     local_daily_rec["createdAt"] = int(reg_ts)
                     local_daily_rec["updatedAt"] = int(reg_ts)
+                _apply_local_daily_cover(local_daily_rec)
             out.append(local_daily_rec)
         elif daily_rec is None:
             # 每日推荐只解析一次；同一次批量请求里重复的日推 guid 复用结果

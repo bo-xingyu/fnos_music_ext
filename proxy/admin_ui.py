@@ -2321,7 +2321,7 @@ function runDiag(auto){
         var tk=Object.keys(tenv);
         out.push("  系统注入变量   : "+(tk.length?tk.join(", "):"★ 一个都没有（进程不是由系统脚本拉起？）"));
         tk.forEach(function(k){
-          if(/PKGVAR|PKGMETA|PKGETC|PKGHOME|APPNAME|APPVER|SYS_VERSION|APP_STATUS/.test(k))
+          if(/PKGVAR|PKGMETA|PKGETC|PKGHOME|APPNAME|APPVER|SYS_VERSION|APP_STATUS|DATA_SHARE_PATHS|DATA_ACCESSIBLE_PATHS/.test(k))
             out.push("      "+k+" = "+tenv[k]);
         });
         if(az.hint) out.push("  ★ "+az.hint);
@@ -2494,7 +2494,7 @@ function authRender(j){
     // 值里能看出系统登记的应用名（TRIM_PKGVAR=/vol1/@appdata/<appname>）
     for(var i=0;i<envKeys.length;i++){
       var k=envKeys[i];
-      if(/PKGVAR|PKGMETA|PKGETC|PKGHOME|APPNAME|APPVER|SYS_VERSION/.test(k)){
+      if(/PKGVAR|PKGMETA|PKGETC|PKGHOME|APPNAME|APPVER|SYS_VERSION|DATA_SHARE_PATHS|DATA_ACCESSIBLE_PATHS/.test(k)){
         lines.push("                 "+k+" = "+env[k]);
       }
     }

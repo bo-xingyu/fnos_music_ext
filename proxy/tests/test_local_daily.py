@@ -361,3 +361,46 @@ def test_local_daily_cover_probe_reports_no_index(monkeypatch):
     r = app_mod._local_daily_cover_probe(5)
     assert r["indexed"] == 0
     assert "索引" in (r["reason"] or ""), "索引没建和文件没图是两种病，得分开说"
+
+
+def test_apply_local_daily_cover_points_at_real_track(monkeypatch):
+    """客户端不会为 localdaily 发封面请求，所以 coverId 必须直接指向有图的曲目。"""
+    from proxy import app as app_mod
+    from proxy import recommend as dailyrec
+
+    monkeypatch.setattr(dailyrec, "load_local_daily_cache",
+                        lambda user, day: {"tracks": [{"guid": "local:file:aaa"}]})
+    monkeypatch.setattr(app_mod, "_LOCAL_DAILY_COVER_SRC", {})
+
+    class _FakeLF:
+        @staticmethod
+        def cover(g):
+            return (b"IMG", "image/jpeg")
+
+    monkeypatch.setattr(app_mod, "local_files", _FakeLF)
+    out = app_mod._apply_local_daily_cover({"guid": "online:playlist:localdaily:20260914:u1"})
+    assert out["coverId"] == "local:file:aaa", "封面直接对准那首有内嵌图的歌"
+    assert "static/cover" in out["coverUrl"] and "local%3Afile%3Aaaa" in out["coverUrl"]
+    assert out["cover_url"] == out["coverUrl"]
+    assert out["source"] != "local", \
+        "source=local 会让客户端把它当本地歌单、转去 music.db 找封面，永远不请求 static/cover"
+
+
+def test_apply_local_daily_cover_keeps_guid_when_no_cover(monkeypatch):
+    from proxy import app as app_mod
+    from proxy import recommend as dailyrec
+
+    monkeypatch.setattr(dailyrec, "load_local_daily_cache",
+                        lambda user, day: {"tracks": [{"guid": "local:file:aaa"}]})
+    monkeypatch.setattr(app_mod, "_LOCAL_DAILY_COVER_SRC", {})
+
+    class _FakeLF:
+        @staticmethod
+        def cover(g):
+            return None
+
+    monkeypatch.setattr(app_mod, "local_files", _FakeLF)
+    out = app_mod._apply_local_daily_cover({"guid": "online:playlist:localdaily:20260914:u1",
+                                            "coverId": "online:playlist:localdaily:20260914:u1"})
+    assert out["coverId"] == "online:playlist:localdaily:20260914:u1", "取不到图就不动 coverId"
+    assert out["source"] != "local"

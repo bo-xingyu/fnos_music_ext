@@ -3,6 +3,64 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.9.11] - 2026-09-14
+
+**修掉本地每日推荐「封面不是真实图」——真正的病根不在封面，在字段形状。**
+
+### 起因
+
+2.9.10 的诊断数据把真相摆到了面前：
+
+```
+封面探测 : 曲目=66  已查=20  有索引=20  内嵌图=17  同目录图=0  可用=17
+```
+
+**17 首有内嵌封面，图是有的。** 可 proxy.log 里：
+
+```
+GET /music/api/v1/static/cover?coverId=online%3Aplaylist%3Ane%3A6900072061
+GET /music/api/v1/static/cover?coverId=online%3Aplaylist%3Ane%3A8443086236
+... （ne:* 每个都请求了）
+（唯独没有 coverId=online:playlist:localdaily:... 的请求）
+```
+
+客户端**压根没来要**本地日推的封面。也就是说：2.9.9 改的"用真实歌曲封面"
+根本没机会生效，我 2.9.4 生成的那张 PNG 也从来没被用上 —— 用户看到的一直是
+**飞牛客户端自带的默认占位图**。
+
+对比网易云伪歌单的字段形状，差异一目了然：
+
+| 字段 | 网易云伪歌单（`_channel_public_fields`） | 本地日推 |
+|---|---|---|
+| `coverId` | = guid | = guid ✅ |
+| `coverUrl` / `cover_url` | **有** | **无** ❌ |
+| `source` | `"netease"` | **`"local"`** ❌ |
+
+两个嫌疑：缺 `coverUrl`，以及我在 `playlist/list` 里标的 `source: "local"`。
+后者尤其可疑——飞牛的本地歌单本来就用 `source` 区分来源，标成 `local` 会让
+客户端转去 music.db 找封面，自然不会来请求 `static/cover`。
+
+### 改动
+
+与其继续猜客户端的封面策略，不如**绕开它**：
+
+1. 新增 `_local_daily_cover_track()`：找出歌单里第一张**确实有内嵌封面**的曲目。
+2. 新增 `_apply_local_daily_cover()`：把歌单条目的 `coverId` **直接指向那首歌**
+   （`local:file:<sha1>`），并补齐 `coverUrl` / `cover_url`。
+   `local:file:` 这条封面路径已被真机验证能出图（日志里 200 OK）。
+   取不到任何封面时保持原 `coverId` 不变。
+3. **去掉 `source: "local"`**，改成 `"localdaily"`（客户端不认识的值，不会触发
+   本地歌单的封面逻辑）。
+4. 三个出口全部应用：`playlist/list`、`playlist/detail`、`playlist/batch-detail`。
+5. 顺带：`trimgw` 增加读取 `TRIM_DATA_ACCESSIBLE_PATHS`（真机环境变量清单里
+   确实有这个键），作为网关查不动时的授权目录兜底来源。
+
+### 回归测试
+
+* `test_apply_local_daily_cover_points_at_real_track` —— `coverId` 必须指向有图的
+  曲目、`coverUrl` 指向 `static/cover`，且 **`source` 绝不能是 `"local"`**。
+* `test_apply_local_daily_cover_keeps_guid_when_no_cover` —— 取不到图时不改 `coverId`。
+
 ## [2.9.10] - 2026-09-14
 
 **封面与网关两件事都补齐「可观测性」——不再靠猜。**
