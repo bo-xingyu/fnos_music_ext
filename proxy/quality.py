@@ -429,7 +429,11 @@ def report(db_path: str = "") -> dict[str, Any]:
     的线索（客户端传了什么键、db 里扫到了什么行），需要进一步适配时这就是依据。
     """
     decision = resolve(None, db_path)
-    scan = _OBSERVED.get("db")
+    # ★ 这里必须自己扫一遍，不能只读 _OBSERVED：fixed / by_network 策略在
+    # resolve() 里根本走不到 preference_from_db（读 db 只有 follow_fnos 需要），
+    # 于是 _OBSERVED["db"] 永远是 None，诊断页就会显示「music.db 不存在或未能
+    # 打开」——db 明明好好地在那里，纯粹是我们没去查。这种假警报最坑人。
+    scan = scan_music_db(db_path) if db_path else _OBSERVED.get("db")
     hints = _OBSERVED["hints"]
     return {
         "policy": decision["policy"],
@@ -445,11 +449,19 @@ def report(db_path: str = "") -> dict[str, Any]:
         "client_ips": _client_ip_report(),
         "db_scan": ({
             "available": True,
+            "path": scan.get("path", db_path),
             "hits": len(scan.get("hits") or []),
             "sample_hits": (scan.get("hits") or [])[:5],
             "error": scan.get("error", ""),
-        } if scan else {"available": False, "hits": 0,
-                        "note": "music.db 不存在或未能打开"}),
+        } if scan else {
+            "available": False,
+            "hits": 0,
+            "path": db_path,
+            # 区分「压根没给路径」和「给了但文件不在」：前者是调用方的问题，
+            # 后者才是真的没装/移库，两者的处理方式完全不同。
+            "note": ("未传入 music.db 路径（无法扫描）" if not db_path
+                     else f"music.db 不存在或未能打开: {db_path}"),
+        }),
     }
 
 

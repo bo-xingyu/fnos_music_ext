@@ -3,6 +3,60 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.9.13] - 2026-09-14
+
+**授权其实一直是成功的——是我们把官方下发的结果当成了「降级」。顺带修掉诊断页一条假警报。**
+
+### ① 系统早就把授权结果给出来了，我们却还在打那个 500 的网关
+
+2.9.12 的诊断第一次把系统注入的变量值摊开，答案就在里面：
+
+```
+TRIM_DATA_ACCESSIBLE_PATHS = /vol1/1000/存储空间1/汇总音乐
+TRIM_DATA_SHARE_PATHS      = （空）
+```
+
+这个值和你在「应用设置 → 授权目录」里勾选的完全一致 —— **系统已经把该路径的 ACL 授予了本应用，并把结果直接写进了进程环境变量**。
+这就是飞牛官方授权的权威结果。可我们之前只把它当成"网关查不到时的兜底"，照旧每次去打
+`trim.file.getSharedAccessibleFolders`，拿到稳定的 `HTTP/1.1 500 / 200006 Internal Error`，
+然后给授权卡片打上「config（降级）」——明明是已授权，界面上却像出了故障。
+
+本次改动：
+
+| 之前 | 现在 |
+| --- | --- |
+| 无条件查网关，失败后回退 env/config，标记 `source=config`、`degraded=true` | env 有值 → **直接用，跳过网关**，`source=env`、`degraded=false` |
+| 诊断页常驻一行「网关返回 : Internal Error」 | 显示「网关查询 : 已跳过 — 系统已通过 TRIM_DATA_ACCESSIBLE_PATHS 下发授权目录」 |
+| 只认 `trim.file.getSharedAccessibleFolders` 一个 req 名 | 依次试 `getSharedAccessibleFolders` / `sharedAccess` / `getSharedFolders`，并试一次带 `uid` 的调用 |
+
+点「刷新状态」时仍会主动探一次网关，但结果单独列为**「网关主动探测（仅供参考）」**，
+不参与来源判定——不会再让一次 500 把已授权显示成故障。
+
+### ② 诊断页那句「music.db 不存在或未能打开」是假警报
+
+同一份诊断里，音质策略区块说 `music.db 扫描 available=false`，本地曲库区块却说
+`music.db 存在=true` 并读出了 `shared_library`。两者都对，因为是**同一页的两次判断**：
+
+```python
+def report(db_path=""):
+    decision = resolve(None, db_path)     # by_network/fixed 策略下根本不读 db
+    scan = _OBSERVED.get("db")            # → 永远是 None
+```
+
+`resolve()` 里只有 `follow_fnos` 策略才会走到 `preference_from_db`，你的策略是
+`by_network`，直接就返回了，`_OBSERVED["db"]` 从头到尾没被填过。于是 note 打出了
+"不存在或未能打开"——库就在那儿，只是没去查。
+
+现在 `report()` 自己扫一遍（有 5 分钟缓存，不会每次都扫库），并把两种情况分开说：
+没传路径 → "未传入 music.db 路径（无法扫描）"；传了但文件不在 → 才说文件不存在。
+
+### 测试
+
+- `test_trimgw.py`：`test_shared_folders_uses_env_paths_as_official_authorization`
+  （env 有值时**不得**再去调网关，否则直接断言失败；`source=env` 且 `degraded=False`）、
+  `test_shared_folders_falls_back_to_config_when_no_env`、`test_probe_shared_tries_req_aliases`。
+- `test_quality_policy.py`：`test_report_scans_db_even_when_policy_does_not_need_it`。
+
 ## [2.9.12] - 2026-09-14
 
 **两处体验优化：歌单名去掉日期、文件位置显示真实路径。**

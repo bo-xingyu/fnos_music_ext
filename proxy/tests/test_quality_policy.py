@@ -403,6 +403,32 @@ def test_report_never_raises_and_exposes_evidence(music_db):
     assert rep2["db_scan"]["available"] is False
 
 
+def test_report_scans_db_even_when_policy_does_not_need_it(music_db, monkeypatch):
+    """v2.9.13：by_network / fixed 策略下 db_scan 曾谎报「music.db 不存在」。
+
+    resolve() 里只有 follow_fnos 才会去读 db，其他策略直接返回，于是
+    _OBSERVED["db"] 一直是 None —— 诊断页照着它就打出「music.db 不存在或未能
+    打开」，可同一页的本地曲库区块明明写着该库存在。db 在、只是没去查，不该
+    报成缺失。report() 必须自己扫一遍。
+    """
+    monkeypatch.setenv("FNMUSIC_QUALITY_POLICY", "by_network")
+    rep = q.report(db_path=music_db)
+    assert rep["policy"] == "by_network"
+    assert rep["db_scan"]["available"] is True
+    assert rep["db_scan"]["hits"] >= 1, "库里有 setting 偏好行，就该扫出来"
+
+    monkeypatch.setenv("FNMUSIC_QUALITY_POLICY", "fixed")
+    q.reset_for_test()
+    rep2 = q.report(db_path=music_db)
+    assert rep2["db_scan"]["available"] is True
+
+    # 没给路径时才允许 unavailable，并且要说清是「没给路径」而不是「文件不在」
+    q.reset_for_test()
+    rep3 = q.report(db_path="")
+    assert rep3["db_scan"]["available"] is False
+    assert "路径" in rep3["db_scan"]["note"]
+
+
 # --------------------------------------------------------------------- 接线
 
 

@@ -48,16 +48,65 @@ def test_call_without_token_returns_error_not_raise(monkeypatch):
     assert trimgw.TOKEN_ENV in resp["msg"]
 
 
-def test_shared_folders_falls_back_to_env_paths(monkeypatch, tmp_path):
-    """网关不存在时：不能假装没有授权，要退回环境变量里的目录。"""
+def test_shared_folders_uses_env_paths_as_official_authorization(monkeypatch, tmp_path):
+    """v2.9.13：系统把授权结果写进 TRIM_DATA_ACCESSIBLE_PATHS —— 这是官方授权。
+
+    真机实测该变量 = /vol1/1000/存储空间1/汇总音乐，与管理员在「应用设置 →
+    授权目录」里勾选的完全一致。既然系统给了答案就不该再去打那个稳定 500 的
+    网关，更不能因为它报错就把已授权显示成「降级」。
+    """
     lib = tmp_path / "music"
     lib.mkdir()
-    monkeypatch.setenv(trimgw.SHARE_PATHS_ENV, str(lib))
+    monkeypatch.setenv(trimgw.ACCESSIBLE_PATHS_ENV, str(lib))
+    monkeypatch.setenv(trimgw.SHARE_PATHS_ENV, "")
+    monkeypatch.setenv(trimgw.TOKEN_ENV, "dummy")
+
+    def boom(*a, **kw):  # 网关要是还被调用，就说明跳过逻辑没生效
+        raise AssertionError("env 已给出授权目录，不该再去查网关")
+
+    monkeypatch.setattr(trimgw, "call", boom)
+    paths, err = trimgw.shared_accessible_folders(force=True)
+    assert paths == [str(lib)]
+    assert err == ""                                  # 不是故障，当然没有错误
+    assert trimgw.gateway_last_state()["skipped"] is True
+
+    rep = trimgw.authorized_report(force=True)
+    assert rep["source"] == "env"
+    assert rep["degraded"] is False                   # ★ 官方授权 ≠ 降级
+    assert rep["authorized"] is True
+
+
+def test_shared_folders_falls_back_to_config_when_no_env(monkeypatch, tmp_path):
+    """env 没给、网关查不动时：退到 share_paths 文件，并如实带回失败原因。"""
+    lib = tmp_path / "music"
+    lib.mkdir()
+    monkeypatch.setenv(trimgw.ACCESSIBLE_PATHS_ENV, "")
+    monkeypatch.setenv(trimgw.SHARE_PATHS_ENV, "")
     monkeypatch.setattr(trimgw, "GATEWAY_SOCKET", "/nonexistent/gateway.socket")
     monkeypatch.setenv(trimgw.TOKEN_ENV, "dummy")
+    monkeypatch.setattr(trimgw, "config_share_paths", lambda: [str(lib)])
     paths, err = trimgw.shared_accessible_folders(force=True)
     assert paths == [str(lib)]
     assert err  # 同时如实带回失败原因
+    rep = trimgw.authorized_report(force=True)
+    assert rep["source"] == "config"
+    assert rep["degraded"] is True
+
+
+def test_probe_shared_tries_req_aliases(monkeypatch):
+    """req 名对不上网关就是 200006；别名一个个试到通为止。"""
+    tried = []
+
+    def fake_call(req, data=None, timeout=0.0):
+        tried.append((req, data))
+        if req == "trim.file.sharedAccess":
+            return {"code": 0, "msg": "", "data": {"paths": ["/vol1/music"]}}
+        return {"code": 200006, "msg": "Internal Error", "data": None}
+
+    monkeypatch.setattr(trimgw, "call", fake_call)
+    resp = trimgw.probe_shared_via_gateway()
+    assert resp.get("req_used") == "trim.file.sharedAccess"
+    assert len(tried) >= 2
 
 
 def test_authorized_report_without_gateway_is_safe(monkeypatch):
@@ -75,6 +124,7 @@ def test_authorized_report_hint_mentions_admin_when_err_is_admin_only(monkeypatc
     monkeypatch.setattr(trimgw, "GATEWAY_SOCKET", str(gw))
     monkeypatch.setenv(trimgw.TOKEN_ENV, "dummy")
     monkeypatch.setenv(trimgw.SHARE_PATHS_ENV, "")
+    monkeypatch.setenv(trimgw.ACCESSIBLE_PATHS_ENV, "")
 
     def fake_call(req, data=None, timeout=0.0):
         return {"code": 1, "msg": "仅管理员可进行此操作", "data": {}}
@@ -137,6 +187,7 @@ def test_cache_is_used_until_invalidated(monkeypatch):
         return {"code": 0, "msg": "", "data": {"paths": ["/vol1/x"]}}
 
     monkeypatch.setenv(trimgw.TOKEN_ENV, "dummy")
+    monkeypatch.setenv(trimgw.ACCESSIBLE_PATHS_ENV, "")
     monkeypatch.setattr(trimgw, "call", fake_call)
     trimgw.shared_accessible_folders()
     trimgw.shared_accessible_folders()
@@ -149,6 +200,7 @@ def test_cache_is_used_until_invalidated(monkeypatch):
 def test_existing_dirs_only(tmp_path, monkeypatch):
     """已授权但目录已被删掉的，不该出现在清单里误导人。"""
     monkeypatch.setenv(trimgw.SHARE_PATHS_ENV, f"{tmp_path}/gone:{tmp_path}")
+    monkeypatch.setenv(trimgw.ACCESSIBLE_PATHS_ENV, "")
     monkeypatch.setattr(trimgw, "GATEWAY_SOCKET", "/nonexistent/gateway.socket")
     monkeypatch.setenv(trimgw.TOKEN_ENV, "dummy")
     rep = trimgw.authorized_report(force=True)

@@ -61,8 +61,30 @@ ACCESSIBLE_PATHS_ENV = "TRIM_DATA_ACCESSIBLE_PATHS"
 
 DEFAULT_TIMEOUT = 3.0
 
+# 这几类错误换了 appName / req 名也一样，不值得重试：
+#   200001 参数错 / 200003 Forbidden / 200004 Unauthorized / 200005 Not Found
+NO_RETRY_CODES = {200001, 200003, 200004, 200005}
+
+# 查「管理员授权了哪些目录」的 req 名。文档写的是第一个，但真机上它稳定返回
+# 200006 Internal Error；网关按 req 名分发，名字对不上就是内部错误，所以把
+# 可能的别名都试一遍，哪个通就用哪个（只在环境变量没给答案时才需要查）。
+SHARED_REQ_CANDIDATES = (
+    "trim.file.getSharedAccessibleFolders",
+    "trim.file.sharedAccess",
+    "trim.file.getSharedFolders",
+)
+
 _CACHE: dict[str, tuple[float, object]] = {}
 _CACHE_TTL = 60.0
+
+# 最近一次「要不要查网关 / 查了没有 / 查成啥样」的状态，给诊断页展示用。
+# skipped=True 表示系统已经通过环境变量给了授权目录，我们把网关跳过了。
+_GATEWAY_LAST: dict[str, object] = {}
+
+
+def gateway_last_state() -> dict:
+    """最近一次网关处理状态（skipped / req / code / msg）。"""
+    return dict(_GATEWAY_LAST)
 
 
 def app_name() -> str:
@@ -205,7 +227,7 @@ def call(req: str, data: dict | None = None, timeout: float = DEFAULT_TIMEOUT) -
     只有"内部错误/未知错误"才值得换名字重试；参数错、scope 不足、token 无效
     这几类换了也一样，别浪费时间。
     """
-    _NOT_WORTH_RETRY = {200001, 200003, 200004, 200005}  # 参数/Forbidden/Unauthorized/NotFound
+    _NOT_WORTH_RETRY = NO_RETRY_CODES
     names = candidate_app_names()
     last: dict | None = None
     for idx, name in enumerate(names):
@@ -331,21 +353,81 @@ def config_share_paths() -> list[str]:
     return out
 
 
+def _shared_req_attempts() -> "list[tuple[str, dict]]":
+    """(req, data) 尝试序列。
+
+    getSharedAccessibleFolders 真机上回报 200006，除了换 req 名，也试一次带
+    uid 的调用（飞牛很多文件类接口都强制要 uid），万一就是这个差别呢。
+    """
+    out: list[tuple[str, dict]] = []
+    uid = str(os.environ.get("TRIM_UID") or "").strip()
+    for req in SHARED_REQ_CANDIDATES:
+        out.append((req, {}))
+    if uid.isdigit():
+        out.insert(1, (SHARED_REQ_CANDIDATES[0], {"uid": int(uid)}))
+    return out
+
+
+def probe_shared_via_gateway() -> dict:
+    """真去查一次网关（不查缓存）。返回最后一次响应，成功时带 req_used。"""
+    last: dict = {"code": -1, "msg": "网关不可用"}
+    for idx, (req, data) in enumerate(_shared_req_attempts()):
+        resp = call(req, data or None)
+        code = int(resp.get("code") or 0)
+        if code == 0:
+            resp["req_used"] = req
+            if idx:
+                logger.info("开放网关查询授权目录成功：req 用的是 %r（第 %d 个候选）", req, idx + 1)
+            return resp
+        last = resp
+        if code in NO_RETRY_CODES:
+            break
+    return last
+
+
 def shared_accessible_folders(force: bool = False) -> tuple[list[str], str]:
-    """管理员为应用授权的共享目录（trim.file.getSharedAccessibleFolders）。
+    """管理员为应用授权的共享目录。
 
     返回 (路径列表, 错误信息)。列表为空 + 错误信息不空 = 查询失败/未授权。
+
+    **v2.9.13 的关键认知**：系统把 ACL 授权结果**直接写进了进程环境变量**
+    ``TRIM_DATA_ACCESSIBLE_PATHS``（真机实测 =
+    ``/vol1/1000/存储空间1/汇总音乐``，与管理员在「应用设置 → 授权目录」里
+    勾选的完全一致）。这**就是官方授权的权威结果**，不是什么降级兜底——
+    既然系统已经给了答案，就没必要再去打那个稳定 500 的网关，也省得诊断页
+    天天挂着一行吓人的 Internal Error。
     """
     key = "shared"
     if not force:
         hit = _cached(key)
         if hit is not None:
             return hit  # type: ignore[return-value]
-    resp = call("trim.file.getSharedAccessibleFolders")
-    fallback = env_share_paths() + config_share_paths()
+
+    env_paths = env_share_paths()
+    fallback: list[str] = []
+    for p in env_paths + config_share_paths():
+        if p not in fallback:
+            fallback.append(p)
+
+    _GATEWAY_LAST.clear()
+    if env_paths:
+        # 系统已下发授权目录 → 官方授权成立，跳过网关
+        _GATEWAY_LAST.update({
+            "skipped": True,
+            "reason": "系统已通过 " + ACCESSIBLE_PATHS_ENV + " 下发授权目录，无需查询网关",
+        })
+        return _put(key, (fallback, ""))  # type: ignore[return-value]
+
+    resp = probe_shared_via_gateway()
+    _GATEWAY_LAST.update({
+        "skipped": False,
+        "req": str(resp.get("req_used") or SHARED_REQ_CANDIDATES[0]),
+        "code": int(resp.get("code") or 0),
+        "msg": str(resp.get("msg") or ""),
+    })
     if int(resp.get("code") or 0) != 0:
-        # 网关查不动（没 token / 系统版本低）时，退到环境变量与 share_paths 文件：
-        # 管理员已经授权过的话，这两处能查到，不能因为查不了网关就报"未授权"。
+        # 网关查不动（没 token / 系统版本低）时，退到 share_paths 文件：
+        # 管理员已经授权过的话这里能查到，不能因为查不了网关就报"未授权"。
         res: tuple[list[str], str] = (fallback, str(resp.get("msg") or "未知错误"))
     else:
         data = resp.get("data") or {}
@@ -383,12 +465,23 @@ def authorized_report(force: bool = False) -> dict:
     shared = _existing(shared)
     token_present = bool(str(os.environ.get(TOKEN_ENV) or "").strip())
     gateway_present = os.path.exists(GATEWAY_SOCKET)
-    # 授权来源：gateway = 开放网关查到的（最权威）；config = 退到 share_paths
-    # 文件/环境变量读到的；none = 完全查不到。前两种都算「已授权」。
-    source = "gateway" if (token_present and not shared_err) else ("config" if shared else "none")
-    if not shared_err:
-        source = "gateway" if token_present else ("config" if shared else "none")
-    return {
+    env_paths = _existing(env_share_paths())
+    cfg_paths = _existing(config_share_paths())
+    # 授权来源（权威度从高到低）：
+    #   env     = 系统把 ACL 结果写进了 TRIM_DATA_ACCESSIBLE_PATHS —— **官方授权**，非降级
+    #   gateway = 开放网关 trim.file.getSharedAccessibleFolders 查到的
+    #   config  = 只从 share_paths 文件读到的（没有 env 也没有网关答案）
+    #   none    = 完全查不到
+    if env_paths:
+        source = "env"
+    elif token_present and not shared_err:
+        source = "gateway"
+    else:
+        source = "config" if shared else "none"
+    # 只有「连系统都没给授权目录」才算降级；env 是官方授权结果，不算。
+    degraded = source in ("config", "none")
+
+    report = {
         "gateway": {
             "socket": GATEWAY_SOCKET,
             "exists": gateway_present,
@@ -398,22 +491,38 @@ def authorized_report(force: bool = False) -> dict:
         "shared_paths": shared,
         "shared_error": shared_err,
         "source": source,
-        "env_paths": _existing(env_share_paths()),
-        "config_paths": _existing(config_share_paths()),
-        "degraded": source != "gateway",
+        "env_paths": env_paths,
+        "config_paths": cfg_paths,
+        "degraded": degraded,
         "authorized": bool(shared),
         "app_names": candidate_app_names(),
         "last_raw": last_raw_response(),
+        "gateway_last": gateway_last_state(),
         "trim_env": trim_env_report(),
         "hint": _hint(shared, shared_err, gateway_present, token_present),
         "note": _note(source, token_present, gateway_present, shared_err),
     }
+    # 环境变量已经给了答案时，用户点「刷新状态」仍然主动探一次网关，把真实
+    # 结果摆出来（纯参考，不参与上面的来源判定，所以不会把已授权显示成故障）。
+    if force and env_paths and gateway_present and token_present:
+        resp = probe_shared_via_gateway()
+        report["gateway_probe"] = {
+            "req": str(resp.get("req_used") or SHARED_REQ_CANDIDATES[0]),
+            "code": int(resp.get("code") or 0),
+            "msg": str(resp.get("msg") or ""),
+            "raw": last_raw_response(),
+        }
+    return report
 
 
 def _note(source: str, token_present: bool, gateway_present: bool, shared_err: str = "") -> str:
     """非「网关直查」时的解释性说明。降级不该被当成故障报错——曲库照样读得动。"""
     if source == "gateway":
         return ""
+    if source == "env":
+        return (f"系统已把授权结果直接下发到本进程的环境变量 {ACCESSIBLE_PATHS_ENV}"
+                f"（= {', '.join(_existing(env_share_paths())) or '（空）'}），"
+                "这就是飞牛官方授权的权威结果，不是降级、功能完全正常，因此不再查询网关。")
     if source == "config":
         return ("已从应用配置（share_paths）读到授权目录，功能正常。"
                 + ("" if token_present else

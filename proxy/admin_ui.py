@@ -2310,13 +2310,18 @@ function runDiag(auto){
         out.push("  已授权目录     : "+((az.shared_paths&&az.shared_paths.length)?az.shared_paths.join(" | "):"（无）"));
         if(az.config_paths&&az.config_paths.length)
           out.push("  配置文件路径   : "+az.config_paths.join(" | "));
-        if(az.source) out.push("  授权来源       : "+az.source+(az.degraded?"（降级，功能不受影响）":""));
+        if(az.source) out.push("  授权来源       : "+az.source+(az.degraded?"（降级，功能不受影响）":(az.source==="env"?"（官方授权，非降级）":"")));
         if(az.env_paths&&az.env_paths.length)
           out.push("  环境变量路径   : "+az.env_paths.join(" | "));
         out.push("  当前曲库目录   : "+az.library_dir+"  被授权覆盖="+(!!az.authorized));
         out.push("  严格模式       : "+az.strict+"（true=只扫已授权目录）");
-        if(az.shared_error) out.push("  网关返回       : "+az.shared_error);
+        var gl=az.gateway_last||{};
+        if(gl.skipped) out.push("  网关查询       : 已跳过 — "+gl.reason);
+        else if(az.shared_error) out.push("  网关返回       : "+az.shared_error);
         if(az.last_raw) out.push("  网关原始响应   : "+az.last_raw);
+        // 环境变量已给答案时，「刷新状态」会额外主动探一次网关，结果仅供参考
+        if(az.gateway_probe) out.push("  网关主动探测   : req="+az.gateway_probe.req+" code="+az.gateway_probe.code
+                                      +" "+(az.gateway_probe.msg||"")+"（仅供参考，授权以环境变量为准）");
         var tenv=(az.trim_env&&az.trim_env.values)||{};
         var tk=Object.keys(tenv);
         out.push("  系统注入变量   : "+(tk.length?tk.join(", "):"★ 一个都没有（进程不是由系统脚本拉起？）"));
@@ -2481,9 +2486,11 @@ function authRender(j){
   lines.push("TRIM_API_TOKEN : "+(gw.token_present?"已注入":"★ 未注入（进程需由系统脚本启动）"));
   lines.push("已授权目录     : "+((j.shared_paths&&j.shared_paths.length)?j.shared_paths.join("\n                 "):"（无）"));
   lines.push("当前曲库目录   : "+(j.library_dir||"（未定位）")+"   被授权覆盖="+(j.authorized?"是":"★ 否"));
-  if(j.source) lines.push("授权来源       : "+j.source+(j.degraded?"（降级，功能不受影响）":""));
-  if((j.app_names||[]).length) lines.push("应用名候选     : "+j.app_names.join(" / "));
-  if(j.shared_error) lines.push("网关返回       : "+j.shared_error);
+  if(j.source) lines.push("授权来源       : "+j.source+(j.degraded?"（降级，功能不受影响）":(j.source==="env"?"（官方授权，非降级）":"")));
+  if(j.app_names&&j.app_names.length) lines.push("应用名候选     : "+j.app_names.join(" / "));
+  var gl=j.gateway_last||{};
+  if(gl.skipped) lines.push("网关查询       : 已跳过 — "+gl.reason);
+  else if(j.shared_error) lines.push("网关返回       : "+j.shared_error);
   // Internal Error 太笼统，光看 code/msg 无法定位，把状态行与响应体原文一并列出，
   // 用户把这段贴出来就能直接判断是 appName 不对、scope 没生效还是系统版本问题。
   if(j.last_raw) lines.push("网关原始响应   : "+j.last_raw);
