@@ -224,6 +224,92 @@ def test_stream_local_first_disabled_by_env(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# v2.9.14：索引不再只靠 music.db —— 曲库目录文件系统扫描
+# ---------------------------------------------------------------------------
+
+
+def test_fs_index_builds_from_library_dir_when_db_has_no_tracks(tmp_path):
+    """真机事故：music.db 里只有 shared_library、没有曲目表 → 索引恒为空、
+    本地优先一次都不命中，界面上却毫无迹象。现在目录扫描必须能兜住。"""
+    flac = _write_audio("周杰伦 - 晴天.flac")
+    empty_db = str(tmp_path / "nope.db")     # 库不存在
+
+    assert ll.find_local_match("晴天", "周杰伦", empty_db, CONF["library_dir"])["path"] == flac
+    assert ll.find_local_match("不存在的歌", "周杰伦", empty_db, CONF["library_dir"]) is None
+
+
+def test_fs_index_uses_parent_dir_as_artist(tmp_path):
+    """/曲库/许嵩/庐州月.flac —— 文件名没分隔符时退用父目录名当艺术家。"""
+    folder = os.path.join(CONF["library_dir"], "许嵩")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "庐州月.flac")
+    with open(path, "wb") as f:
+        f.write(b"A" * 1024)
+
+    hit = ll.find_local_match("庐州月", "许嵩", str(tmp_path / "n.db"), CONF["library_dir"])
+    assert hit is not None and hit["path"] == path
+    assert ll.artist_compatible(hit["artist"], "许嵩")
+
+
+def test_fs_index_ignores_non_audio_and_empty_files(tmp_path):
+    _write_audio("cover.jpg", 2048)
+    _write_audio("歌词.lrc", 512)
+    _write_audio("空的 - 文件.mp3", 0)          # 0 字节不算曲目
+    good = _write_audio("周杰伦 - 稻香.mp3")
+
+    idx = ll.build_fs_index(CONF["library_dir"])
+    paths = [i["path"] for es in idx.values() for i in es]
+    assert paths == [good], paths
+
+
+def test_index_merges_db_and_fs_without_duplicate_paths(tmp_path):
+    """同一首歌 db 和目录都索引到时，只保留一条（db 优先，它带真实标签）。"""
+    shared = _write_audio("周杰伦 - 晴天.flac")
+    other = _write_audio("周杰伦 - 稻香.mp3")
+    db = _make_music_db(tmp_path, [("晴天", "周杰伦", shared)])
+
+    hit = ll.find_local_match("晴天", "周杰伦", db, CONF["library_dir"])
+    assert hit["path"] == shared
+    assert hit.get("src") == "db", "同一 path 去重后应保留 music.db 的条目"
+
+    st = ll.status(db, CONF["library_dir"])
+    assert st["from_db"] == 1
+    assert other in [i["path"] for es in
+                     ll._get_index(db, CONF["library_dir"]).values() for i in es]
+
+
+def test_artist_compatible_allows_containment():
+    assert ll.artist_compatible("", "周杰伦") is True          # 一侧缺失
+    assert ll.artist_compatible("周杰伦", "") is True
+    assert ll.artist_compatible("周杰伦", "周杰伦") is True
+    assert ll.artist_compatible("许嵩 / 何曼婷", "许嵩") is True  # 主艺术家包含
+    assert ll.artist_compatible("许嵩", "许嵩 / 何曼婷") is True
+    assert ll.artist_compatible("周杰伦", "蔡依林") is False
+    assert ll.artist_compatible("周杰伦", "周杰伦与合唱团") is True
+
+
+def test_split_name_separators():
+    assert ll._split_name("周杰伦 - 晴天") == ("周杰伦", "晴天")
+    assert ll._split_name("许嵩 _ 庐州月") == ("许嵩", "庐州月")
+    assert ll._split_name("庐州月", "许嵩") == ("许嵩", "庐州月")
+
+
+def test_status_reports_empty_reason_when_nothing_indexed(tmp_path):
+    """索引为空时诊断页必须给出「为什么空」，而不是一个沉默的 0。"""
+    st = ll.status(str(tmp_path / "nope.db"), "")
+    assert st["entries"] == 0
+    assert st["empty_reason"], "必须说明索引为什么是空的"
+    assert st["enabled"] is True
+
+
+def test_lookup_log_records_miss_reason(tmp_path):
+    ll.find_local_match("不存在的歌", "周杰伦", str(tmp_path / "n.db"))
+    st = ll.status(str(tmp_path / "n.db"), "")
+    assert st["lookups"] == 1 and st["lookup_hits"] == 0
+    assert st["recent"][-1]["reason"] == "title-not-in-index"
+
+
+# ---------------------------------------------------------------------------
 # v2.8.1：music.db 自动定位
 # ---------------------------------------------------------------------------
 

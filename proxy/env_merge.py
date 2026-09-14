@@ -36,6 +36,9 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     # 本地每日推荐（v2.9）：每天从本地曲库随机抽 N 首，与网易云日推独立
     ("FNMUSIC_LOCAL_DAILY_ENABLED", "true"),
     ("FNMUSIC_LOCAL_DAILY_LIMIT", "50"),
+    # 本地曲库优先（v2.8 引入 / v2.9.14 修好）与下一首预热（v2.9.14）
+    ("FNMUSIC_LOCAL_FIRST", "true"),
+    ("FNMUSIC_PREFETCH_NEXT", "true"),
     # --- 更多口径歌单 / 账户歌单（v2.2 新增）---
     ("FNMUSIC_NETEASE_CHANNELS", "mine,toplist,category"),
     ("FNMUSIC_NETEASE_CHANNEL_LIMIT", "8"),
@@ -118,7 +121,7 @@ NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOCAL_DAILY", "FN
                 "FNMUSIC_DOWNLOAD_", "FNMUSIC_FAV_",
                 "FNMUSIC_QUALITY_", "FNMUSIC_WATCHDOG_", "FNMUSIC_URL_CACHE_",
                 "FNMUSIC_CHANNEL_LIST_", "FNMUSIC_REMOTE_AS_", "FNMUSIC_LOCAL_",
-                "FNMUSIC_COVER_")
+                "FNMUSIC_PREFETCH_", "FNMUSIC_COVER_")
 
 # v2.0 已废弃的配置项：升级合并时从 .env 中清理，避免残留误导。
 # 只删「确定已无代码读取」的键；FNMUSIC_MODE / BASE_IMAGE / PIP_INDEX 等 docker 相关项保留。

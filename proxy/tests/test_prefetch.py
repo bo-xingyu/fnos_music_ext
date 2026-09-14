@@ -1,0 +1,177 @@
+"""下一首预热（T1）：上下文推断、单飞、统计与可关开关。"""
+from __future__ import annotations
+
+import os
+
+import pytest
+
+from proxy import prefetch as pf
+
+
+@pytest.fixture(autouse=True)
+def _reset(monkeypatch):
+    pf.reset_for_test()
+    monkeypatch.delenv("FNMUSIC_PREFETCH_NEXT", raising=False)
+    yield
+    pf.reset_for_test()
+
+
+def _tracks(*guids):
+    return [{"guid": g} for g in guids]
+
+
+# ---------------------------------------------------------------------------
+# 上下文推断
+# ---------------------------------------------------------------------------
+
+
+def test_remember_context_and_next_of():
+    assert pf.remember_context("pl:1", _tracks("a", "b", "c")) == 3
+    assert pf.next_of("a") == ("pl:1", "b")
+    assert pf.next_of("b") == ("pl:1", "c")
+    assert pf.next_of("c") is None, "最后一首没有下一首"
+
+
+def test_remember_context_ignores_too_short_or_empty():
+    assert pf.remember_context("pl:1", _tracks("a")) == 0
+    assert pf.remember_context("pl:1", []) == 0
+    assert pf.next_of("a") is None
+
+
+def test_same_context_replaced_not_duplicated():
+    pf.remember_context("pl:1", _tracks("a", "b", "c"))
+    pf.remember_context("pl:1", _tracks("a", "x", "y"))
+    assert pf.next_of("a") == ("pl:1", "x"), "同名上下文应覆盖而不是并存"
+    assert len(pf.context_report()) == 1
+
+
+def test_newest_context_wins():
+    pf.remember_context("pl:old", _tracks("a", "b"))
+    pf.remember_context("pl:new", _tracks("a", "z"))
+    assert pf.next_of("a") == ("pl:new", "z")
+
+
+def test_context_capped_at_max():
+    for i in range(pf.MAX_CONTEXTS + 4):
+        pf.remember_context(f"pl:{i}", _tracks(f"g{i}", f"h{i}"))
+    assert len(pf.context_report()) == pf.MAX_CONTEXTS
+
+
+def test_tracks_capped_at_max():
+    guids = [f"g{i}" for i in range(pf.MAX_TRACKS + 50)]
+    assert pf.remember_context("pl:big", _tracks(*guids)) == pf.MAX_TRACKS
+
+
+def test_next_of_unknown_guid():
+    pf.remember_context("pl:1", _tracks("a", "b"))
+    assert pf.next_of("zzz") is None
+    assert pf.next_of("") is None
+
+
+def test_contexts_expire_after_ttl(monkeypatch):
+    pf.remember_context("pl:1", _tracks("a", "b"))
+    real = pf.time.time
+    monkeypatch.setattr(pf.time, "time", lambda: real() + pf.CONTEXT_TTL + 1)
+    assert pf.next_of("a") is None, "过期的上下文不该再用来推断下一首"
+
+
+# ---------------------------------------------------------------------------
+# 单飞
+# ---------------------------------------------------------------------------
+
+
+def test_claim_single_flight_within_window():
+    assert pf.claim("a") is True
+    assert pf.claim("a") is False, "同一个 guid 60s 内只应预热一次"
+    assert pf.claim("b") is True
+
+
+def test_claim_rejected_for_empty_guid():
+    assert pf.claim("") is False
+    assert pf.claim("   ") is False
+
+
+# ---------------------------------------------------------------------------
+# 统计
+# ---------------------------------------------------------------------------
+
+
+def test_stats_and_hit_rate():
+    pf.bump("scheduled")
+    pf.note_result("a", True, 120.0)
+    pf.note_play("a", 30.0, warm=True)      # 命中预热
+    pf.bump("scheduled")
+    pf.note_result("b", False, 90.0, "no url")
+    pf.note_play("b", 500.0, warm=False)    # 冷启动
+
+    st = pf.status()
+    assert st["scheduled"] == 2
+    assert st["done"] == 1
+    assert st["failed"] == 1
+    assert st["plays"] == 2
+    assert st["hits"] == 1
+    assert st["hit_rate"] == 0.5
+    assert st["cold_ms"] == 500.0
+    assert st["warm_ms"] == 30.0
+    assert st["saved_ms"] == 470.0
+    assert st["recent"][-1]["guid"] == "b"
+
+
+def test_warming_seconds():
+    assert pf.warming_seconds("a") is None
+    pf.note_result("a", True, 10.0)
+    secs = pf.warming_seconds("a")
+    assert secs is not None and secs >= 0
+
+
+def test_no_next_counter():
+    pf.bump("no_next")
+    assert pf.status()["no_next"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 开关
+# ---------------------------------------------------------------------------
+
+
+def test_enabled_default_true():
+    assert pf.enabled() is True
+
+
+def test_disabled_by_env(monkeypatch):
+    monkeypatch.setenv("FNMUSIC_PREFETCH_NEXT", "false")
+    assert pf.enabled() is False
+    monkeypatch.setenv("FNMUSIC_PREFETCH_NEXT", "0")
+    assert pf.enabled() is False
+    monkeypatch.setenv("FNMUSIC_PREFETCH_NEXT", "on")
+    assert pf.enabled() is True
+
+
+def test_env_read_at_call_time(monkeypatch):
+    """开关必须是每次读，不能在 import 时固化——改设置不该要求重启。"""
+    assert pf.enabled() is True
+    monkeypatch.setenv("FNMUSIC_PREFETCH_NEXT", "false")
+    assert pf.enabled() is False
+
+
+def test_reset_for_test_clears_everything():
+    pf.remember_context("pl:1", _tracks("a", "b"))
+    pf.note_result("a", True, 1.0)
+    pf.note_play("a", 2.0, warm=True)
+    pf.reset_for_test()
+    st = pf.status()
+    assert st["contexts"] == [] and st["recent"] == []
+    assert st["plays"] == 0 and st["done"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 默认进包：预热开关必须能在管理页改、升级后自动补进配置文件
+# ---------------------------------------------------------------------------
+
+
+def test_prefetch_env_is_backfilled_by_env_merge():
+    from proxy import env_merge
+
+    assert "FNMUSIC_PREFETCH_NEXT" in dict(env_merge.NEW_DEFAULTS)
+    assert any("FNMUSIC_PREFETCH_" == p for p in env_merge.NEW_PREFIXES)
+    assert os.environ.get("FNMUSIC_PREFETCH_NEXT") is None or True

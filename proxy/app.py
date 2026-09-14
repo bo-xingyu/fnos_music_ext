@@ -46,6 +46,7 @@ try:
     from . import recommend as dailyrec
     from . import trimgw
     from . import local_files
+    from . import prefetch
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import netease_auth  # type: ignore
@@ -58,6 +59,7 @@ except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
     import trimgw  # type: ignore
     import local_files  # type: ignore
+    import prefetch  # type: ignore
     from version import get_version  # type: ignore
 
 logger = logging.getLogger("fnmusic_proxy")
@@ -1101,6 +1103,39 @@ def ext_from_content_type(content_type: str) -> str:
     if "mpeg" in ct or "mp3" in ct:
         return "mp3"
     return play_format_from_ext(ct.split("/")[-1] if "/" in ct else "mp3")
+
+
+def sniff_audio_ext(path: str) -> str:
+    """按**文件头**判断真实音频格式，判断不出返回空串。
+
+    为什么要它：Content-Type 也可能撒谎（中转/回源层给 application/octet-stream），
+    而落盘文件的扩展名一旦错了就全是坑——写标签失败、本地曲库当无损匹配、
+    客户端按错的容器去解。文件头是唯一可信的依据。
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+    except OSError:
+        return ""
+    if head[:4] == b"fLaC":
+        return "flac"
+    if head[:3] == b"ID3":
+        return "mp3"
+    if head[:4] == b"OggS":
+        return "ogg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "wav"
+    if head[:4] == b"wvpk":
+        return "wv"
+    if head[:4] == b"MAC ":
+        return "ape"
+    if head[:4] == b"FORM" and head[8:12] == b"AIFF":
+        return "aiff"
+    if head[4:8] == b"ftyp":
+        return "m4a"
+    if len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0:
+        return "mp3"      # MPEG 帧同步字（无 ID3 头的裸 MP3）
+    return ""
 
 
 def parse_http_range(range_header: str | None, file_size: int) -> tuple[int, int] | None:
@@ -2165,6 +2200,47 @@ async def ext_local_daily(request: Request):
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
 
 
+@app.get("/_ext/localfirst")
+async def ext_local_first():
+    """本地曲库优先的状态快照（v2.9.14）。
+
+    这个模块之前最大的问题不是逻辑错，而是**无法自证**：索引空了、匹配没命中，
+    界面上一点迹象都没有，看起来就是「没做」。这里把索引构成、来源、最近查询
+    结果全部摊开。
+    """
+    try:
+        lib = detect_library_dir()
+        rep = local_library.status(resolve_music_db(), lib)
+        rep["policy_level"] = ""
+        rep["hint"] = ""
+        if not rep["enabled"]:
+            rep["hint"] = "已在管理页关闭「本地曲库优先」。"
+        elif not rep["entries"]:
+            rep["hint"] = ("索引是空的，本地优先永远不会命中：" + (rep["empty_reason"] or "")
+                           + "。请确认「本地曲库目录」填对、且已在应用设置里授权该目录。")
+        elif rep["lookups"] and not rep["lookup_hits"]:
+            rep["hint"] = ("索引有歌但一次都没匹配上——多半是标题写法对不上（网易云的标题"
+                           "带「(Live)」「- Remaster」等后缀）。把「最近查询」贴给开发者即可定位。")
+        return {"ok": True, "data": rep}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("local first diag failed: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
+
+
+@app.get("/_ext/prefetch")
+async def ext_prefetch():
+    """下一首预热（T1）的运行统计（v2.9.14）。
+
+    预热有没有生效不能靠感觉，这里给出：调度/成功/失败次数、在线播放里命中
+    预热的比率、以及**冷启动与预热后的 gather 平均耗时差**（= 实际省下的毫秒）。
+    """
+    try:
+        return {"ok": True, "data": prefetch.status()}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("prefetch diag failed: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
+
+
 @app.get("/_ext/authorized")
 async def ext_authorized(request: Request):
     """飞牛「应用授权目录」状态快照（v2.9.4）。
@@ -2537,6 +2613,17 @@ def stream_tee_response(
         if v:
             out_headers[k] = v
 
+    _ct = (resp.headers.get("content-type") or "").strip().lower()
+    # ⚠️ 直链**实际给的格式**可能低于请求的音质档位（jymaster 无权益时网易云直接
+    # 给 320k MP3），也可能被 CDN 误标（网易 CDN 有时给无损流回 audio/mpeg）。
+    # 所以响应头维持原策略（以 info/URL 为准，见
+    # test_stream_track_netease_mpeg_content_type_override_to_flac），只在两者
+    # 打架时留一条日志；**落盘扩展名**则交给下面的文件头嗅探做最终裁决——那才是
+    # 唯一可信的依据，落错了会写出「.flac 装 MP3」的坏文件。
+    if _ct and "mpeg" in _ct and str(resolved_ext or "").strip().lower() == "flac":
+        logger.info("CDN 回的是 audio/mpeg，曲目却声明无损（%s）：可能已降级为 MP3，"
+                    "落盘时将按文件头判定真实格式", guid)
+
     if resolved_ext:
         out_headers["content-type"] = media_type_for_ext(resolved_ext)
 
@@ -2584,6 +2671,8 @@ def stream_tee_response(
                 return False
 
         async def _downloader():
+            # ext 要在落盘前按文件头纠正，所以它不是本函数的局部变量
+            nonlocal ext
             written = 0
             part_file = None
             abandoned = False
@@ -2628,6 +2717,13 @@ def stream_tee_response(
                 lyric_text = str((info or {}).get("lyric") or (info or {}).get("lrc") or "")
                 complete = written >= 1024 and (content_length is None or written == content_length)
                 if complete:
+                    _sniffed = sniff_audio_ext(part_path)
+                    if _sniffed and _sniffed != ext:
+                        logger.info("缓存文件按文件头纠正扩展名 %s -> %s（%s）"
+                                    "——直链实际给的格式与曲目声明的不一致，"
+                                    "不纠正会落出「.flac 装 MP3」的坏文件",
+                                    ext, _sniffed, guid)
+                        ext = _sniffed
                     dest = library_media_path(guid, title, ext, artist=artist)
                     try:
                         os.replace(part_path, dest)
@@ -2675,6 +2771,69 @@ def stream_tee_response(
                 await client_to_close.aclose()
 
     return StreamingResponse(stream_no_cache(), status_code=status_code, headers=out_headers)
+
+
+# ---------------------------------------------------------------------------
+# 下一首预热（T1）
+#
+# 真机实测一首没缓存的在线歌要 519ms 才出声，其中绝大部分是两个 musicbox 往返
+# （直链 + 元数据/歌词），而客户端自己完全不预取。这里在播放当前曲目时把下一首
+# 的直链与元数据提前取回来（**只取几个 KB 的 JSON，不下载音频**），下一首起步
+# 时两个缓存都是热的，整段往返直接省掉。
+#
+# 「下一首是谁」没有上下文参数可用（stream 请求只有 guid），靠我们下发过的有序
+# 列表推断，见 proxy/prefetch.py。推断错了的代价只是几个 KB，所以可以放心做；
+# 真要做整首预下载（T2）就必须先解决随机播放下的准确率问题。
+# ---------------------------------------------------------------------------
+
+_PREFETCH_TASKS: dict[str, asyncio.Task] = {}
+
+
+async def _prefetch_one(request: Request, guid: str) -> None:
+    """后台把一首歌的直链与元数据取回来，只填缓存、不下载任何音频字节。"""
+    started = time.monotonic()
+    try:
+        song_id = song_id_from_online_guid(guid).split(":")[-1]
+        if not song_id:
+            prefetch.note_result(guid, False, 0.0, "no song id")
+            return
+        client = get_musicbox_client(request.app)
+        url, _info = await asyncio.gather(
+            resolve_netease_url(client, song_id, request),
+            _online_info(request, guid),
+            return_exceptions=True,
+        )
+        ok = bool(url) and not isinstance(url, Exception)
+        prefetch.note_result(guid, ok, (time.monotonic() - started) * 1000.0,
+                             "" if ok else f"url={url!r}")
+    except Exception as exc:  # noqa: BLE001 - 预热失败只记日志，绝不影响播放
+        prefetch.note_result(guid, False, (time.monotonic() - started) * 1000.0,
+                             f"{type(exc).__name__}: {exc}")
+    finally:
+        _PREFETCH_TASKS.pop(guid, None)
+
+
+def _schedule_prefetch(request: Request, guid: str) -> None:
+    """为「下一首」安排一次预热。同步返回，失败静默，绝不阻塞当前播放。"""
+    try:
+        if not prefetch.enabled():
+            return
+        found = prefetch.next_of(guid)
+        if not found:
+            prefetch.bump("no_next")
+            return
+        _ctx, next_guid = found
+        if not is_online_guid(next_guid) or next_guid == guid:
+            prefetch.bump("no_next")
+            return
+        if prefetch.warming_seconds(next_guid) is not None or not prefetch.claim(next_guid):
+            prefetch.bump("already")
+            return
+        prefetch.bump("scheduled")
+        logger.info("prefetch schedule: %s -> %s", guid, next_guid)
+        _PREFETCH_TASKS[next_guid] = asyncio.create_task(_prefetch_one(request, next_guid))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("prefetch schedule failed for %s: %s: %s", guid, type(exc).__name__, exc)
 
 
 @app.get("/music/api/v1/track/stream")
@@ -2736,41 +2895,77 @@ async def stream_track(request: Request):
     if not song_id:
         return _online_unavailable()
 
+    # ------------------------------------------------------------------
+    # 本地曲库优先（v2.8 引入，v2.9.14 修好）：NAS 上已有同一首歌时直接读本地
+    # 文件——零外网、起步最快。
+    #
+    # v2.9.14 两处关键修正：
+    #   ① 索引来源并入**曲库目录扫描**。之前只扫 music.db，而真机上那个库里压根
+    #      没有曲目表（能读到的只有 shared_library 一排目录），索引恒为空、永不
+    #      命中，界面上却毫无迹象——看起来就是「这功能没做」。
+    #   ② 标题已知时**在联网之前**就判。否则「优先」是假的：直链都取回来了才想
+    #      起来本地有，519ms 的网络往返照付。
+    # 是否可用本地仍受音质策略约束（见 local_library 模块头注）；网易云取链彻底
+    # 失败时本地匹配（不论档位）作最后兜底。
+    # ------------------------------------------------------------------
+    local_db = resolve_music_db()
+    local_dir = detect_library_dir()
+    local_hit: dict | None = None
+
+    def _try_local_first(title: str, artist: str, phase: str):
+        """查本地并在档位相符时直接出流；返回 Response 或 None（None = 走在线）。"""
+        nonlocal local_hit
+        if not local_library.local_first_enabled() or not str(title or "").strip():
+            return None
+        hit = local_library.find_local_match(str(title or ""), str(artist or ""),
+                                             local_db, local_dir)
+        if not hit:
+            return None
+        local_hit = hit
+        decision = quality.resolve(request, db_path=local_db)
+        if not local_library.serves_request(hit, decision.get("level") or ""):
+            logger.info("local-first skip: %s 本地 %s 不满足档位 %s",
+                        guid, hit.get("ext"), decision.get("level"))
+            return None
+        try:
+            _log_play(f"local-first({phase},ext={hit.get('ext')},level={decision.get('level')})")
+            logger.info("local-first hit: %s -> %s", guid, hit.get("path"))
+            return serve_file_with_range(hit["path"], range_header,
+                                         media_type_for_ext(hit.get("ext") or "mp3"))
+        except Exception as exc:  # noqa: BLE001 - 本地文件异常则回落在线链路
+            logger.warning("local-first serve failed for %s: %s: %s",
+                           guid, type(exc).__name__, exc)
+            local_hit = None
+            return None
+
+    # 播放前客户端必然请求过 metadata，标题/艺术家通常已在缓存里 —— 先用它判本地
+    cached_info = _peek_online_info(guid)
+    if cached_info:
+        early = _try_local_first(str(cached_info.get("title") or ""),
+                                 str(cached_info.get("artist") or ""), "pre-net")
+        if early is not None:
+            return early
+
+    # 为「下一首」安排预热（零音频流量，只取直链与元数据）
+    _schedule_prefetch(request, guid)
+
+    warm_before = prefetch.warming_seconds(guid)
+    _gather_started = time.monotonic()
     play_url_res, info_res = await asyncio.gather(
         resolve_netease_url(musicbox_client, song_id, request),
         _online_info(request, guid),
         return_exceptions=True,
     )
+    _gather_ms = (time.monotonic() - _gather_started) * 1000.0
+    prefetch.note_play(guid, _gather_ms, warm_before is not None)
     play_url = None if isinstance(play_url_res, Exception) else play_url_res
     info = None if isinstance(info_res, Exception) else info_res
 
-    # ------------------------------------------------------------------
-    # 本地曲库优先（v2.8）：NAS 上已有同一首歌时直接读本地文件——零外网、
-    # 起步最快。是否可用本地受音质策略约束（见 local_library 模块头注）：
-    # 策略要 lossless 且本地是无损 → 用本地；策略要 exhigh（省流量）而本地是
-    # Hi-Res → 不用本地，仍按策略去网易云要 320k；本地 320k 而策略要 lossless
-    # → 同样不用本地。网易云取链彻底失败时本地匹配（不论档位）作最后兜底。
-    # ------------------------------------------------------------------
-    local_hit: dict | None = None
-    if local_library.local_first_enabled() and isinstance(info, dict) \
-            and str(info.get("title") or "").strip():
-        decision = quality.resolve(request, db_path=resolve_music_db())
-        local_hit = local_library.find_local_match(
-            str(info.get("title") or ""),
-            str(info.get("artist") or ""),
-            resolve_music_db(),
-        )
-        if local_hit and local_library.serves_request(local_hit, decision.get("level")):
-            try:
-                _log_play(f"local-first(class={local_hit.get('klass')},level={decision.get('level')})")
-                logger.info("local-first hit: %s -> %s", guid, local_hit.get("path"))
-                return serve_file_with_range(
-                    local_hit["path"], range_header,
-                    media_type_for_ext(local_hit.get("ext") or "mp3"))
-            except Exception as exc:  # noqa: BLE001 - 本地文件异常则回落在线链路
-                logger.warning("local-first serve failed for %s: %s: %s",
-                               guid, type(exc).__name__, exc)
-                local_hit = None
+    if isinstance(info, dict) and str(info.get("title") or "").strip():
+        late = _try_local_first(str(info.get("title") or ""),
+                                str(info.get("artist") or ""), "post-info")
+        if late is not None:
+            return late
 
     def _serve_local_fallback(reason: str):
         _log_play(f"local-fallback({reason})")
@@ -2961,6 +3156,22 @@ _ONLINE_INFO_MAX = int(os.environ.get("FNMUSIC_INFO_CACHE_MAX", "2000"))
 # （歌词是另一个上游往返，对一张缩略图毫无意义）。
 _ONLINE_COVER_CACHE: dict[str, tuple[float, str]] = {}
 _ONLINE_COVER_TTL = float(os.environ.get("FNMUSIC_COVER_CACHE_TTL", "86400"))
+
+
+def _peek_online_info(guid: str) -> dict | None:
+    """只读缓存地取在线曲目信息——**一个网络请求都不发**。
+
+    本地曲库优先要在联网前就判定「本地有没有这首歌」，否则「优先」两个字是
+    假的：人都已经把网易云的直链取回来了，才想起来本地有。判定只需要标题与
+    艺术家，而播放前客户端必然请求过 metadata，这份缓存里基本都有。
+    """
+    hit = _ONLINE_INFO_CACHE.get(guid)
+    if not hit:
+        return None
+    ts, rec = hit
+    if (time.time() - float(ts or 0.0)) >= _ONLINE_INFO_TTL:
+        return None
+    return rec if isinstance(rec, dict) else None
 
 
 def _cache_put_prune(store: dict, max_entries: int) -> None:
@@ -4811,6 +5022,13 @@ async def playlist_track_list(request: Request):
     else:
         bundle = await _load_daily_bundle(request, user_guid)
         tracks = dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
+    # 记下这份有序列表：stream 请求里没有歌单信息，「下一首是谁」全靠它推断
+    try:
+        _n = prefetch.remember_context(guid, tracks)
+        if _n:
+            logger.info("prefetch context: %s（%d 首）", guid, _n)
+    except Exception as exc:  # noqa: BLE001 - 记不住只是不能预热，不影响打开歌单
+        logger.debug("prefetch context failed for %s: %s: %s", guid, type(exc).__name__, exc)
     # 打开耗时留证：真机上「歌单打开几秒」从此可量化（cache=miss 是上游链路，
     # cache=hit 仍慢则瓶颈在传输/客户端，两者排障方向完全不同）
     _ms = (time.monotonic() - started) * 1000.0

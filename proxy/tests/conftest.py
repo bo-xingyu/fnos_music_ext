@@ -56,6 +56,26 @@ def _reset_online_info_caches():
         if task is not None and not task.done():
             task.cancel()
     proxy_app._channel_recs_refresh.clear()
+    # 下一首预热（v2.9.14）：上下文与统计都是进程级的，用例之间必须清干净。
+    # 更要紧的是**取消残留的后台任务**——pending 任务在事件循环关闭时会抛
+    # unraisable「Event loop is closed」，而 pytest 会把这笔账记到**下一个**
+    # 用例头上，表现就是毫不相干的用例莫名失败，极难定位。
+    try:
+        from proxy import prefetch
+    except Exception:  # noqa: BLE001
+        prefetch = None  # type: ignore
+    if prefetch is not None:
+        prefetch.reset_for_test()
+        for task in list(getattr(proxy_app, "_PREFETCH_TASKS", {}) or {}.values()):
+            try:
+                if task is not None and not task.done():
+                    task.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            proxy_app._PREFETCH_TASKS.clear()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @pytest.fixture

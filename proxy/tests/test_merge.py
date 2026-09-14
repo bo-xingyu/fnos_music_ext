@@ -628,7 +628,8 @@ def test_search_track_deduplication():
 
 def test_stream_online_guid_range_and_tee_cache(monkeypatch):
     """在线播放全链路：解析网易云直链 → 200 流式返回 → tee 落盘到曲库 + 同名 .lrc。"""
-    audio_content = b"RIFF....WAVEfmt....FAKE_MP3_STREAM_CONTENT" * 50
+    # 文件头必须是真的 MP3（ID3 + MPEG 帧同步），否则落盘时会被嗅探成别的容器
+    audio_content = b"ID3\x03\x00\x00\x00\x00\x00\xff\xfb\x90\x00FAKE_MP3_STREAM" * 50
     content_len = str(len(audio_content))
     guid = "online:netease:228908"
 
@@ -665,6 +666,36 @@ def test_stream_online_guid_range_and_tee_cache(monkeypatch):
 
         # 官方后端全程不参与在线播放
         assert calls.get("upstream", 0) == 0
+
+
+def test_cache_ext_follows_real_file_header_not_declaration(monkeypatch):
+    """曲目声明 flac、CDN 实际给 MP3 时，落盘扩展名必须按**文件头**纠正成 .mp3。
+
+    回归 bug：以前只信曲目声明 → 落出「.flac 装 MP3」的坏文件，
+    写标签报 “is not a valid FLAC file”，本地曲库还把它当无损匹配。
+    """
+    audio_content = b"ID3\x03\x00\x00\x00\x00\x00\xff\xfb\x90\x00FAKE_MP3_STREAM" * 50
+
+    _wire_netease(
+        monkeypatch,
+        song_id="228908",
+        # lossless=True → 曲目信息里带 sq，代理原本会判定 ext=flac
+        info=_netease_song_info("228908", lossless=True, size=len(audio_content)),
+        play_url="http://audio.test/song.flac",
+        cdn=(200, audio_content, {
+            "Content-Type": "audio/mpeg",
+            "Content-Length": str(len(audio_content)),
+        }),
+    )
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/track/stream?guid=online:netease:228908")
+        assert resp.status_code == 200
+        assert resp.content == audio_content
+
+    files = os.listdir(CONF["library_dir"])
+    assert not [f for f in files if f.endswith(".flac")], f"仍落出了假 flac：{files}"
+    assert "周杰伦 - 晴天.mp3" in files, files
 
 
 def test_stream_cache_hit_never_touches_source(monkeypatch):

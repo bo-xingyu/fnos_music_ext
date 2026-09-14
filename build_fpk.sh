@@ -186,6 +186,7 @@ sync_into_app "proxy/env_merge.py"
 sync_into_app "proxy/version.py"
 sync_into_app "proxy/trimgw.py"
 sync_into_app "proxy/local_files.py"
+sync_into_app "proxy/prefetch.py"
 sync_into_app "proxy/__init__.py"
 sync_into_app "proxy/run_proxy.sh"
 sync_into_app "proxy/requirements.txt"
@@ -334,7 +335,7 @@ for required in config/privilege config/resource \
                 proxy/app.py proxy/netease_auth.py proxy/pushplus.py \
                 proxy/netease_items.py proxy/playlists.py proxy/download.py proxy/quality.py \
                 proxy/admin_ui.py proxy/loghouse.py \
-                proxy/recommend.py proxy/env_merge.py proxy/trimgw.py proxy/local_files.py proxy/run_proxy.sh proxy/requirements.txt \
+                proxy/recommend.py proxy/env_merge.py proxy/trimgw.py proxy/local_files.py proxy/prefetch.py proxy/run_proxy.sh proxy/requirements.txt \
                 musicbox-service/app.py musicbox-service/requirements.txt \
                 bin/fnmusic-lib.sh bin/setup.sh bin/start.sh bin/stop.sh bin/status.sh \
                 bin/restart_services.sh \

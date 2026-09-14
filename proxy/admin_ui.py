@@ -277,6 +277,10 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     # 自动探测靠 music.db；飞牛各版本目录布局不统一，猜不中就整个功能静默失效，
     # 所以必须留一个手动指定的入口（留空 = 自动探测）。
     "library_dir": ("FNMUSIC_LIBRARY_DIR", _as_library_dir, False),
+    # --- 本地曲库优先（v2.8 引入 / v2.9.14 修好）：播网易云歌单时优先读本地同名文件 ---
+    "local_first": ("FNMUSIC_LOCAL_FIRST", _as_bool, False),
+    # --- 下一首预热（v2.9.14 T1）：提前取回下一首的直链与元数据 ---
+    "prefetch_next": ("FNMUSIC_PREFETCH_NEXT", _as_bool, False),
     "pushplus_enabled": ("FNMUSIC_PUSHPLUS_ENABLED", _as_bool, False),
     "pushplus_token": ("FNMUSIC_PUSHPLUS_TOKEN", _token, True),
     "pushplus_topic": ("FNMUSIC_PUSHPLUS_TOPIC", _free_text(64), True),
@@ -326,6 +330,8 @@ DEFAULTS = {
     "local_daily_enabled": "true",
     "local_daily_limit": "50",
     "library_dir": "",
+    "local_first": "true",
+    "prefetch_next": "true",
     "pushplus_enabled": "true",
     "pushplus_token": "",
     "pushplus_topic": "",
@@ -787,6 +793,38 @@ async def _probe_proxy_local_daily() -> dict:
         return {"reachable": False, "error": f"{type(exc).__name__}: {exc}"[:160]}
 
 
+async def _probe_proxy_path(path: str, timeout: float = 10.0) -> dict:
+    """向代理进程取任意 /_ext 快照。
+
+    观察记录只存在于代理进程内存里（索引、预热统计都在那边），管理页面是
+    **另一个进程**，直接 import 读到的永远是空 —— 必须经 unix socket 取。
+    """
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=PROXY_SOCK),
+            base_url="http://unix",
+            timeout=timeout,
+        ) as client:
+            r = await client.get(path)
+            body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            if r.status_code == 200 and isinstance(body, dict) and body.get("ok") is not False:
+                return {"reachable": True, **(body.get("data") if isinstance(body.get("data"), dict) else {})}
+            return {"reachable": False, "status": r.status_code,
+                    "error": str(body.get("error") or "")[:160]}
+    except Exception as exc:  # noqa: BLE001
+        return {"reachable": False, "error": f"{type(exc).__name__}: {exc}"[:160]}
+
+
+async def _probe_proxy_local_first() -> dict:
+    """本地曲库优先的状态（索引构成 + 最近匹配结果）。"""
+    return await _probe_proxy_path("/_ext/localfirst", timeout=15.0)
+
+
+async def _probe_proxy_prefetch() -> dict:
+    """下一首预热的统计（命中率 + 冷/热 gather 平均耗时）。"""
+    return await _probe_proxy_path("/_ext/prefetch", timeout=10.0)
+
+
 async def _probe_proxy_authorized() -> dict:
     """向代理进程取「飞牛应用授权目录」状态快照。
 
@@ -989,6 +1027,8 @@ async def api_diag(request: Request):
         "quality": quality_probe,
         "local_daily": await _probe_proxy_local_daily(),
         "authorized": await _probe_proxy_authorized(),
+        "local_first": await _probe_proxy_local_first(),
+        "prefetch": await _probe_proxy_prefetch(),
         "musicbox": {
             "url": MUSICBOX_URL,
             "healthz": mb,
@@ -1845,6 +1885,18 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
         <div class="t"><span class="lb">启用「本地每日推荐」歌单</span>
           <span class="ht">每天从本地曲库随机抽一批歌组成歌单（与网易云每日推荐相互独立，无需登录）；播放直接读本地文件</span></div></div>
 
+      <div class="sw"><input type="checkbox" name="local_first" id="c_local_first">
+        <div class="t"><span class="lb">本地曲库优先</span>
+          <span class="ht">播网易云歌单时，若 NAS 曲库里已有同一首歌就直接读本地文件（零外网、起步最快）；
+            没有再走网易云。是否采用本地文件受音质策略约束：策略要无损就只吃本地无损，
+            策略要 320k 就不喂本地母带。诊断页「本地曲库优先」一栏能看到索引条数与命中情况。</span></div></div>
+
+      <div class="sw"><input type="checkbox" name="prefetch_next" id="c_prefetch">
+        <div class="t"><span class="lb">下一首预热</span>
+          <span class="ht">播当前这首时，提前把「下一首」的直链与元数据取回来（只取几 KB 的 JSON，
+            <b>不下载音频</b>）。下一首起步时缓存是热的，实测能省掉几百毫秒的往返。
+            「下一首」由我们下发过的歌单顺序推断；随机播放时会猜错，但猜错不产生任何实质代价。</span></div></div>
+
       <div class="grid" style="margin-top:6px">
         <label><span class="lb">本地每日推荐数量</span>
           <input name="local_daily_limit" inputmode="numeric" placeholder="50">
@@ -1958,7 +2010,7 @@ var $=function(s){return document.querySelector(s)};
 //     而给 checkbox 赋 value 不会改变勾选外观；
 //   - 提交时下面那句 `el.type==="checkbox"` 会把未登记的 checkbox 整个跳过，
 //     该字段不会出现在 values 里。
-var BOOLS=["free_only_on_logout","daily_enabled","local_daily_enabled","pushplus_enabled","download_on_favorite","fav_sync_like"];
+var BOOLS=["free_only_on_logout","daily_enabled","local_daily_enabled","local_first","prefetch_next","pushplus_enabled","download_on_favorite","fav_sync_like"];
 var pollTimer=null, qrUnikey="", expireTimer=null;
 
 // 服务端注入的绝对前缀（形如 /app/fnmusicext/）。
@@ -2296,6 +2348,47 @@ function runDiag(auto){
           out.push("     "+(c.exists?"[存在] ":"[缺失] ")+c.path);
         });
         if(ld.hint) out.push("  ★ "+ld.hint);
+      }
+      // ---- 本地曲库优先（v2.9.14）：能不能命中，全看这一块 ----
+      out.push("");
+      out.push("-- 本地曲库优先（播网易云歌单时优先读本地同名文件）--");
+      var lf=d.local_first||{};
+      if(!lf.reachable){ out.push("  取不到代理侧快照: "+JSON.stringify(lf)); }
+      else{
+        out.push("  开关           : "+lf.enabled+"（any_class="+lf.any_class+"：true=不看音质档位，本地有就播）");
+        out.push("  索引           : "+lf.entries+" 首 / "+lf.titles+" 个标题"
+                 +"（music.db "+lf.from_db+" + 目录扫描 "+lf.from_fs+"）");
+        out.push("  曲库目录       : "+(lf.library_dir||"（未定位）"));
+        var st=lf.selftest||{};
+        out.push("  自测           : "+(st.ok?("能匹配上自己（"+st.title+" → "+st.path+"）")
+                                        :(st.title?("★ 连索引里自己的歌都匹配不上: "+st.title):"（索引为空，无法自测）")));
+        out.push("  查询/命中      : "+lf.lookups+" / "+lf.lookup_hits);
+        (lf.recent||[]).slice(-5).forEach(function(r){
+          out.push("     "+(r.hit?"[命中] ":"[未中] ")+r.title+" - "+r.artist
+                   +(r.hit?(" → "+r.path):(" （"+r.reason+"）")));
+        });
+        if(lf.hint) out.push("  ★ "+lf.hint);
+      }
+      // ---- 下一首预热（T1）----
+      out.push("");
+      out.push("-- 下一首预热（T1：提前取回下一首的直链与元数据，不下载音频）--");
+      var pf=d.prefetch||{};
+      if(!pf.reachable){ out.push("  取不到代理侧快照: "+JSON.stringify(pf)); }
+      else{
+        out.push("  开关           : "+pf.enabled);
+        out.push("  调度/成功/失败 : "+pf.scheduled+" / "+pf.done+" / "+pf.failed
+                 +"（推断不出下一首 "+pf.no_next+" 次，已预热过跳过 "+pf.already+" 次）");
+        out.push("  在线播放       : "+pf.plays+" 次，命中预热 "+pf.hits+" 次（命中率 "
+                 +Math.round((pf.hit_rate||0)*100)+"%）");
+        out.push("  取链耗时       : 未预热 "+pf.cold_ms+"ms → 命中预热 "+pf.warm_ms+"ms"
+                 +(pf.saved_ms?("  ★ 省下约 "+pf.saved_ms+"ms"):""));
+        (pf.contexts||[]).forEach(function(c){
+          out.push("     上下文: "+c.ctx+"（"+c.tracks+" 首，"+(c.age_s||0)+"s 前下发）");
+        });
+        (pf.recent||[]).slice(-5).forEach(function(r){
+          out.push("     "+(r.ok?"[ok] ":"[fail] ")+r.guid+" "+r.ms+"ms"+(r.detail?(" "+r.detail):""));
+        });
+        if(!pf.plays) out.push("  （还没有在线播放记录：播一首网易云的歌再来看）");
       }
       out.push("");
       out.push("-- 飞牛应用授权目录（开放能力 / api-scope）--");
