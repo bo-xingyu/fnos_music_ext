@@ -423,3 +423,63 @@ def test_resolve_music_db_uses_default_when_nothing_exists(monkeypatch):
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(P.glob, "glob", lambda pat, *a, **k: [])
         assert P.resolve_music_db() == "/nonexistent/music.db"
+
+
+# ------------------------------------------------- v2.9.20 music.db 失效记录
+
+
+def test_broken_db_records_are_dropped_and_do_not_shadow_fs(tmp_path, monkeypatch):
+    """music.db 里文件已删的记录必须剔除——否则它会按 path 相等把目录扫到的
+    同名真文件挡在门外（fs 补充恒为 0），诊断里就只剩一句没主语的 file-missing。"""
+    import proxy.local_library as L
+    from proxy.local_library import reset_for_test
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    real = lib / "Beyond - 光辉岁月.flac"
+    real.write_bytes(b"fake")
+    db = tmp_path / "music.db"
+    _make_music_db_at(
+        db,
+        [( "Beyond - 光辉岁月.flac", None, str(tmp_path / "已搬走" / "旧路径.flac"))],
+    )
+    reset_for_test()
+    idx = L._get_index(str(db), str(lib))
+    paths = {str(i.get("path")) for es in idx.values() for i in es}
+    assert str(real) in paths, "目录扫到的真文件必须补进来"
+    assert not any("旧路径" in p for p in paths), "失效记录不该留在索引里"
+    assert L._INDEX_META[str(db) + "|" + str(lib)]["db_broken"] == 1
+
+
+def test_broken_db_paths_are_reported_in_status(tmp_path):
+    import proxy.local_library as L
+    from proxy.local_library import reset_for_test
+
+    db = tmp_path / "music.db"
+    _make_music_db_at(db, [("张三 - 随便.mp3", None, "/不存在的目录/随便.mp3")])
+    reset_for_test()
+    st = L.status(str(db), "")
+    assert st["db_broken"] == 1
+    assert st["entries"] == 0
+
+
+def test_file_missing_records_the_failing_path(tmp_path):
+    """file-missing 不带路径就是一句废话——到底是拼错了还是文件真没了查不下去。"""
+    import proxy.local_library as L
+    from proxy.local_library import reset_for_test
+
+    db = tmp_path / "music.db"
+    gone = "/不存在的目录/光辉岁月.flac"
+    _make_music_db_at(db, [("Beyond - 光辉岁月.flac", None, gone)])
+    reset_for_test()
+    # 直接走索引路径：让索引保留失效记录，验证 miss_path 被记下
+    L._INDEX_CACHE.clear()
+    L._INDEX_META.clear()
+    L._LOOKUP_LOG.clear()
+    idx = L.build_index(str(db))
+    L._INDEX_CACHE[str(db)] = (L.time.time() + 9999, idx)
+    assert L.find_local_match("光辉岁月", "Beyond", str(db), "") is None
+    assert L._LOOKUP_LOG[-1]["reason"] == "file-missing"
+    assert L._LOOKUP_LOG[-1]["miss_path"] == gone
+    # 命中时不带 miss_path，免得看着像出错
+    L._LOOKUP_LOG.clear()

@@ -415,10 +415,40 @@ def _get_index(db_path: str, library_dir: str = "") -> dict[str, list[dict]]:
     if hit is not None and (now - hit[0]) < _index_ttl():
         return hit[1]
 
-    index = build_index(db_path)
-    for e in index.values():
-        for item in e:
+    raw = build_index(db_path)
+    # music.db 里常有已经搬走 / 删掉的旧记录。它们有两个坏处，而且第二个是隐性的：
+    #   1. 匹配上了却 os.path.isfile() 失败 → 诊断里那条看不懂的 file-missing；
+    #   2. 更要命——`seen` 是按 path 去重的，失效记录的 path 会把**目录扫描到的同名
+    #      真文件**误判成「已在库里」而跳过，于是 fs 补充恒为 0，坏记录永远没人顶替。
+    # 建索引时先按可达性过滤一次，两个问题一起解决（stat 有 TTL 缓存，不是每次播放）。
+    index: dict[str, list[dict]] = {}
+    ok_paths: set[str] = set()
+    bad_paths: set[str] = set()
+
+    def _reachable(p: str) -> bool:
+        if not p:
+            return False
+        if p in ok_paths:
+            return True
+        if p in bad_paths:
+            return False
+        try:
+            good = os.path.isfile(p) and os.path.getsize(p) > 0
+        except OSError:
+            good = False
+        (ok_paths if good else bad_paths).add(p)
+        return good
+
+    for k, v in raw.items():
+        kept = []
+        for item in v:
             item.setdefault("src", "db")
+            if _reachable(str(item.get("path") or "")):
+                kept.append(item)
+        if kept:
+            index[k] = kept
+    db_broken = len({p for p in bad_paths if p})
+
     fs_n = 0
     fs_scanned = 0
     if library_dir:
@@ -437,11 +467,14 @@ def _get_index(db_path: str, library_dir: str = "") -> dict[str, list[dict]]:
                 for e in index.values() for i in e if i.get("src") == "db"})
     _INDEX_META[key] = {
         "db": db_n, "fs": fs_n, "fs_scanned": fs_scanned, "dir": library_dir,
+        "db_broken": db_broken,
         "ts": now, "key": key,
         "empty_reason": ("" if (db_n or fs_n) else
                          ("music.db 没有可索引的曲目表" if not library_dir else
                           "music.db 无曲目表且曲库目录未扫到音频文件")),
     }
+    if db_broken:
+        logger.info("本地曲库索引：忽略 %d 条 music.db 失效记录（文件已不存在）", db_broken)
     if db_n or fs_n:
         logger.info("本地曲库索引：music.db %d 首 + 目录扫描 %d 首（dir=%s）",
                     db_n, fs_n, library_dir or "-")
@@ -462,6 +495,7 @@ def find_local_match(title: str, artist: str, db_path: str,
     idx = _get_index(db_path, library_dir)
     hit: dict | None = None
     reason = "title-not-in-index"
+    miss_path = ""
     for ki, key in enumerate(title_keys(title)):
         entries = idx.get(key)
         if not entries:
@@ -485,12 +519,17 @@ def find_local_match(title: str, artist: str, db_path: str,
             except OSError:
                 continue
             reason = "file-missing"
+            # 记下第一个打不开的路径：不写出来，file-missing 就是一句没有主语的
+            # 废话——到底是路径拼错了、还是文件真被删了，永远查不下去。
+            if not miss_path:
+                miss_path = path
         if hit is not None:
             break
     _LOOKUP_LOG.append({
         "ts": time.time(), "title": str(title or ""), "artist": str(artist or ""),
         "hit": hit is not None, "reason": reason,
         "path": str((hit or {}).get("path") or ""),
+        "miss_path": "" if hit is not None else miss_path,
         # 未命中时给出索引里最像的标题：区分「真没有」和「名字对不上」
         "near": [] if hit is not None else suggest_similar(title, db_path, library_dir),
     })
@@ -585,6 +624,8 @@ def status(db_path: str, library_dir: str = "") -> dict:
                         for es in idx.values() for i in es if i.get("path")}),
         "from_db": int(meta.get("db") or 0),
         "from_fs": int(meta.get("fs") or 0),
+        # music.db 里文件已不存在的失效记录数（已剔除，不再挡住目录扫描的真文件）
+        "db_broken": int(meta.get("db_broken") or 0),
         # fs_scanned 必须单独给：fs（新增）为 0 常常不是「没扫到」而是
         # 「扫到的全在 music.db 里已有」——真机第一次看到 0 会以为扫描坏了。
         "fs_scanned": int(meta.get("fs_scanned") or 0),

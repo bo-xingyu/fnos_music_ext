@@ -2387,7 +2387,8 @@ function runDiag(auto){
         out.push("  开关           : "+lf.enabled+"（any_class="+lf.any_class+"：true=不看音质档位，本地有就播）");
         var _fs = (lf.fs_scanned||0);
         out.push("  索引           : "+lf.entries+" 首 / "+lf.titles+" 个标题"
-                 +"（music.db "+lf.from_db+" + 目录扫描新增 "+lf.from_fs+"）");
+                 +"（music.db "+lf.from_db+" + 目录扫描新增 "+lf.from_fs+"）"
+                 +(lf.db_broken?("  [已忽略 music.db 失效记录 "+lf.db_broken+" 条]"):""));
         // fs_scanned 必须单独给：新增为 0 常常不是「没扫到」而是「扫到的
         // 全在 music.db 里已有」，只显示 0 会让人误判成扫描坏了。
         out.push("  目录扫描       : "+(lf.library_dir?("扫到 "+_fs+" 个音频文件，"
@@ -2400,7 +2401,8 @@ function runDiag(auto){
         out.push("  查询/命中      : "+lf.lookups+" / "+lf.lookup_hits);
         (lf.recent||[]).slice(-5).forEach(function(r){
           out.push("     "+(r.hit?"[命中] ":"[未中] ")+r.title+" - "+r.artist
-                   +(r.hit?(" → "+r.path):(" （"+r.reason+"）")));
+                   +(r.hit?(" → "+r.path):(" （"+r.reason
+                     +(r.miss_path?(": "+r.miss_path):"")+"）")));
           // 未命中时给出索引里最像的标题：一眼分清「本地真没这首歌」
           // 和「名字写法的差异」——没有这个就只能靠猜。
           if(!r.hit && r.near && r.near.length){
