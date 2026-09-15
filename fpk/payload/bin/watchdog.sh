@@ -77,6 +77,25 @@ main() {
             continue
         fi
 
+        # ------------------------------------------------------------------
+        # 防抖：只在「接管丢失」时复测一次。
+        #
+        # lib_probe_proxy 有 3s 超时，而 healthz 内部要连上游 + musicbox 三次；
+        # 上游偶尔慢一下就会超时 → 误判成接管丢失 → 走进 start.sh 的「先停后
+        # 起」分支，**把健康的代理杀掉**，代价是 1~2 分钟服务中断（真机 01:51
+        # 那次报丢失、3 秒后就正常了，纯属误报）。
+        # 进程不存在的分支不复测——那没有歧义，越早恢复越好。
+        # ------------------------------------------------------------------
+        if [ "${need}" -eq 1 ] && [ "${reason}" = "socket 接管丢失（官方后端可能重启过）" ]; then
+            sleep 5
+            if lib_pid_alive "${PROXY_PID}" && lib_probe_proxy; then
+                lib_log "watchdog：复测 socket 接管正常，判定为瞬时抖动，不干预"
+                fails=0
+                backoff="${interval}"
+                continue
+            fi
+        fi
+
         # 行动前最后再确认一次停机标志（stop.sh 可能刚好落地）
         if lib_stopped_flag_set; then
             exit 0

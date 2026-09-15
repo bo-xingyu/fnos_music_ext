@@ -503,6 +503,43 @@ lib_restart_in_progress() {
 }
 
 # ------------------------------------------------------------------------------
+# 接管丢失标记（v2.9.26）
+#
+# `status` 的语义是「这个应用**是否处于启用状态**」，不是「这一刻 socket 有没有
+# 接管成功」——飞牛按 exit 3 把应用置为「未启用」，而这个状态**不会因为我们的
+# 看门狗自愈而自动翻回来**，用户必须手动再点一次「启用」。
+#
+# 官方 trim-music 重启会重绑 /var/run/trim_music.socket 把接管抢走，代理进程本身
+# 毫发无损、看门狗几十秒内就能恢复。以前 status 见到接管丢失一律 exit 3，等于
+# **一边用看门狗自愈、一边告诉系统自己没在运行**——两个机制打架，用户看到的就是
+# 「明明一切正常，应用却显示未启用，还得我手动点回来」。
+#
+# 所以这里给「接管丢失」一个宽限窗口：窗口内仍报 running。超过宽限期还恢复不了，
+# 说明看门狗确实救不回来，那时才诚实报「未运行」让人介入。
+# ------------------------------------------------------------------------------
+
+TAKEOVER_LOST_MARKER="${PKGVAR}/takeover.lost"
+# 宽限时长（秒）。看门狗 30s 一轮、恢复通常 1~2 分钟内完成，给 10 分钟足够。
+TAKEOVER_GRACE_S="${FNMUSICEXT_TAKEOVER_GRACE_S:-600}"
+
+lib_takeover_lost_age() {
+    mkdir -p "${PKGVAR}" 2>/dev/null || true
+    if [ ! -f "${TAKEOVER_LOST_MARKER}" ]; then
+        printf '%s\n' "$(date +%s)" > "${TAKEOVER_LOST_MARKER}" 2>/dev/null || true
+        echo 0
+        return 0
+    fi
+    local mtime now
+    mtime="$(stat -c %Y "${TAKEOVER_LOST_MARKER}" 2>/dev/null || echo 0)"
+    now="$(date +%s)"
+    echo $(( now - mtime ))
+}
+
+lib_takeover_lost_clear() {
+    rm -f "${TAKEOVER_LOST_MARKER}" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
 # 主动停机标志（v2.7）：stop.sh 落盘、start.sh 清除（看门狗发起的恢复除外）。
 #
 # 看门狗（watchdog.sh）的职责是把「死掉的代理 / 丢失的 socket 接管」自动拉起来，
