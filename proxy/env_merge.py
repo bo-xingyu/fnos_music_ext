@@ -127,6 +127,9 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_LOG_MAX_MB", "10"),
     ("FNMUSIC_LOG_MAX_DAYS", "30"),
     ("FNMUSIC_LOG_SCAN_INTERVAL", "3600"),
+    # v2.9.29 日志降噪：掐掉封面/心跳/轮询这类高频无信息量的访问行，
+    # 让 fnmusic_proxy 自己的日志在 10MB 截断前能留得更久。默认开，可关。
+    ("FNMUSIC_LOG_QUIET", "true"),
     # 在线搜索空结果的短 TTL（秒）：上游一次抖动导致结果为空时，
     # 若沿用 7 天的正常 TTL，该关键词会在整个周期内只返回本地结果。
     ("FNMUSIC_SEARCH_EMPTY_TTL", "60"),

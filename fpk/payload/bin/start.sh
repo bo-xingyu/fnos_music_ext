@@ -36,6 +36,7 @@ start_musicbox() {
         XDG_CACHE_HOME="${MUSICBOX_DATA_DIR}/cache" \
         XDG_CONFIG_HOME="${MUSICBOX_DATA_DIR}/config" \
         FNMUSIC_FREE_ONLY_ON_LOGOUT="$(lib_read_env_value FNMUSIC_FREE_ONLY_ON_LOGOUT true)" \
+        FNMUSIC_LOG_QUIET="$(lib_read_env_value FNMUSIC_LOG_QUIET true)" \
         "${venv}/bin/uvicorn" app:app \
             --app-dir "${RUN_DIR}/musicbox-service" \
             --host "${bind}" \

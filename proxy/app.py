@@ -87,6 +87,76 @@ def _float(name: str, default: float) -> float:
         return default
 
 
+# ---------------------------------------------------------------------------
+# 日志降噪（v2.9.29）
+#
+# 真机 proxy.log 10MB 就截断，而其中一大半是封面图、5 秒心跳、客户端轮询这类
+# 高频且毫无信息量的访问行；真正有排障价值的 fnmusic_proxy 行反而留不住——
+# 「播不出来的时候日志里一行都没有」，一半原因就在这里：不是没记，是被淹了、
+# 又被 10MB 截断冲掉了。
+#
+# 这里只掐掉**可以判定为噪音**的行，业务日志（play-start / stream redirect /
+# stream-fail / prefetch / hls slow segment …）一字不动。
+# 想看全部：管理页关掉「日志降噪」，或 FNMUSIC_LOG_QUIET=false，重启生效。
+# ---------------------------------------------------------------------------
+
+# uvicorn 访问日志里直接丢弃的高频路径（子串匹配）。
+# 判定标准很苛刻：只列「固定周期自动发出、且成功与否都不影响播放」的请求。
+LOG_QUIET_ACCESS_PATHS: "tuple[str, ...]" = (
+    "/music/api/v1/static/cover",             # 封面图：一首歌要取好几次
+    "/music/api/v1/task/list",                # 客户端 5s 轮询
+    "/music/api/v1/event/report",             # 播放事件上报
+    "/music/api/v1/initialization/state",     # 客户端启动状态轮询
+    "/music/api/v1/track/transcode/heartbeat",  # 转码会话保活，5s 一次
+    "/_ext/healthz",                          # 我们自己的心跳/诊断探针
+)
+
+# 出站 httpx 每一次请求都记一行 INFO（封面、healthz、musicbox 调用都在内），
+# 这些调用我们自己在关键路径上另有日志，整体压到 WARNING。
+LOG_QUIET_LOGGERS: "tuple[str, ...]" = ("httpx", "httpcore")
+
+
+class _QuietAccessFilter(logging.Filter):
+    """丢弃命中噪音路径的 uvicorn 访问日志行。"""
+
+    def __init__(self, paths: "tuple[str, ...]") -> None:
+        super().__init__()
+        self._paths = tuple(paths)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            line = record.getMessage()
+        except Exception:      # 拿不到就放行，宁可多记也别漏记
+            return True
+        return not any(p in line for p in self._paths)
+
+
+def log_quiet_enabled() -> bool:
+    """是否开启日志降噪（默认开）。改这个值需要重启代理才生效。"""
+    return _flag("FNMUSIC_LOG_QUIET", "true")
+
+
+def install_log_quiet() -> bool:
+    """安装日志降噪，返回是否实际开启。可重复调用（幂等）。
+
+    注意：uvicorn 启动时会用 dictConfig 重配 uvicorn.access（它会重置 level、
+    清空 handlers），但**不会清掉 logger 上的 filter**——所以这里用 filter
+    而不是 setLevel，否则配置会在启动时被覆盖回去。
+    """
+    if not log_quiet_enabled():
+        return False
+    for name in LOG_QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+    flt = _QuietAccessFilter(LOG_QUIET_ACCESS_PATHS)
+    lg = logging.getLogger("uvicorn.access")
+    # 幂等：重复安装不会叠加 filter（filter 是「与」关系，叠加只会更慢）
+    if not any(isinstance(f, _QuietAccessFilter) for f in lg.filters):
+        lg.addFilter(flt)
+    return True
+
+
+install_log_quiet()
+
 # 播放链路（本地曲目 stream / HLS / 转码会话）转发到官方后端的读超时（秒）。
 # 共享上游客户端是 30s；但官方后端处理 /track/transcode 要等 ffmpeg 产出
 # 首个分片才应答，大文件 + 慢磁盘时 30s 不够，超时会把「能播」变成 504，

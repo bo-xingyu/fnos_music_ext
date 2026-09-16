@@ -238,6 +238,11 @@ write_env_file() {
         echo "FNMUSIC_LOG_MAX_MB=$(dq "$(pick_env FNMUSIC_LOG_MAX_MB "" "${LOG_MAX_MB}")")"
         echo "FNMUSIC_LOG_MAX_DAYS=$(dq "$(pick_env FNMUSIC_LOG_MAX_DAYS "" "${LOG_MAX_DAYS}")")"
         echo "FNMUSIC_LOG_SCAN_INTERVAL=$(dq "$(pick_env FNMUSIC_LOG_SCAN_INTERVAL "" 3600)")"
+        # v2.9.29：日志降噪（默认开）。关掉可记录全部访问行，用于抓原始日志排障。
+        echo "FNMUSIC_LOG_QUIET=$(dq "$(pick_env FNMUSIC_LOG_QUIET "" true)")"
+        # v2.9.28：非局域网直连 CDN（音频不经 NAS 中转）与取链硬超时（秒）
+        echo "FNMUSIC_CDN_REDIRECT=$(dq "$(pick_env FNMUSIC_CDN_REDIRECT "" true)")"
+        echo "FNMUSIC_PLAY_RESOLVE_TIMEOUT_S=$(dq "$(pick_env FNMUSIC_PLAY_RESOLVE_TIMEOUT_S "" 5)")"
         # 用户手工加的、不属于本应用托管清单的自定义键：原样保留在尾部
         if [ -n "${ENV_SRC}" ] && [ -n "${OLD_ENV_KEYS}" ]; then
             echo "# --- 以下为用户自定义键（自动保留） ---"
@@ -264,7 +269,8 @@ write_env_file() {
                     FNMUSIC_PUSHPLUS_TOPIC|FNMUSIC_PUSHPLUS_TEMPLATE|FNMUSIC_PUSHPLUS_URL|\
                     FNMUSIC_CACHE_DIR|FNMUSIC_FAV_DIR|FNMUSIC_PLAY_HISTORY_DIR|FNMUSIC_RECOMMEND_DIR|\
                     FNMUSIC_UPSTREAM_SOCK|FNMUSIC_LIBRARY_DIR|FNMUSIC_MUSIC_DB|FNMUSIC_PIP_INDEX|\
-                    FNMUSIC_LOG_MAX_MB|FNMUSIC_LOG_MAX_DAYS|FNMUSIC_LOG_SCAN_INTERVAL)
+                    FNMUSIC_LOG_MAX_MB|FNMUSIC_LOG_MAX_DAYS|FNMUSIC_LOG_SCAN_INTERVAL|\
+                    FNMUSIC_LOG_QUIET|FNMUSIC_CDN_REDIRECT|FNMUSIC_PLAY_RESOLVE_TIMEOUT_S)
                         continue ;;
                     FNMUSIC_MUSICDL_*|FNMUSIC_LX_*|FNMUSIC_LLM_*)
                         continue ;;  # 已废弃的 v1.x 遗留键不再保留

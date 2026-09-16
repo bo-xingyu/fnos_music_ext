@@ -304,6 +304,9 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     "login_check_interval_h": ("FNMUSIC_LOGIN_CHECK_INTERVAL", _int_range(0, 168), False),
     "log_max_mb": ("FNMUSIC_LOG_MAX_MB", _int_range(0, 1024), False),
     "log_max_days": ("FNMUSIC_LOG_MAX_DAYS", _int_range(0, 3650), False),
+    # v2.9.29 日志降噪：不记封面/心跳/轮询这类高频无信息量的访问行。
+    # 关掉可看到完整原始日志（排障时用），代价是 proxy.log 涨得快、截断更频繁。
+    "log_quiet": ("FNMUSIC_LOG_QUIET", _as_bool, False),
     # v2.9.28：取链硬超时（秒）。到点就回 404，让飞牛播放器立刻切下一首。
     "play_resolve_timeout_s": ("FNMUSIC_PLAY_RESOLVE_TIMEOUT_S", _int_range(1, 30), False),
     # --- 更多口径歌单 / 账户歌单 ---
@@ -358,6 +361,7 @@ DEFAULTS = {
     "login_check_interval_h": "1",
     "log_max_mb": "10",
     "log_max_days": "30",
+    "log_quiet": "true",
     "play_resolve_timeout_s": "5",
     "netease_channels": "mine,toplist,category",
     "netease_channel_limit": "8",
@@ -1085,7 +1089,10 @@ async def api_diag(request: Request):
                      "template": pushplus.template(), "topic_set": bool(pushplus.topic())},
         "logs": {"dir": log_dir, "dir_exists": bool(log_dir and os.path.isdir(log_dir)),
                  "max_mb": log_max_mb(), "max_days": log_max_days(),
-                 "scan_interval_s": LOG_SCAN_INTERVAL_S, "files": logdir_info},
+                 "scan_interval_s": LOG_SCAN_INTERVAL_S, "files": logdir_info,
+                 # v2.9.29：日志降噪是否开启（UI 进程自己读，代理那边另有 install_log_quiet）
+                 "quiet": (os.environ.get("FNMUSIC_LOG_QUIET") or "true").strip().lower()
+                          in ("true", "1", "yes", "on")},
         "restart_script": {"path": RESTART_SCRIPT,
                            "exists": bool(RESTART_SCRIPT and os.path.exists(RESTART_SCRIPT))},
         "runtime": {"python": sys.version.split()[0], "pid": os.getpid(),
@@ -1853,7 +1860,16 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
           <input name="play_resolve_timeout_s" inputmode="numeric" placeholder="5">
           <span class="ht">1–30，默认 5。超过这个时间还没拿到直链就直接回 404，让飞牛<b>立刻切下一首</b>，
           不再干等——播放器自己也就等 7~8 秒，设得比它大没有意义：等回来那首歌早被切掉了，
-          白白占着音源服务。实际生效值取「这里设的」与「上限 30 秒」中较小的那个</span>
+          白白占着音源服务。          实际生效值取「这里设的」与「上限 30 秒」中较小的那个</span>
+        </label>
+
+        <label><span class="lb">日志降噪（不记封面 / 心跳 / 轮询）</span>
+          <input type="checkbox" name="log_quiet">
+          <span class="ht">默认开。日志里一大半是封面图、5 秒保活心跳、客户端状态轮询这类访问行——
+          它们成功与否都不影响播放，却把 proxy.log 撑到 10MB 触发截断，
+          真正有用的播放日志反而留不住（「播不出来时日志里一行都没有」，一半就是这个原因）。
+          打开后这些行不再记录，<b>播放、取链失败、慢分片等排障日志一字不减</b>；
+          要抓完整原始日志时关掉它，重启服务生效</span>
         </label>
 
         <label><span class="lb">单次搜索请求条数</span>
@@ -2008,7 +2024,7 @@ var $=function(s){return document.querySelector(s)};
 //     而给 checkbox 赋 value 不会改变勾选外观；
 //   - 提交时下面那句 `el.type==="checkbox"` 会把未登记的 checkbox 整个跳过，
 //     该字段不会出现在 values 里。
-var BOOLS=["free_only_on_logout","daily_enabled","local_daily_enabled","local_first","local_first_any_class","prefetch_next","pushplus_enabled","download_on_favorite","cdn_redirect"];
+var BOOLS=["free_only_on_logout","daily_enabled","local_daily_enabled","local_first","local_first_any_class","prefetch_next","pushplus_enabled","download_on_favorite","cdn_redirect","log_quiet"];
 var pollTimer=null, qrUnikey="", expireTimer=null;
 
 // 服务端注入的绝对前缀（形如 /app/fnmusicext/）。
@@ -2486,6 +2502,7 @@ function runDiag(auto){
       out.push("");
       out.push("-- 日志目录 "+d.logs.dir+" (存在="+d.logs.dir_exists+") 策略: >"+d.logs.max_mb
                +"MB 截断 / >"+d.logs.max_days+"天清理 --");
+      out.push("  日志降噪 : "+(d.logs.quiet===false?"关（记录全部访问行）":"开（已过滤 封面/保活心跳/客户端轮询/自身探针；播放与失败日志不减）"));
       (d.logs.files||[]).forEach(function(f){
         out.push("  "+f.name+"  "+fmtBytes(f.bytes)+"  修改于 "+new Date(f.mtime*1000).toLocaleString());
       });

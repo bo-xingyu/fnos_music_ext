@@ -3,6 +3,51 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.9.29] - 2026-09-16
+
+**日志降噪——把 proxy.log 从「噪音账本」变回「排障账本」。**
+
+### 为什么做
+
+真机 `proxy.log` 10MB 就截断，而其中一大半是这种行：
+
+```
+[INFO] httpx: HTTP Request: GET https://p1.music.126.net/...jpg?param=120y120 "200 OK"
+INFO:  - "GET /music/api/v1/static/cover?coverId=..." 200 OK
+INFO:  - "GET /music/api/v1/task/list?lan=zh-CN" 200 OK
+```
+
+封面图、5 秒保活心跳、客户端状态轮询——**高频，且成功与否都不影响播放**。真正有排障价值的 `fnmusic_proxy:` 行被稀释到 10MB 里没几行，又被截断冲掉。
+
+上一版说「播不出来的时候日志里一行都没有」，一半原因就在这里：**不是没记，是被淹了**。
+
+### 掐掉了什么
+
+| 类别 | 路径 | 理由 |
+|---|---|---|
+| 封面图 | `/music/api/v1/static/cover` | 一首歌取好几次 |
+| 客户端轮询 | `/music/api/v1/task/list`、`/initialization/state` | 固定 5 秒一次 |
+| 事件上报 | `/music/api/v1/event/report` | 只上报，不影响播放 |
+| 转码保活 | `/music/api/v1/track/transcode/heartbeat` | 5 秒一次 |
+| 自身探针 | `/_ext/healthz` | 看门狗与诊断页打的 |
+| 出站 httpx | 全部压到 `WARNING` | 封面、healthz、musicbox 调用；关键调用我们自己另有日志 |
+
+**音源服务 `musicbox.log` 同样处理**——它几乎 100% 是我们每 30 秒打一遍的 `healthz` / `auth/detail` 探针，已经涨到 5MB+。
+
+### 没掐什么（这条比上面更重要）
+
+播放起步 `play-start`、取链失败 `stream-fail`、慢起步告警、HLS 慢分片、预热命中、`stream redirect` 302 直连——**业务日志一字不减**。降噪要的是「有日志」，做成「更少的日志」就是倒退。
+
+### 一个实现上的坑
+
+用 `logging.Filter`，**不是** `setLevel`。uvicorn 启动时会用 `dictConfig` 重配 `uvicorn.access`（重置 level、清空 handlers），所以 `setLevel(WARNING)` 会在启动时被悄悄覆盖回去，功能等于没做；而 `dictConfig` 不会清掉 logger 上的 filter。
+
+### 顺带补的
+
+`FNMUSIC_CDN_REDIRECT` 与 `FNMUSIC_PLAY_RESOLVE_TIMEOUT_S`（2.9.28 新增的两个键）补进 `.env` 托管清单——之前只在代码里有默认值，`.env` 里看不到，改完之后查配置反而不方便。
+
+管理页新增 **「日志降噪」** 开关（默认开），想抓完整原始日志时关掉、重启生效。诊断页「日志目录」区块会标明当前是开是关。
+
 ## [2.9.28] - 2026-09-16
 
 **非局域网不再经 NAS 中转——音频走 302 直连 CDN；取链超过 5 秒主动放弃让飞牛切下一首；管理页按你说的把没用/有歧义的项清掉。**

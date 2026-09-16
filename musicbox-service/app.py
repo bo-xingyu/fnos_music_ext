@@ -49,6 +49,49 @@ ensure_xdg_dirs()
 logger = logging.getLogger("fnmusic_musicbox")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
+
+# ---------------------------------------------------------------------------
+# 日志降噪（v2.9.29）
+#
+# musicbox.log 几乎 100% 是 uvicorn 的访问行，而其中绝大部分是我们自己每 30 秒
+# 打一遍的 healthz / auth/detail 探针——它们成功与否在代理那边的日志里已有结论，
+# 在这里只占地方：日志涨到 5MB+，真正出错的那几行反而要翻很久。
+#
+# 同样用 filter 而不是 setLevel：uvicorn 启动时会用 dictConfig 重配
+# uvicorn.access（重置 level、清空 handlers），但不会清掉 logger 上的 filter。
+# ---------------------------------------------------------------------------
+_MUSICBOX_QUIET_PATHS = (
+    "/healthz",
+    "/api/v1/auth/status",
+    "/api/v1/auth/detail",
+    "/api/v1/selftest",
+)
+
+
+class _QuietAccessFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            line = record.getMessage()
+        except Exception:      # 拿不到就放行，宁可多记也别漏记
+            return True
+        return not any(p in line for p in _MUSICBOX_QUIET_PATHS)
+
+
+def _install_log_quiet() -> bool:
+    if (os.environ.get("FNMUSIC_LOG_QUIET") or "true").strip().lower() not in (
+        "true", "1", "yes", "on", ""
+    ):
+        return False
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    lg = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, _QuietAccessFilter) for f in lg.filters):
+        lg.addFilter(_QuietAccessFilter())
+    return True
+
+
+_install_log_quiet()
+
 SEARCH_TYPES = {"song", "album", "artist", "playlist"}
 QUALITY_WHITELIST = {"exhigh", "higher", "standard", "lossless", "hires", "jymaster"}
 
