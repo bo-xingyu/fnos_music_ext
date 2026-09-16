@@ -59,7 +59,7 @@ _WIFI = ("wifi", "wi-fi", "wlan", "wireless", "无线")
 _HINT_KEYS = ("quality", "bitrate", "network", "nettype", "net_type",
               "audiotype", "audio_type", "prefer", "transcode")
 
-DEFAULT_POLICY = "follow_fnos"
+DEFAULT_POLICY = "by_lan"
 POLICIES = ("follow_fnos", "fixed", "by_network", "by_lan")
 
 

@@ -51,7 +51,7 @@ def download_enabled() -> bool:
 
 
 def like_sync_enabled() -> bool:
-    return _flag("FNMUSIC_FAV_SYNC_LIKE", "true")
+    return _flag("FNMUSIC_FAV_SYNC_LIKE", "false")
 
 
 # ---------------------------------------------------------------------------

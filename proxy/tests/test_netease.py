@@ -330,7 +330,7 @@ async def test_resolve_netease_url_all_fail():
 
 
 @pytest.mark.anyio
-async def test_resolve_netease_url_logs_exception_type(caplog):
+async def test_resolve_netease_url_logs_exception_type(caplog, monkeypatch):
     """回归真机上的诊断盲区：日志必须带异常类型。
 
     真机日志只有孤零零一行、冒号后面是空的：
@@ -347,6 +347,10 @@ async def test_resolve_netease_url_logs_exception_type(caplog):
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(timeout_handler), base_url="http://127.0.0.1:8770"
     )
+    # v2.9.28：默认策略改为 by_lan，无 request 时按「非局域网」取省流档，
+    # 于是主档就是 exhigh、不会再多试一档。这里显式把非局域网档调高，
+    # 让「主档 + exhigh」两级都走到，才能验证两级失败都留痕。
+    monkeypatch.setenv("FNMUSIC_QUALITY_CELLULAR", "lossless")
     with caplog.at_level(logging.WARNING, logger="fnmusic_proxy"):
         url = await resolve_netease_url(client, "186016")
 

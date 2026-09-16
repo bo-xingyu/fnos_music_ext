@@ -106,15 +106,18 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_DOWNLOAD_DIR", ""),
     ("FNMUSIC_DOWNLOAD_ON_FAVORITE", "true"),
     # --- 音质策略（v2.3 新增）---
-    ("FNMUSIC_QUALITY_POLICY", "follow_fnos"),
-    ("FNMUSIC_QUALITY_FIXED", "lossless"),
+    # v2.9.28：策略固定为「局域网听什么 / 非局域网听什么」，FNMUSIC_QUALITY_POLICY
+    # 与 FNMUSIC_QUALITY_FIXED 已进 OBSOLETE_EXACT（下一步保存配置即从 .env 清掉），
+    # 缺省由 quality.DEFAULT_POLICY 兜底为 by_lan。
     ("FNMUSIC_QUALITY_WIFI", "lossless"),
     ("FNMUSIC_QUALITY_CELLULAR", "exhigh"),
     ("FNMUSIC_QUALITY_DB_RESCAN", "300"),
-    ("FNMUSIC_FAV_SYNC_LIKE", "true"),
+    # v2.9.28：非局域网直连网易云 CDN，音频不再经 NAS 中转（见 app.cdn_redirect_enabled）
+    ("FNMUSIC_CDN_REDIRECT", "true"),
+    # v2.9.28：取链硬超时，到点就回 404 让播放器切下一首（见 app.play_resolve_timeout_s）
+    ("FNMUSIC_PLAY_RESOLVE_TIMEOUT_S", "5"),
     ("FNMUSIC_LOGIN_STATE_TTL", "300"),
     ("FNMUSIC_LOGIN_CHECK_INTERVAL", "3600"),
-    ("FNMUSIC_VIP_WARN_DAYS", "7"),
     ("FNMUSIC_PUSHPLUS_ENABLED", "true"),
     ("FNMUSIC_PUSHPLUS_TOKEN", ""),
     ("FNMUSIC_PUSHPLUS_TOPIC", ""),
@@ -142,7 +145,9 @@ NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOCAL_DAILY", "FN
                 "FNMUSIC_DOWNLOAD_", "FNMUSIC_FAV_",
                 "FNMUSIC_QUALITY_", "FNMUSIC_WATCHDOG_", "FNMUSIC_URL_CACHE_",
                 "FNMUSIC_CHANNEL_LIST_", "FNMUSIC_REMOTE_AS_", "FNMUSIC_LOCAL_",
-                "FNMUSIC_PREFETCH_", "FNMUSIC_COVER_", "FNMUSIC_UNKNOWN_AS_", "FNMUSIC_HLS_")
+                "FNMUSIC_PREFETCH_", "FNMUSIC_COVER_", "FNMUSIC_UNKNOWN_AS_", "FNMUSIC_HLS_",
+                # v2.9.28：非局域网直连 CDN 与取链硬超时
+                "FNMUSIC_CDN_", "FNMUSIC_PLAY_")
 
 # v2.0 已废弃的配置项：升级合并时从 .env 中清理，避免残留误导。
 # 只删「确定已无代码读取」的键；FNMUSIC_MODE / BASE_IMAGE / PIP_INDEX 等 docker 相关项保留。
@@ -150,6 +155,12 @@ OBSOLETE_EXACT = {
     "FNMUSIC_ONLINE_SOURCES",
     "FNMUSIC_APT_MIRROR",
     "FNMUSIC_DEPLOY_MODE",
+    # v2.9.28 起取消的功能：页面已不再提供入口，这里把残留值从 .env 清掉，
+    # 免得「界面上看不见、实际还在生效」——那比留着开关更容易误导。
+    "FNMUSIC_FAV_SYNC_LIKE",      # 收藏同步回网易云（红心写操作）
+    "FNMUSIC_VIP_WARN_DAYS",      # VIP 到期提醒提前量（上游从未给过到期时间）
+    "FNMUSIC_QUALITY_POLICY",     # 音质策略固定为「局域网 / 非局域网」两档
+    "FNMUSIC_QUALITY_FIXED",      # 固定音质档
 }
 OBSOLETE_PREFIXES = (
     "FNMUSIC_MUSICDL_",

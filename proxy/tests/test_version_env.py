@@ -231,7 +231,8 @@ def test_ensure_prefix_defaults_adds_missing_new_keys():
         "FNMUSIC_PUSHPLUS_TOKEN",
         "FNMUSIC_PUSHPLUS_URL",
         "FNMUSIC_LOGIN_STATE_TTL",
-        "FNMUSIC_VIP_WARN_DAYS",
+        "FNMUSIC_CDN_REDIRECT",
+        "FNMUSIC_PLAY_RESOLVE_TIMEOUT_S",
     ):
         assert key in m, f"{key} 应被自动补齐"
     for key, val in env_merge.NEW_DEFAULTS:

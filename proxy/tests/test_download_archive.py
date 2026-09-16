@@ -113,7 +113,8 @@ def test_enabled_requires_dir_and_flag(monkeypatch, tmp_path):
     assert dl.download_enabled() is False
 
     monkeypatch.delenv("FNMUSIC_FAV_SYNC_LIKE", raising=False)
-    assert dl.like_sync_enabled() is True, "红心同步默认开"
+    # v2.9.28：收藏同步回网易云已取消（页面不再提供入口），默认改为关闭。
+    assert dl.like_sync_enabled() is False, "红心同步默认关"
     monkeypatch.setenv("FNMUSIC_FAV_SYNC_LIKE", "off")
     assert dl.like_sync_enabled() is False
 

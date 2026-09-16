@@ -83,11 +83,13 @@ def test_norm_level_keeps_netease_vocabulary_meaning():
 
 
 def test_policy_defaults_and_validation(monkeypatch):
-    assert q.policy() == "follow_fnos"
+    # v2.9.28：页面只保留「局域网 / 非局域网」两档，默认策略随之改为 by_lan。
+    # 其余策略的代码分支保留（手动写 .env 仍可指定），但已不再是默认值。
+    assert q.policy() == "by_lan"
     monkeypatch.setenv("FNMUSIC_QUALITY_POLICY", "fixed")
     assert q.policy() == "fixed"
     monkeypatch.setenv("FNMUSIC_QUALITY_POLICY", "bogus")
-    assert q.policy() == "follow_fnos", "非法值必须回落默认，不能炸"
+    assert q.policy() == "by_lan", "非法值必须回落默认，不能炸"
 
 
 def test_level_getters(monkeypatch):
@@ -489,8 +491,9 @@ def test_resolve_by_network_uses_detected_type(monkeypatch):
     assert unk["level"] == "jymaster", "判不出网络类型时按 WiFi 处理（NAS 场景多在局域网）"
 
 
-def test_resolve_follow_uses_db_evidence(music_db):
+def test_resolve_follow_uses_db_evidence(music_db, monkeypatch):
     """自动跟随：读到了就以飞牛偏好为准，且 source 必须可查证。"""
+    monkeypatch.setenv("FNMUSIC_QUALITY_POLICY", "follow_fnos")
     d = q.resolve(_fake_request(headers={"networkType": "cellular"}), db_path=music_db)
     assert d["policy"] == "follow_fnos"
     assert d["level"] == "exhigh" and d["source"] == "auto:music_db"
@@ -500,6 +503,7 @@ def test_resolve_follow_uses_db_evidence(music_db):
 
 def test_resolve_follow_falls_back_without_evidence(monkeypatch, tmp_path):
     """读不到飞牛偏好时回落手动值，且 source 如实标注是回落。"""
+    monkeypatch.setenv("FNMUSIC_QUALITY_POLICY", "follow_fnos")
     monkeypatch.setenv("FNMUSIC_QUALITY_WIFI", "hires")
     d = q.resolve(None, db_path=str(tmp_path / "absent.db"))
     assert d["level"] == "hires" and d["source"] == "fallback:manual_or_default"
@@ -507,6 +511,7 @@ def test_resolve_follow_falls_back_without_evidence(monkeypatch, tmp_path):
 
 def test_resolve_follow_falls_back_to_netease_quality(monkeypatch):
     """连手动值都认不出来时沿用既有 netease_quality，保持升级前的行为。"""
+    monkeypatch.setenv("FNMUSIC_QUALITY_POLICY", "follow_fnos")
     monkeypatch.setenv("FNMUSIC_NETEASE_QUALITY", "exhigh")
     monkeypatch.setenv("FNMUSIC_QUALITY_WIFI", "garbage")
     monkeypatch.setenv("FNMUSIC_QUALITY_CELLULAR", "garbage")
@@ -514,7 +519,8 @@ def test_resolve_follow_falls_back_to_netease_quality(monkeypatch):
     assert d["level"] == "exhigh" and d["source"] == "fallback:manual_or_default"
 
 
-def test_report_never_raises_and_exposes_evidence(music_db):
+def test_report_never_raises_and_exposes_evidence(music_db, monkeypatch):
+    monkeypatch.setenv("FNMUSIC_QUALITY_POLICY", "follow_fnos")
     q.observe_request("GET", "/music/api/v1/track/stream",
                       query={"audioQuality": "lossless", "deviceId": "x"})
     rep = q.report(db_path=music_db)

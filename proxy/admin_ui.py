@@ -89,7 +89,17 @@ QUALITIES = ("lossless", "exhigh", "higher", "standard")
 # 音质策略可选档位比播放音质多两档：hires / jymaster 在 musicbox 的 QUALITY_WHITELIST
 # 里合法（账号无对应权益时上游会自动降级，不会因此播不出来）。顺序由高到低。
 QUALITY_LEVELS = ("jymaster", "hires", "lossless", "exhigh", "higher", "standard")
-quality_POLICIES = ("follow_fnos", "fixed", "by_network", "by_lan")
+# v2.9.28：音质策略只剩「局域网 / 非局域网」两档；跟随飞牛、按网络分别设置、
+# 固定音质三个策略与固定档一并取消（页面不再提供入口，对应键已列入废弃）。
+QUALITY_POLICY = "by_lan"
+QUALITY_LEVEL_LABELS = (
+    ("standard", "标准 standard（128k）"),
+    ("higher", "较高 higher（192k）"),
+    ("exhigh", "极高 exhigh（320k）"),
+    ("lossless", "无损 lossless（FLAC）"),
+    ("hires", "高清无损 hires（Hi-Res）"),
+    ("jymaster", "臻品母带 jymaster"),
+)
 TEMPLATES = ("markdown", "html", "txt", "json")
 
 
@@ -291,10 +301,11 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     "netease_search_limit": ("FNMUSIC_NETEASE_SEARCH_LIMIT", _int_range(1, 100), False),
     "online_limit": ("FNMUSIC_ONLINE_LIMIT", _int_range(1, 100), False),
     "search_cache_ttl_days": ("FNMUSIC_SEARCH_CACHE_TTL", _int_range(0, 365), False),
-    "vip_warn_days": ("FNMUSIC_VIP_WARN_DAYS", _int_range(0, 90), False),
     "login_check_interval_h": ("FNMUSIC_LOGIN_CHECK_INTERVAL", _int_range(0, 168), False),
     "log_max_mb": ("FNMUSIC_LOG_MAX_MB", _int_range(0, 1024), False),
     "log_max_days": ("FNMUSIC_LOG_MAX_DAYS", _int_range(0, 3650), False),
+    # v2.9.28：取链硬超时（秒）。到点就回 404，让飞牛播放器立刻切下一首。
+    "play_resolve_timeout_s": ("FNMUSIC_PLAY_RESOLVE_TIMEOUT_S", _int_range(1, 30), False),
     # --- 更多口径歌单 / 账户歌单 ---
     "netease_channels": ("FNMUSIC_NETEASE_CHANNELS", _as_channels, False),
     "netease_channel_limit": ("FNMUSIC_NETEASE_CHANNEL_LIMIT", _int_range(1, 50), False),
@@ -308,11 +319,11 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     # --- 收藏归档与红心同步 ---
     "download_dir": ("FNMUSIC_DOWNLOAD_DIR", _as_path, True),
     "download_on_favorite": ("FNMUSIC_DOWNLOAD_ON_FAVORITE", _as_bool, False),
-    "fav_sync_like": ("FNMUSIC_FAV_SYNC_LIKE", _as_bool, False),
-    # --- 音质策略：跟随飞牛 / 按网络分别设置 / 固定 ---
-    "quality_policy": ("FNMUSIC_QUALITY_POLICY",
-                       _in_choices(*quality_POLICIES), False),
-    "quality_fixed": ("FNMUSIC_QUALITY_FIXED", _in_choices(*QUALITY_LEVELS), False),
+    # v2.9.28：非局域网让客户端直连网易云 CDN，音频不再经 NAS 中转
+    "cdn_redirect": ("FNMUSIC_CDN_REDIRECT", _as_bool, False),
+    # --- 音质：局域网一档 / 非局域网一档（v2.9.28 起只有这两档）---
+    # 「跟随飞牛」「按网络分别设置」「固定音质」三个策略与固定档一并取消：
+    # 前两个依赖我们从未可靠拿到的客户端网络线索，第三个则把窄管道照灌母带。
     "quality_wifi": ("FNMUSIC_QUALITY_WIFI", _in_choices(*QUALITY_LEVELS), False),
     "quality_cellular": ("FNMUSIC_QUALITY_CELLULAR", _in_choices(*QUALITY_LEVELS), False),
 }
@@ -344,10 +355,10 @@ DEFAULTS = {
     "netease_search_limit": "50",
     "online_limit": "30",
     "search_cache_ttl_days": "7",
-    "vip_warn_days": "7",
     "login_check_interval_h": "1",
     "log_max_mb": "10",
     "log_max_days": "30",
+    "play_resolve_timeout_s": "5",
     "netease_channels": "mine,toplist,category",
     "netease_channel_limit": "8",
     "netease_category": "华语",
@@ -360,9 +371,7 @@ DEFAULTS = {
     "playlist_refresh_at": "04:30",
     "download_dir": "",
     "download_on_favorite": "true",
-    "fav_sync_like": "true",
-    "quality_policy": "follow_fnos",
-    "quality_fixed": "lossless",
+    "cdn_redirect": "true",
     "quality_wifi": "lossless",
     "quality_cellular": "exhigh",
 }
@@ -844,6 +853,11 @@ async def _probe_proxy_failures() -> dict:
     return await _probe_proxy_path("/_ext/failures", timeout=10.0)
 
 
+async def _probe_proxy_streammode() -> dict:
+    """音频走了哪条路：302 直连 / NAS 中转落缓存 / 本地文件（v2.9.28）。"""
+    return await _probe_proxy_path("/_ext/streammode", timeout=10.0)
+
+
 async def _probe_proxy_authorized() -> dict:
     """向代理进程取「飞牛应用授权目录」状态快照。
 
@@ -1051,6 +1065,7 @@ async def api_diag(request: Request):
         "hls": await _probe_proxy_hls(),
         "playstart": await _probe_proxy_playstart(),
         "failures": await _probe_proxy_failures(),
+        "streammode": await _probe_proxy_streammode(),
         "musicbox": {
             "url": MUSICBOX_URL,
             "healthz": mb,
@@ -1802,61 +1817,43 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
           <span class="ht">取账号能拿到的最高品质（jymaster→hires→lossless→exhigh 逐档降级），配歌词</span>
         </label>
 
-        <label><span class="lb">收藏同步回网易云</span>
-          <input type="checkbox" name="fav_sync_like">
-          <span class="ht">收藏=加红心，取消收藏=撤销红心。这是对你网易云账号的写操作</span>
-        </label>
-
-        <label><span class="lb">音质策略</span>
-          <select name="quality_policy">
-            <option value="by_lan">局域网听无损 / 其他一律 320k（推荐）</option>
-            <option value="follow_fnos">跟随飞牛偏好（读不到时回落到下面的手动值）</option>
-            <option value="by_network">按网络分别设置（WiFi / 流量）</option>
-            <option value="fixed">固定音质（不分网络）</option>
-          </select>
-          <span class="ht"><b>局域网听无损 / 其他一律 320k</b>：只有真的看见私网 IP 才给无损；
-          <b>判不出网络的请求也算「其他」</b>，一律走 320k。这跟「按网络分别设置」的差别就在
-          判不出来的那部分——后者会把它们当 WiFi 处理、照发母带，数据网络下正是卡顿来源。
-          代价是：若你家里一次 XFF 都没透传，WiFi 也会停在 320k（诊断页「网络判定计数」可确认）。
-          <br/>「跟随飞牛」：飞牛把音质偏好放在哪个接口/库表我们没有可靠证据，因此只做被动发现。
-          到底读到没有，请到<b>一键诊断</b>看 <code>quality</code> 段的 <code>current.source</code>：
-          <code>auto:*</code> = 真读到了，<code>fallback:*</code> = 没读到、在用手动脉位</span>
-        </label>
-
-        <label><span class="lb">WiFi / 原始音质档</span>
+        <label><span class="lb">音质：局域网（家里 WiFi / 内网）</span>
           <select name="quality_wifi">
+            <option value="standard">标准 standard（128k）</option>
+            <option value="higher">较高 higher（192k）</option>
+            <option value="exhigh">极高 exhigh（320k）</option>
+            <option value="lossless">无损 lossless（FLAC）</option>
+            <option value="hires">高清无损 hires（Hi-Res）</option>
             <option value="jymaster">臻品母带 jymaster</option>
-            <option value="hires">高清无损 hires</option>
-            <option value="lossless">无损 lossless</option>
-            <option value="exhigh">极高 exhigh (320k)</option>
-            <option value="higher">较高 higher (192k)</option>
-            <option value="standard">标准 standard (128k)</option>
           </select>
-          <span class="ht">账号无对应权益时上游自动降级，不会因此播放失败</span>
+          <span class="ht">档位与网易云音乐一致，由低到高。账号无对应权益时上游自动降级，不会因此播放失败</span>
         </label>
 
-        <label><span class="lb">流量 / 标准音质档</span>
+        <label><span class="lb">音质：非局域网（流量 / 异地远程）</span>
           <select name="quality_cellular">
-            <option value="exhigh">极高 exhigh (320k)</option>
-            <option value="higher">较高 higher (192k)</option>
-            <option value="standard">标准 standard (128k)</option>
-            <option value="lossless">无损 lossless</option>
-            <option value="hires">高清无损 hires</option>
+            <option value="standard">标准 standard（128k）</option>
+            <option value="higher">较高 higher（192k）</option>
+            <option value="exhigh">极高 exhigh（320k）</option>
+            <option value="lossless">无损 lossless（FLAC）</option>
+            <option value="hires">高清无损 hires（Hi-Res）</option>
             <option value="jymaster">臻品母带 jymaster</option>
           </select>
-          <span class="ht">省流量场景默认 320k；只在客户端真的报了网络类型时才用得上</span>
+          <span class="ht"><b>看不出是不是局域网的请求也按这一档处理</b>——判不出时宁可少给一档音质
+          （多半听不出来），也不能在窄管道上灌母带（立刻就卡）。诊断页「网络判定计数」可确认透传是否正常</span>
         </label>
 
-        <label><span class="lb">固定音质档</span>
-          <select name="quality_fixed">
-            <option value="jymaster">臻品母带 jymaster</option>
-            <option value="hires">高清无损 hires</option>
-            <option value="lossless">无损 lossless</option>
-            <option value="exhigh">极高 exhigh (320k)</option>
-            <option value="higher">较高 higher (192k)</option>
-            <option value="standard">标准 standard (128k)</option>
-          </select>
-          <span class="ht">仅当策略选「固定音质」时生效</span>
+        <label><span class="lb">非局域网直连 CDN（不经 NAS 中转）</span>
+          <input type="checkbox" name="cdn_redirect">
+          <span class="ht">移动数据 / 异地远程时，音频原本是「网易云 CDN → NAS → 手机」两次穿越 NAS 的上行带宽，
+          窄管道上这正是「等 7~8 秒才出声」的成因。打开后我们直接 302 让手机去 CDN 拿，绕开 NAS；
+          <b>代价是这一路不再边播边存</b>（局域网不受影响，照旧落缓存）。播不出来就关掉，立刻回到原来的转发方式</span>
+        </label>
+
+        <label><span class="lb">取链超时（秒）</span>
+          <input name="play_resolve_timeout_s" inputmode="numeric" placeholder="5">
+          <span class="ht">1–30，默认 5。超过这个时间还没拿到直链就直接回 404，让飞牛<b>立刻切下一首</b>，
+          不再干等——播放器自己也就等 7~8 秒，设得比它大没有意义：等回来那首歌早被切掉了，
+          白白占着音源服务。实际生效值取「这里设的」与「上限 30 秒」中较小的那个</span>
         </label>
 
         <label><span class="lb">单次搜索请求条数</span>
@@ -1872,11 +1869,6 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
         <label><span class="lb">搜索缓存有效期（天）</span>
           <input name="search_cache_ttl_days" inputmode="numeric" placeholder="7">
           <span class="ht">0 表示不缓存</span>
-        </label>
-
-        <label><span class="lb">VIP 到期提醒提前量（天）</span>
-          <input name="vip_warn_days" inputmode="numeric" placeholder="7">
-          <span class="ht">0 表示不提醒</span>
         </label>
 
         <label><span class="lb">登录态巡检间隔（小时）</span>
@@ -1985,19 +1977,6 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
   </div>
 
   <div class="card">
-    <h2>飞牛授权目录（本地曲库访问权）</h2>
-    <div class="sub">按飞牛开发规范，应用读取存储空间里的目录前必须先取得授权——系统会把该路径的 ACL
-      授予本应用，之后本地每日推荐、本地曲库优先才读得动。点「申请授权」在弹窗里选你的音乐目录
-      （需管理员）；授权后点「刷新状态」，下方会列出已授权目录。</div>
-    <div class="acts">
-      <button class="btn pri" id="authPickBtn" type="button">申请授权目录…</button>
-      <button class="btn" id="authRefreshBtn" type="button">刷新状态</button>
-    </div>
-    <div class="msg" id="authMsg"></div>
-    <div class="sub" id="authState" style="margin:0 0 6px;white-space:pre-wrap"></div>
-  </div>
-
-  <div class="card">
     <h2>歌单顺序（手动排序）</h2>
     <div class="sub">点「读取当前歌单」拉取当前实际注入飞牛的网易云歌单（真实名称，顺序与飞牛里显示一致），
       用 ▲▼ 调整后保存。保存后<b>立即生效、无需重启</b>；新出现的歌单会排在手动排过的之后。
@@ -2011,25 +1990,6 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
     <div class="msg" id="plMsg"></div>
     <div class="sub" id="plCache" style="margin:0 0 10px"></div>
     <div id="plList"></div>
-  </div>
-
-  <div class="card">
-    <h2>日志</h2>
-    <div class="tabs" id="logTabs">
-      <button data-w="info" class="on">生命周期</button>
-      <button data-w="proxy">代理</button>
-      <button data-w="musicbox">音源服务</button>
-      <button data-w="restore">socket 还原</button>
-      <button data-w="setup">安装/依赖</button>
-      <button data-w="ui">本页</button>
-    </div>
-    <div class="acts" style="margin-top:0">
-      <button class="btn" id="logBtn">读取最近 120 行</button>
-      <button class="btn" id="rotateBtn">立即清理超额日志</button>
-      <span class="sub" id="logPolicy" style="margin:0"></span>
-    </div>
-    <div class="msg" id="logMsg"></div>
-    <pre class="log hide" id="logBox"></pre>
   </div>
 
   <div class="sub" style="text-align:center;margin-top:20px">
@@ -2048,7 +2008,7 @@ var $=function(s){return document.querySelector(s)};
 //     而给 checkbox 赋 value 不会改变勾选外观；
 //   - 提交时下面那句 `el.type==="checkbox"` 会把未登记的 checkbox 整个跳过，
 //     该字段不会出现在 values 里。
-var BOOLS=["free_only_on_logout","daily_enabled","local_daily_enabled","local_first","local_first_any_class","prefetch_next","pushplus_enabled","download_on_favorite","fav_sync_like"];
+var BOOLS=["free_only_on_logout","daily_enabled","local_daily_enabled","local_first","local_first_any_class","prefetch_next","pushplus_enabled","download_on_favorite","cdn_redirect"];
 var pollTimer=null, qrUnikey="", expireTimer=null;
 
 // 服务端注入的绝对前缀（形如 /app/fnmusicext/）。
@@ -2125,11 +2085,6 @@ function renderStatus(j){
       var v=n.vip?'<span class="pill ok">VIP</span> '
         :'<span class="pill warn">非 VIP'+(n.vip_type?(" (vipType="+n.vip_type+")"):"")+'</span> ';
       h+=kv("网易云", pill(true,"已登录")+" "+v+esc(n.nickname||""));
-      // 天数未知时必须如实说"上游未提供"，不能显示成 0 天或空破折号
-      var vipd = n.vip_days_left==null
-        ? (n.vip ? '<span class="pill warn">上游未提供到期时间</span>' : "—")
-        : (n.vip_days_left+" 天");
-      h+=kv("VIP 剩余", vipd);
     }else{
       h+=kv("网易云", pill(false,"未登录")+(n.free_only?' <span class="pill warn">免费曲降级</span>':""));
     }
@@ -2237,56 +2192,12 @@ $("#reloadBtn").onclick=function(){ $("#cfgMsg").className="msg"; loadCfg() };
 function fmtBytes(n){ n=Number(n)||0; return n>1048576 ? (n/1048576).toFixed(2)+" MB"
   : n>1024 ? (n/1024).toFixed(1)+" KB" : n+" B" }
 
-function currentLogName(){ return $("#logTabs button.on").getAttribute("data-w") }
-
-function renderLogs(){
-  var w=currentLogName();
-  $("#logBox").classList.remove("hide");
-  $("#logBox").textContent="读取中…";
-  api("api/logs?what="+encodeURIComponent(w)+"&lines=120").then(function(j){
-    if(!j.ok){
-      $("#logBox").textContent="读取失败："+(j.error||("HTTP "+(j._status||"?")));
-      return;
-    }
-    if(j.policy){
-      $("#logPolicy").textContent="策略：单文件 > "+j.policy.max_mb+" MB 就地截断保留尾部，超过 "
-        +j.policy.max_days+" 天自动清理；目录 "+(j.policy.dir||"未配置");
-    }
-    var ls=j.lines||[];
-    var head="— "+w+".log（"+(j.size_bytes?fmtBytes(j.size_bytes):"空")+"，显示末尾 "+ls.length+" 行）—\n";
-    $("#logBox").textContent = ls.length ? head+ls.join("\n")
-      : (j.note || "（暂无日志）") + "\n\n路径："+(j.path||"未知");
-    $("#logBox").scrollTop=$("#logBox").scrollHeight;
-  });
-}
-$("#logBtn").onclick=renderLogs;
-
-$("#rotateBtn").onclick=function(){
-  var b=this; b.disabled=true; b.textContent="清理中…";
-  var m=$("#logMsg"); m.className="msg info"; m.textContent="正在按策略清理…";
-  api("api/logs/rotate",{method:"POST"}).then(function(j){
-    b.disabled=false; b.textContent="立即清理超额日志";
-    if(!j.ok){ m.className="msg err"; m.textContent="清理失败："+(j.error||("HTTP "+(j._status||"?"))); return; }
-    var acts=j.actions||[];
-    var msg=acts.length
-      ? "已清理 "+acts.length+" 项，回收 "+(j.freed_mb||0)+" MB：\n"
-        + acts.map(function(a){return "  · "+a.file+" — "+a.action
-            +(a.size_mb?" ("+a.size_mb+"MB → "+(a.kept_mb||0)+"MB)":"")
-            +(a.age_days?" (留存 "+a.age_days+" 天)":"")}).join("\n")
-      : "没有需要清理的日志（都在阈值内）。";
-    if(j.errors&&j.errors.length) msg+="\n\n部分失败：\n  "+j.errors.join("\n  ");
-    m.className=(j.errors&&j.errors.length)?"msg err":"msg ok";
-    m.textContent=msg;
-    renderLogs();
-  });
-};
-
 function runDiag(auto){
   DIAG_DONE=true;
   var box=$("#diagBox"), acts=$("#diagActs");
   box.classList.remove("hide"); acts.classList.remove("hide");
   if(!auto){ $("#diagMsg").className="msg info"; $("#diagMsg").textContent="正在收集诊断信息…"; }
-  var w=currentLogName();
+  var w="proxy";  // 日志页签已移除，固定取代理日志
   Promise.all([
     api("api/diag"),
     api("api/logs?what=info&lines=60"),
@@ -2531,38 +2442,18 @@ function runDiag(auto){
                 +"slow-start = 连元数据带直链就花了 5s 以上，播放器 7~8s 跳歌时它已占掉大半。");
       }
       out.push("");
-      out.push("-- 飞牛应用授权目录（开放能力 / api-scope）--");
-      var az=d.authorized||{};
-      if(!az.reachable){
-        out.push("  取不到代理侧快照: "+JSON.stringify(az));
-      }else{
-        var gw=az.gateway||{};
-        out.push("  应用名         : "+gw.app_name);
-        out.push("  开放网关       : "+gw.socket+"  存在="+gw.exists);
-        out.push("  TRIM_API_TOKEN : "+(gw.token_present?"已注入":"★ 未注入（需由系统脚本启动进程）"));
-        out.push("  已授权目录     : "+((az.shared_paths&&az.shared_paths.length)?az.shared_paths.join(" | "):"（无）"));
-        if(az.config_paths&&az.config_paths.length)
-          out.push("  配置文件路径   : "+az.config_paths.join(" | "));
-        if(az.source) out.push("  授权来源       : "+az.source+(az.degraded?"（降级，功能不受影响）":(az.source==="env"?"（官方授权，非降级）":"")));
-        if(az.env_paths&&az.env_paths.length)
-          out.push("  环境变量路径   : "+az.env_paths.join(" | "));
-        out.push("  当前曲库目录   : "+az.library_dir+"  被授权覆盖="+(!!az.authorized));
-        out.push("  严格模式       : "+az.strict+"（true=只扫已授权目录）");
-        var gl=az.gateway_last||{};
-        if(gl.skipped) out.push("  网关查询       : 已跳过 — "+gl.reason);
-        else if(az.shared_error) out.push("  网关返回       : "+az.shared_error);
-        if(az.last_raw) out.push("  网关原始响应   : "+az.last_raw);
-        // 环境变量已给答案时，「刷新状态」会额外主动探一次网关，结果仅供参考
-        if(az.gateway_probe) out.push("  网关主动探测   : req="+az.gateway_probe.req+" code="+az.gateway_probe.code
-                                      +" "+(az.gateway_probe.msg||"")+"（仅供参考，授权以环境变量为准）");
-        var tenv=(az.trim_env&&az.trim_env.values)||{};
-        var tk=Object.keys(tenv);
-        out.push("  系统注入变量   : "+(tk.length?tk.join(", "):"★ 一个都没有（进程不是由系统脚本拉起？）"));
-        tk.forEach(function(k){
-          if(/PKGVAR|PKGMETA|PKGETC|PKGHOME|APPNAME|APPVER|SYS_VERSION|APP_STATUS|DATA_SHARE_PATHS|DATA_ACCESSIBLE_PATHS/.test(k))
-            out.push("      "+k+" = "+tenv[k]);
-        });
-        if(az.hint) out.push("  ★ "+az.hint);
+      out.push("-- 音频走哪条路（302 直连 / NAS 中转 / 本地文件）--");
+      var sm=d.streammode||{};
+      if(!sm.reachable){ out.push("  取不到代理侧快照: "+JSON.stringify(sm)); }
+      else{
+        out.push("  非局域网直连   : "+sm.enabled+"（FNMUSIC_CDN_REDIRECT）");
+        out.push("  302 直连 CDN   : "+sm.redirect+" 次（音频不经 NAS，但也不落缓存）");
+        out.push("  NAS 中转       : "+sm.tee+" 次（局域网：边播边存）");
+        out.push("  本地文件       : "+sm.local+" 次");
+        out.push("  取链超时       : "+sm.timeout_s+"s（上限 "+sm.timeout_cap_s
+                 +"s；到点就回 404，让播放器立刻切下一首）");
+        out.push("  ★ 怎么读：在外面（流量/远程）播放时「302 直连」应该是大头；"
+                +"若它一直是 0，说明请求被判成了局域网（看上面「客户端 IP 线索」）或开关没开。");
       }
       out.push("");
       out.push("-- 音源服务 (musicbox) --");
@@ -2705,94 +2596,7 @@ $("#plWarmBtn").onclick=function(){
   });
 };
 
-/* ===== 飞牛授权目录（api-scope: trim.file.sharedAccess） =====
-   管理页保持「单文件、零外链」约束，不动态加载任何 CDN SDK。若宿主已把
-   TrimApp 注入为全局对象（微应用形态），直接唤起系统目录选择器；否则降级为
-   「去应用设置 → 授权目录添加 + 本页刷新状态核对」的引导，绝不报错、不联网。 */
-function authRender(j){
-  var box=$("#authState"), m=$("#authMsg");
-  if(!j.ok){ box.textContent="读取失败："+(j.error||"未知错误"); m.className="msg err";
-             m.textContent="代理不可达，无法查询授权状态。"; return; }
-  var gw=j.gateway||{};
-  var lines=[];
-  lines.push("开放网关       : "+(gw.exists?"存在":"★ 不存在")+"  "+gw.socket);
-  lines.push("TRIM_API_TOKEN : "+(gw.token_present?"已注入":"★ 未注入（进程需由系统脚本启动）"));
-  lines.push("已授权目录     : "+((j.shared_paths&&j.shared_paths.length)?j.shared_paths.join("\n                 "):"（无）"));
-  lines.push("当前曲库目录   : "+(j.library_dir||"（未定位）")+"   被授权覆盖="+(j.authorized?"是":"★ 否"));
-  if(j.source) lines.push("授权来源       : "+j.source+(j.degraded?"（降级，功能不受影响）":(j.source==="env"?"（官方授权，非降级）":"")));
-  if(j.app_names&&j.app_names.length) lines.push("应用名候选     : "+j.app_names.join(" / "));
-  var gl=j.gateway_last||{};
-  if(gl.skipped) lines.push("网关查询       : 已跳过 — "+gl.reason);
-  else if(j.shared_error) lines.push("网关返回       : "+j.shared_error);
-  // Internal Error 太笼统，光看 code/msg 无法定位，把状态行与响应体原文一并列出，
-  // 用户把这段贴出来就能直接判断是 appName 不对、scope 没生效还是系统版本问题。
-  if(j.last_raw) lines.push("网关原始响应   : "+j.last_raw);
-  var env=(j.trim_env&&j.trim_env.values)||{};
-  var envKeys=Object.keys(env);
-  if(envKeys.length){
-    lines.push("系统注入变量   : "+envKeys.join(", "));
-    // 值里能看出系统登记的应用名（TRIM_PKGVAR=/vol1/@appdata/<appname>）
-    for(var i=0;i<envKeys.length;i++){
-      var k=envKeys[i];
-      if(/PKGVAR|PKGMETA|PKGETC|PKGHOME|APPNAME|APPVER|SYS_VERSION|DATA_SHARE_PATHS|DATA_ACCESSIBLE_PATHS/.test(k)){
-        lines.push("                 "+k+" = "+env[k]);
-      }
-    }
-  } else { lines.push("系统注入变量   : ★ 一个都没有（进程不是由系统脚本拉起的？）"); }
-  if(j.note) lines.push("说明           : "+j.note);
-  box.textContent=lines.join("\n");
-  if(j.hint){ m.className="msg err"; m.textContent=j.hint; }
-  else if(j.note){ m.className="msg"; m.textContent=j.note; }
-  else { m.className="msg ok"; m.textContent="已授权 "+(j.shared_paths||[]).length+" 个目录。"; }
-}
-function authLoad(refresh){
-  var b=$("#authRefreshBtn"); if(b){ b.disabled=true; b.textContent="刷新中…"; }
-  api("api/authorized"+(refresh?"?refresh=1":"")).then(function(j){
-    if(b){ b.disabled=false; b.textContent="刷新状态"; }
-    authRender(j);
-  });
-}
-$("#authRefreshBtn").onclick=function(){ authLoad(true); };
-$("#authPickBtn").onclick=function(){
-  var m=$("#authMsg");
-  if(typeof window.TrimApp==="function"){
-    m.className="msg"; m.textContent="正在唤起飞牛目录选择器…";
-    try{
-      var sdk=new window.TrimApp();
-      var p=sdk.isStandaloneWeb
-        ? sdk.openAppAuth("pickSharedFile",{appName:"fnmusicext",directory:true,
-            title:"选择音乐曲库目录",okText:"确认授权",
-            redirectUri:window.location.pathname,state:"localdaily"},
-            {target:"_blank",features:"width=750,height=630"})
-        : sdk.pickSharedFile({directory:true,title:"选择音乐曲库目录",okText:"确认授权"});
-      Promise.resolve(p).then(function(res){
-        if(res&&typeof res.code==="number"){
-          m.className=res.code===0?"msg ok":"msg err";
-          m.textContent=res.code===0?("已授权："+((res.data||[]).join(" | ")||"（空）"))
-                                     :("授权失败："+(res.msg||"未知错误"));
-        }
-        authLoad(true);
-      })["catch"](function(e){
-        m.className="msg err";
-        m.textContent="唤起失败："+(e&&(e.message||e))+"（可到「应用设置 → 授权目录」手动添加）";
-      });
-      return;
-    }catch(e){ /* 落到下面的引导 */ }
-  }
-  m.className="msg";
-  m.textContent="本页没有宿主注入的 SDK。请到「应用中心 → 飞牛音乐扩展 → 设置 → 授权目录」"
-    +"添加你的音乐目录（需管理员），完成后回到这里点「刷新状态」核对。";
-};
-authLoad(false);
 loadPl();
-Array.prototype.forEach.call($("#logTabs").querySelectorAll("button"),function(b){
-  b.onclick=function(){
-    Array.prototype.forEach.call($("#logTabs").querySelectorAll("button"),function(x){x.classList.remove("on")});
-    b.classList.add("on");
-    if(!$("#logBox").classList.contains("hide")) renderLogs();
-  };
-});
-
 $("#cfgForm").onsubmit=function(ev){
   ev.preventDefault();
   var fd=new FormData(ev.target), values={};

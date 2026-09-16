@@ -2324,6 +2324,16 @@ async def ext_playstart():
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
 
 
+@app.get("/_ext/streammode")
+async def ext_streammode():
+    """音频到底走了哪条路（v2.9.28）：302 直连 / 经 NAS 中转落缓存 / 本地文件。"""
+    try:
+        return {"ok": True, "data": stream_mode_stats()}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("streammode diag failed: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
+
+
 @app.get("/_ext/failures")
 async def ext_failures():
     """最近几次「播不出来」的留证（v2.9.27）。
@@ -3114,6 +3124,7 @@ async def stream_track(request: Request):
             if _play_start_fresh(guid):
                 logger.info("play-start local-daily %s %.0fms local", guid,
                             (time.monotonic() - started) * 1000.0)
+            _STREAM_MODE["local"] = int(_STREAM_MODE.get("local", 0)) + 1
             return serve_file_with_range(local_path, request.headers.get("range"),
                                          media_type_for_ext(ext))
         return await forward_to_upstream(
@@ -3157,6 +3168,7 @@ async def stream_track(request: Request):
         cached = promote_cache_hit(guid, cached)
         ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
         _log_play("tee-cache", " local")
+        _STREAM_MODE["local"] = int(_STREAM_MODE.get("local", 0)) + 1
         return serve_file_with_range(cached, range_header, media_type_for_ext(ext))
 
     src = source_from_online_guid(guid)
@@ -3249,11 +3261,23 @@ async def stream_track(request: Request):
     warming_now = guid in _PREFETCH_TASKS
     _gather_flags: dict[str, bool] = {}
     _gather_started = time.monotonic()
-    play_url_res, info_res = await asyncio.gather(
-        resolve_netease_url(musicbox_client, song_id, request, stats=_gather_flags),
-        _online_info(request, guid),
-        return_exceptions=True,
-    )
+    # v2.9.28：给取链加硬超时（见 play_resolve_timeout_s）。超时不是「失败」，
+    # 而是**主动认输**——播放器早就自己跳走了，再等下去只是替一个已被放弃的
+    # 请求占着 musicbox。届时直接回 404，让播放器立刻切下一首。
+    _resolve_timeout = play_resolve_timeout_s()
+    try:
+        _gathered = await asyncio.wait_for(
+            asyncio.gather(
+                resolve_netease_url(musicbox_client, song_id, request, stats=_gather_flags),
+                _online_info(request, guid),
+                return_exceptions=True,
+            ),
+            timeout=_resolve_timeout,
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        _gathered = (TimeoutError(f"resolve timeout >{_resolve_timeout:.0f}s"),
+                     TimeoutError("resolve timeout"))
+    play_url_res, info_res = _gathered
     _gather_ms = (time.monotonic() - _gather_started) * 1000.0
     # v2.9.25：warm 收紧为「这次真的省掉了 musicbox 往返」（直链缓存是否命中）。
     # 以前拿「曾经预热过这首歌」当 warm，可预热成果的寿命是直链缓存 TTL、比标记
@@ -3310,6 +3334,18 @@ async def stream_track(request: Request):
 
     resolved_ext = str(info.get("ext")) if (isinstance(info, dict) and info.get("ext")) else None
 
+    # v2.9.28：非局域网 302 直连 CDN（见 cdn_redirect_enabled）。
+    # 只在**明确判为远程/流量**时才绕开。判不出（unknown）时不绕——「不知道」的
+    # 时候保持原样（照旧经 NAS 并落缓存）才是保守做法：悄悄丢掉边播边存，比
+    # 少拿一次直连优化更糟。真机远程访问是能判出来的（诊断里 13/13 都是 cellular）。
+    if cdn_redirect_enabled() and quality.network_of(request) == "cellular":
+        _STREAM_MODE["redirect"] = int(_STREAM_MODE.get("redirect", 0)) + 1
+        logger.info("stream redirect %s -> cdn（非局域网，音频不经 NAS 中转）", guid)
+        return RedirectResponse(
+            play_url, status_code=302,
+            headers={"Cache-Control": "private, max-age=60",
+                     "Accept-Ranges": "bytes"})
+
     req_headers = {}
     if range_header:
         req_headers["Range"] = range_header
@@ -3359,6 +3395,7 @@ async def stream_track(request: Request):
             return _online_unavailable()
 
     _log_play("netease", warm=_gather_warm)
+    _STREAM_MODE["tee"] = int(_STREAM_MODE.get("tee", 0)) + 1
     return stream_tee_response(
         resp,
         guid=guid,
@@ -3414,6 +3451,61 @@ def hls_local_bypass() -> bool:
 def _hls_slow_ms() -> float:
     """分片耗时超过多少就算「慢」（默认 5s，播放器通常 7~8s 就放弃）。"""
     return max(1000.0, _float("FNMUSIC_HLS_SLOW_SEG_MS", 5000.0))
+
+
+# ---------------------------------------------------------------------------
+# 取链硬超时（v2.9.28）
+#
+# 真机反馈「一首歌等 7~8 秒然后自动跳过」。等太久的代价其实比失败更大：播放器
+# 7~8 秒等不到就**自己跳歌**了，而我们还在这儿干等，等取回来时那首歌早被切掉，
+# 白白占着单进程的 musicbox（连累后面几首）。不如到点就认输、回 404 —— 那正是
+# 飞牛播放器本来就认的「跳过」信号，它立刻就会去播下一首。
+#
+# 上限刻意压在「播放器自己的耐心」之内：设成 30s 只会让我们替一个已经放弃的
+# 请求继续占用资源，用户那边什么也感觉不到。
+# ---------------------------------------------------------------------------
+_PLAY_RESOLVE_TIMEOUT_CAP = 30.0
+
+
+def play_resolve_timeout_s() -> float:
+    """取链最多等多久。实际生效值 = min(你设的值, 上限)。"""
+    return max(1.0, min(_PLAY_RESOLVE_TIMEOUT_CAP,
+                        _float("FNMUSIC_PLAY_RESOLVE_TIMEOUT_S", 5.0)))
+
+
+# ---------------------------------------------------------------------------
+# 非局域网 302 直连 CDN（v2.9.28）
+# ---------------------------------------------------------------------------
+_STREAM_MODE: dict[str, int] = {"redirect": 0, "tee": 0, "local": 0}
+
+
+def cdn_redirect_enabled() -> bool:
+    """非局域网时是否 302 让客户端直连网易云 CDN（默认开）。
+
+    - **局域网**：音频走「NAS 取流 → 落盘缓存 → 喂给客户端」，也就是**边播边存**，
+      播过一次之后第二次直接读本地文件。代价是所有音频字节都要经 NAS 转一圈。
+    - **非局域网**（移动数据 / 异地远程）：NAS 的**上行带宽**成了瓶颈，音频等于
+      「CDN → NAS → 手机」两次穿越同一条窄管道——真机在流量下等 7~8 秒才出声、
+      然后被播放器跳掉，就是这么来的。302 让手机直接去 CDN 拿，绕开 NAS 上行。
+
+    代价是这一路**不再落缓存**，所以只在非局域网开：家里带宽不紧张，缓存也更有价值。
+
+    播不出来就关掉（个别 CDN 有 Referer/UA 校验，或播放器不跟重定向）：关掉后
+    立刻回到代理转发，行为与旧版本完全一致。
+    """
+    return str(os.environ.get("FNMUSIC_CDN_REDIRECT", "true") or "true") \
+        .strip().lower() in ("true", "1", "yes", "on")
+
+
+def stream_mode_stats() -> dict[str, Any]:
+    return {
+        "enabled": cdn_redirect_enabled(),
+        "redirect": int(_STREAM_MODE.get("redirect", 0)),
+        "tee": int(_STREAM_MODE.get("tee", 0)),
+        "local": int(_STREAM_MODE.get("local", 0)),
+        "timeout_s": round(play_resolve_timeout_s(), 1),
+        "timeout_cap_s": round(_PLAY_RESOLVE_TIMEOUT_CAP, 1),
+    }
 
 
 def _hls_known_duration(guid: str) -> int:
