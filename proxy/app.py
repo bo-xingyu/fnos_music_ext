@@ -26,7 +26,7 @@ import re
 import shutil
 import sqlite3
 import time
-from collections import deque
+from collections import deque, OrderedDict
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Callable, Coroutine
 from urllib.parse import quote
@@ -3409,12 +3409,24 @@ async def stream_track(request: Request):
     # 时候保持原样（照旧经 NAS 并落缓存）才是保守做法：悄悄丢掉边播边存，比
     # 少拿一次直连优化更糟。真机远程访问是能判出来的（诊断里 13/13 都是 cellular）。
     if cdn_redirect_enabled() and quality.network_of(request) == "cellular":
-        _STREAM_MODE["redirect"] = int(_STREAM_MODE.get("redirect", 0)) + 1
-        logger.info("stream redirect %s -> cdn（非局域网，音频不经 NAS 中转）", guid)
-        return RedirectResponse(
-            play_url, status_code=302,
-            headers={"Cache-Control": "private, max-age=60",
-                     "Accept-Ranges": "bytes"})
+        # v2.9.30：客户端反复回来要同一首歌 = 上一次直连没取到音频（我们看不见
+        # 客户端与 CDN 之间发生了什么，只看得见它是不是在反复回来）。这时继续
+        # 302 只会让它一直重试到放弃跳歌，改走中转——中转是 2.9.28 之前的老路。
+        if redirect_storm(guid):
+            _note_redirect_storm(guid, len(_STREAM_HITS.get(guid) or ()))
+            # 不 return：落到下面的中转分支
+        else:
+            _STREAM_MODE["redirect"] = int(_STREAM_MODE.get("redirect", 0)) + 1
+            # 补回播放起步留证：2.9.28 在这里直接 return，play-start 一行都没落，
+            # 于是诊断页「实际播放 0 首」而预热统计却记着 6 首——自相矛盾，
+            # 而且「每次播放请求数」这个能看出客户端是否稳定取流的指标也一并瞎了。
+            _log_play(f"redirect({_url_scheme_host(play_url)})", warm=_gather_warm)
+            logger.info("stream redirect %s -> cdn（非局域网，音频不经 NAS 中转）%s",
+                        guid, _url_scheme_host(play_url))
+            return RedirectResponse(
+                play_url, status_code=302,
+                headers={"Cache-Control": "private, max-age=60",
+                         "Accept-Ranges": "bytes"})
 
     req_headers = {}
     if range_header:
@@ -3575,7 +3587,82 @@ def stream_mode_stats() -> dict[str, Any]:
         "local": int(_STREAM_MODE.get("local", 0)),
         "timeout_s": round(play_resolve_timeout_s(), 1),
         "timeout_cap_s": round(_PLAY_RESOLVE_TIMEOUT_CAP, 1),
+        # v2.9.30：因「反复重试」判定直连失败、已回退中转的曲目数
+        "storm": len(_REDIRECT_STORM_LOGGED),
+        "storm_n": _REDIRECT_STORM_N,
+        "storm_window_s": _REDIRECT_STORM_WINDOW_S,
     }
+
+
+# ---------------------------------------------------------------------------
+# 302 重试风暴自动回退（v2.9.30）
+#
+# 302 是把音频交给客户端自己去取，代价是**这一程我们完全看不见**。真机出现过：
+# 同一首歌在 2.5 秒里被请求 9 次（约 300ms 一次），然后就被切到下一首——
+# 正常播放时客户端拿一次直链就该自己去 CDN 拉很久（对比：413829859 全程只有
+# 1 次请求，之后 31 秒再无动静，那才是 302 该有的样子）。反复回来要直链，
+# 说明**客户端没能从那个 CDN 地址取到音频**（地址拒了、连接被断、或客户端
+# 不跟重定向），而我们的日志里对此一行都没有：留证只覆盖「取直链」这一段。
+#
+# 所以按行为兜底：同一首歌短时间内被反复要直链，就判定这次直连没成功，
+# 改走 NAS 中转——中转是 2.9.28 之前一直在用的老路，行为完全已知。
+# 这样 302 变成「能用就直连、不能用自己退回中转」，而不是非此即彼的开关。
+# ---------------------------------------------------------------------------
+_REDIRECT_STORM_N = 3            # 同一首歌这么多次请求…
+_REDIRECT_STORM_WINDOW_S = 15.0  # …发生在这么短的窗口内，判定直连没成功
+_REDIRECT_STORM_MAX_GUID = 64    # 最多记住这么多首，防内存无上限增长
+_STREAM_HITS: "OrderedDict[str, deque]" = OrderedDict()
+_REDIRECT_STORM_LOGGED: "set[str]" = set()
+
+
+def redirect_storm(guid: str) -> bool:
+    """记录一次取流请求，返回这首歌是否正处在「重试风暴」里。
+
+    判定依据是客户端的行为，不是我们的猜测——我们看不见客户端与 CDN 之间发生了什么，
+    但能看见它是不是在反复回来要同一首歌。
+    """
+    now = time.monotonic()
+    q = _STREAM_HITS.get(guid)
+    if q is None:
+        q = deque(maxlen=8)
+        _STREAM_HITS[guid] = q
+        _REDIRECT_STORM_LOGGED.discard(guid)
+        while len(_STREAM_HITS) > _REDIRECT_STORM_MAX_GUID:
+            _STREAM_HITS.popitem(last=False)
+    q.append(now)
+    while q and now - q[0] > _REDIRECT_STORM_WINDOW_S:
+        q.popleft()
+    return len(q) >= _REDIRECT_STORM_N
+
+
+def _note_redirect_storm(guid: str, count: int) -> None:
+    """风暴每个 guid 只告警一次，避免一次播放刷出十几行。"""
+    if guid in _REDIRECT_STORM_LOGGED:
+        return
+    _REDIRECT_STORM_LOGGED.add(guid)
+    if len(_REDIRECT_STORM_LOGGED) > _REDIRECT_STORM_MAX_GUID * 2:
+        _REDIRECT_STORM_LOGGED.clear()
+    logger.warning(
+        "stream redirect %s 放弃直连：%.0fs 内已被请求 %d 次，客户端多半没能从 CDN 取到音频，"
+        "本次起改走 NAS 中转（音频经 NAS，可边播边存）", guid, _REDIRECT_STORM_WINDOW_S, count)
+    _note_stream_fail(guid, f"302 直连未成功：{_REDIRECT_STORM_WINDOW_S:.0f}s 内重试 {count} 次，已回退中转",
+                      None, "redirect-storm")
+
+
+def _url_scheme_host(url: str) -> str:
+    """只取 scheme://host —— 直链后半段是令牌，不进日志。
+
+    但 scheme 必须留：若真机拿到的是 http:// 直链，部分客户端默认禁止明文流量，
+    那就是「302 出去却取不到」最可能的原因，看不到 scheme 就只能靠猜。
+    """
+    try:
+        from urllib.parse import urlsplit  # 局部导入：保持模块顶层导入面不变
+        p = urlsplit(url)
+        if not (p.scheme or p.netloc):
+            return "?"
+        return f"{p.scheme or '?'}://{p.netloc or '?'}"
+    except Exception:
+        return "?"
 
 
 def _hls_known_duration(guid: str) -> int:
