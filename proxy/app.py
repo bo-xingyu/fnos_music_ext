@@ -26,6 +26,7 @@ import re
 import shutil
 import sqlite3
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Callable, Coroutine
 from urllib.parse import quote
@@ -1739,6 +1740,43 @@ def _online_unavailable(msg: str = "online source unavailable", code: int = 404)
     return JSONResponse(content={"code": code, "msg": msg, "data": None}, status_code=code)
 
 
+# ---------------------------------------------------------------------------
+# 播放失败留证（v2.9.27）
+#
+# 「一首歌等 7~8 秒然后自动跳过」最难受的其实不是跳过，是**查不到为什么**：
+# 以前 _online_unavailable() 直接回 404 就完了，日志里一行都没有。播放器跳过
+# 之后我们既不知道失败在哪一步，也不知道耗时多久，只能靠猜。现在每次失败都落
+# 一行，并留最近若干条到环形缓冲，诊断页直接看得到。
+#
+# 阶段（stage）区分两种完全不同的失败：
+#   resolve  = 连直链都没拿到（musicbox / 网易云接口 / 登录态问题）
+#   open-cdn = 直链拿到了但取流被拒（直链过期、403、CDN 抽风）
+# ---------------------------------------------------------------------------
+_STREAM_FAILS: "deque[dict[str, Any]]" = deque(maxlen=40)
+
+
+def _note_stream_fail(guid: str, reason: str, ms: float | None = None,
+                      stage: str = "") -> None:
+    try:
+        item: dict[str, Any] = {
+            "ts": time.strftime("%H:%M:%S"),
+            "guid": str(guid or ""),
+            "reason": str(reason or ""),
+            "stage": str(stage or ""),
+            "ms": round(float(ms), 1) if ms is not None else None,
+        }
+        _STREAM_FAILS.append(item)
+        logger.info("stream-fail %s [%s] %s%s", item["guid"], stage or "-", reason,
+                    f" 耗时 {item['ms']}ms" if item["ms"] is not None else "")
+    except Exception:  # noqa: BLE001 - 留证本身绝不能影响播放
+        pass
+
+
+def stream_failures() -> dict[str, Any]:
+    items = list(_STREAM_FAILS)
+    return {"count": len(items), "kept": _STREAM_FAILS.maxlen or 0, "items": items[-12:]}
+
+
 def build_lyric_list_payload(guid: str, lyric_text: str) -> dict:
     """对齐飞牛 $n.lyric.list → xr(list, preferred)。
 
@@ -2284,6 +2322,22 @@ async def ext_playstart():
     except Exception as exc:  # noqa: BLE001
         logger.warning("playstart diag failed: %s: %s", type(exc).__name__, exc)
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
+
+
+@app.get("/_ext/failures")
+async def ext_failures():
+    """最近几次「播不出来」的留证（v2.9.27）。
+
+    播放器跳过一首歌时日志里以前一行都没有，事后完全查不到是卡在取链还是卡在
+    取流。这里按时间倒序给出最近若干条：阶段（resolve / open-cdn / slow-start）
+    + 原因 + 从收到请求到判失败耗了多少毫秒。
+    """
+    try:
+        return {"ok": True, "data": stream_failures()}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("failures diag failed: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200],
+                "data": {"count": 0, "items": []}}
 
 
 @app.get("/_ext/authorized")
@@ -3109,16 +3163,22 @@ async def stream_track(request: Request):
     if src and src != NETEASE_SOURCE:
         # 历史遗留的非网易云 guid（旧版多音源缓存/收藏），单源版无法解析
         logger.info("stream rejected: unsupported legacy online source %r (guid=%s)", src, guid)
+        _note_stream_fail(guid, f"unsupported legacy online source {src!r}",
+                          (time.monotonic() - started) * 1000.0, "resolve")
         return _online_unavailable("unsupported online source")
 
     musicbox_client = get_musicbox_client(request.app)
 
     # 未登录且未开启免费曲降级时，不提供任何在线播放（本地缓存命中已在上方返回）
     if not await _online_search_allowed(musicbox_client):
+        _note_stream_fail(guid, "netease login required",
+                          (time.monotonic() - started) * 1000.0, "resolve")
         return _online_unavailable("netease login required")
 
     song_id = song_id_from_online_guid(guid).split(":")[-1]
     if not song_id:
+        _note_stream_fail(guid, "empty song id", (time.monotonic() - started) * 1000.0,
+                          "resolve")
         return _online_unavailable()
 
     # ------------------------------------------------------------------
@@ -3201,6 +3261,13 @@ async def stream_track(request: Request):
     # 「未预热 114ms → 命中预热 332ms」这种反方向结论，其实是口径把自己骗了。
     _gather_warm = bool(_gather_flags.get("url_cache_hit"))
     prefetch.note_play(guid, _gather_ms, _gather_warm, warming=warming_now)
+    if _gather_ms > 5000.0:
+        # 播放器一般 7~8 秒等不到就跳歌，取链这一段如果就吃掉 5 秒以上，
+        # 后面再快也来不及——这是「等半天然后跳过」最常被忽略的一半。
+        logger.warning("play slow-start %s: 取链+元数据 耗时 %.0fms"
+                       "（播放器通常 7~8s 就放弃，这一段已占掉大半）", guid, _gather_ms)
+        _note_stream_fail(guid, f"起步过慢：取链+元数据 {_gather_ms:.0f}ms",
+                          _gather_ms, "slow-start")
     if warm_before is not None and not _gather_warm:
         # 标着「预热过」却没吃到缓存：多半是成果已过期（直链缓存 TTL 到了），
         # 也可能档位变了（预热时是 jymaster、播的时候降成了 exhigh）。留个线索。
@@ -3232,6 +3299,13 @@ async def stream_track(request: Request):
         state = netease_auth.current_state()
         if not state.logged_in:
             logger.info("stream 404 for %s: 网易云未登录，该曲目需要账号权益", guid)
+            _note_stream_fail(guid, "未登录：resolve 返回空直链",
+                              (time.monotonic() - started) * 1000.0, "resolve")
+        else:
+            # 已登录却拿不到直链：多半是 musicbox/网易云接口超时或返回空。
+            # 这一支以前**完全不留日志**，是「跳过却查不到原因」的主要来源。
+            _note_stream_fail(guid, "已登录但取不到直链（musicbox 超时/空返回）",
+                              (time.monotonic() - started) * 1000.0, "resolve")
         return _online_unavailable()
 
     resolved_ext = str(info.get("ext")) if (isinstance(info, dict) and info.get("ext")) else None
@@ -3254,6 +3328,10 @@ async def stream_track(request: Request):
             content_type = (resp.headers.get("content-type") or "").lower()
             if resp.status_code >= 400 or "text/html" in content_type:
                 await resp.aclose()
+                logger.warning("netease cdn refused %s: status=%s content-type=%s",
+                               guid, resp.status_code, content_type or "-")
+                _note_stream_fail(guid, f"cdn status={resp.status_code} ct={content_type or '-'}",
+                                  (time.monotonic() - started) * 1000.0, "open-cdn")
                 return None
             return resp
         except Exception as e:
@@ -3276,6 +3354,8 @@ async def stream_track(request: Request):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("local fallback serve failed for %s: %s", guid, exc)
         if resp is None:
+            _note_stream_fail(guid, "直链取流失败（已重取一次仍不可用）",
+                              (time.monotonic() - started) * 1000.0, "open-cdn")
             return _online_unavailable()
 
     _log_play("netease", warm=_gather_warm)
@@ -3308,6 +3388,11 @@ _HLS_STATS: dict[str, Any] = {
     "first_ms_max": 0.0,
     "first_n": 0,
     "bypassed": 0,       # 绕过官方转码、直出原始流的次数
+    # v2.9.27：慢分片留证。以前只有 seg_ms_max 一个数，看得到「有一片 30 秒」
+    # 却定位不到是哪首歌、一共发生了几次——而那正是「等 7~8 秒然后跳歌」的现场。
+    "seg_slow": 0,       # 超过阈值的分片数（播放器基本等不过这个阈值）
+    "seg_ms_max_guid": "",
+    "seg_ms_max_seg": "",
 }
 _HLS_PLAYLIST_AT: dict[str, float] = {}
 # 绕过转码时 m3u8 需要时长，而我们没有官方曲目的 info；先记下见过的 guid → 时长
@@ -3324,6 +3409,11 @@ def hls_local_bypass() -> bool:
     """
     return str(os.environ.get("FNMUSIC_HLS_LOCAL_BYPASS", "false") or "false") \
         .strip().lower() in ("true", "1", "yes", "on")
+
+
+def _hls_slow_ms() -> float:
+    """分片耗时超过多少就算「慢」（默认 5s，播放器通常 7~8s 就放弃）。"""
+    return max(1000.0, _float("FNMUSIC_HLS_SLOW_SEG_MS", 5000.0))
 
 
 def _hls_known_duration(guid: str) -> int:
@@ -3355,6 +3445,14 @@ def _hls_note_segment(guid: str, filename: str, ms: float) -> None:
     st["seg_ms_sum"] = float(st.get("seg_ms_sum", 0.0)) + ms
     if ms > float(st.get("seg_ms_max", 0.0)):
         st["seg_ms_max"] = ms
+        st["seg_ms_max_guid"] = str(guid)
+        st["seg_ms_max_seg"] = str(filename or "")
+    if ms >= _hls_slow_ms():
+        # 播放器一般 7~8 秒等不到就跳歌，而我们的转发会继续挂着等官方后端。
+        # 也就是说「用户看到的跳过」和「日志里的超时」是同一件事的两半。
+        st["seg_slow"] = int(st.get("seg_slow", 0)) + 1
+        logger.warning("hls slow segment %s %s: %.0fms（播放器通常等不到这个时间就跳歌）",
+                       guid, filename, ms)
     name = str(filename or "")
     # 必须先去掉扩展名再取数字：`00000.m4s` 里那个 `4` 也是数字，直接 whole-string
     # 取会变成序号 4，首个分片就永远识别不出来（启动开销恒为 0，等于白测）。
@@ -3389,6 +3487,10 @@ def hls_stats() -> dict[str, Any]:
         "first_n": first_n,
         "bypassed": int(st.get("bypassed", 0)),
         "bypass_enabled": hls_local_bypass(),
+        "seg_slow": int(st.get("seg_slow", 0)),
+        "seg_slow_ms": round(_hls_slow_ms(), 1),
+        "seg_ms_max_guid": str(st.get("seg_ms_max_guid") or ""),
+        "seg_ms_max_seg": str(st.get("seg_ms_max_seg") or ""),
     }
 
 

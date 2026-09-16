@@ -839,6 +839,11 @@ async def _probe_proxy_playstart() -> dict:
     return await _probe_proxy_path("/_ext/playstart", timeout=10.0)
 
 
+async def _probe_proxy_failures() -> dict:
+    """最近几次「播不出来」的留证（v2.9.27）。"""
+    return await _probe_proxy_path("/_ext/failures", timeout=10.0)
+
+
 async def _probe_proxy_authorized() -> dict:
     """向代理进程取「飞牛应用授权目录」状态快照。
 
@@ -1045,6 +1050,7 @@ async def api_diag(request: Request):
         "prefetch": await _probe_proxy_prefetch(),
         "hls": await _probe_proxy_hls(),
         "playstart": await _probe_proxy_playstart(),
+        "failures": await _probe_proxy_failures(),
         "musicbox": {
             "url": MUSICBOX_URL,
             "healthz": mb,
@@ -2442,6 +2448,10 @@ function runDiag(auto){
       if(!pf.reachable){ out.push("  取不到代理侧快照: "+JSON.stringify(pf)); }
       else{
         out.push("  开关           : "+pf.enabled+"（预热 "+pf.lookahead+" 首，列表下发即预热头首="+pf.on_list+"）");
+        if(pf.lookahead_requested && pf.lookahead_requested > pf.lookahead)
+          out.push("  ★ 已收敛       : .env 里写的是 "+pf.lookahead_requested+"，实际按 "+pf.lookahead
+                   +" 执行（上限 3）。多预热一首就多占 musicbox 约 400ms，而队列上限只有 "
+                   +pf.max_queue+"，超出的会被直接丢弃——等于白占资源、还拖慢正在播的这首。");
         out.push("  调度/成功/失败 : "+pf.scheduled+" / "+pf.done+" / "+pf.failed
                  +"（推断不出下一首 "+pf.no_next+" 次，已预热过跳过 "+pf.already+" 次"
                  +(pf.queued_out?("，队列满放弃 "+pf.queued_out+" 次"):"")+"）");
@@ -2476,6 +2486,12 @@ function runDiag(auto){
         out.push("  转码启动开销   : 平均 "+hs.first_ms_avg+"ms  最大 "+hs.first_ms_max+"ms"
                  +"（= 从客户端拿到 m3u8 到取回第一个分片的间隔）");
         out.push("  分片转发耗时   : 平均 "+hs.seg_ms_avg+"ms  最大 "+hs.seg_ms_max+"ms");
+        if(hs.seg_slow)
+          out.push("  ★ 慢分片       : "+hs.seg_slow+" 个分片超过 "+hs.seg_slow_ms+"ms"
+                   +"（最慢 "+hs.seg_ms_max+"ms"
+                   +(hs.seg_ms_max_guid?("，曲目 "+hs.seg_ms_max_guid+" / "+hs.seg_ms_max_seg):"")+"）"
+                   +"——播放器一般等 7~8s 就跳歌，这个数字就是「等半天然后自动跳过」的现场；"
+                   +"我们这边的转发会继续挂着，所以日志里的耗时比用户感知的更长。");
         out.push("  ★ 怎么读：first_ms 大 = 「点下去要等」（转码器初始化慢）；"
                 +"seg_ms 最大远大于平均 = 「播起来断断续续」（转码吞吐跟不上）。"
                 +"两者解法不同，先分清是哪一个。");
@@ -2497,6 +2513,22 @@ function runDiag(auto){
                 +"到几十就说明客户端在反复重开连接，那才是卡顿信号。"
                 +"标记 local 表示音频走本地文件（不吃预热），cold/warm 只用于走网易云的播放。");
         if(!ps.plays) out.push("  （还没有播放记录：播一首歌再来看）");
+      }
+      out.push("");
+      out.push("-- 最近播不出来（失败留证）--");
+      var fl=d.failures||{};
+      if(!fl.reachable){ out.push("  取不到代理侧快照: "+JSON.stringify(fl)); }
+      else if(!fl.count){ out.push("  暂无记录。播放失败会在这里留一条，含阶段与耗时——"
+                                  +"以前跳歌是完全不留痕的，事后只能靠猜。"); }
+      else{
+        out.push("  共 "+fl.count+" 条（保留最近 "+fl.kept+" 条，下面按时间倒序列出最新的）");
+        (fl.items||[]).slice().reverse().forEach(function(f){
+          out.push("     "+f.ts+"  ["+(f.stage||"-")+"]  "+f.guid
+                   +(f.ms!=null?("  耗时 "+f.ms+"ms"):"")+"  "+f.reason);
+        });
+        out.push("  ★ 阶段怎么读：resolve = 连直链都没拿到（musicbox 慢/超时、登录态掉了、接口空返回）；"
+                +"open-cdn = 直链拿到了但取流被拒（直链过期、403）；"
+                +"slow-start = 连元数据带直链就花了 5s 以上，播放器 7~8s 跳歌时它已占掉大半。");
       }
       out.push("");
       out.push("-- 飞牛应用授权目录（开放能力 / api-scope）--");

@@ -148,9 +148,12 @@ def test_lookahead_env(monkeypatch):
     # 随时可能切歌——少预热一首只是「下一首慢一次」，拖慢正在播的是「每次都慢」。
     assert pf._lookahead() == 2
     monkeypatch.setenv("FNMUSIC_PREFETCH_LOOKAHEAD", "5")
-    assert pf._lookahead() == 5
+    # v2.9.27：上限 5 → 3。真机 .env 里留着 LOOKAHEAD=5（升级不覆盖用户值），
+    # 配 max_queue=2 的后果是 6 次被队列拒、11 次撞上「已预热过」——预热全在
+    # 空转，却实打实占着单进程的 musicbox，被拖慢的恰恰是正在播的那首。
+    assert pf._lookahead() == 3
     monkeypatch.setenv("FNMUSIC_PREFETCH_LOOKAHEAD", "99")
-    assert pf._lookahead() == 5, "上限 5，防止一次打爆 musicbox"
+    assert pf._lookahead() == 3, "上限 3，防止一次打爆 musicbox"
     monkeypatch.setenv("FNMUSIC_PREFETCH_LOOKAHEAD", "0")
     assert pf._lookahead() == 1
 

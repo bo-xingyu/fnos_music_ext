@@ -61,9 +61,22 @@ def _lookahead() -> int:
     v2.9.25：默认 3 → 2。musicbox 是单进程，一首预热 ~400ms，多预热一首就多占
     它 400ms；而用户随时可能切歌，那首歌的 gather 得跟这些预热排队。少预热一首
     只是「下一首慢一次」，把正在播的拖慢是「每次都慢」——不划算。
+
+    v2.9.27：上限 5 → 3。真机出现过 LOOKAHEAD=5 配 max_queue=2 的组合（.env 里
+    的老值升级不覆盖）：一次想预热 5 首、队列只放得下 2 个，结果 6 次被队列拒、
+    11 次撞上「已预热过」，预热全在空转，却实打实地占着 musicbox——被拖慢的正
+    是当前这首。预热是纯优化，砍到 3 首不会让任何功能退化。
     """
     try:
-        return max(1, min(5, int(float(os.environ.get("FNMUSIC_PREFETCH_LOOKAHEAD", "2") or 2))))
+        return max(1, min(3, int(float(os.environ.get("FNMUSIC_PREFETCH_LOOKAHEAD", "2") or 2))))
+    except (TypeError, ValueError):
+        return 2
+
+
+def lookahead_requested() -> int:
+    """用户在 .env 里实际写了多少（未经收敛）。诊断页用来提示「已收敛」。"""
+    try:
+        return int(float(os.environ.get("FNMUSIC_PREFETCH_LOOKAHEAD", "2") or 2))
     except (TypeError, ValueError):
         return 2
 
@@ -348,6 +361,7 @@ def status() -> dict:
     return {
         "enabled": enabled(),
         "lookahead": _lookahead(),
+        "lookahead_requested": lookahead_requested(),
         "on_list": on_list_enabled(),
         "scheduled": int(_STATS.get("scheduled") or 0),
         "done": int(_STATS.get("done") or 0),
