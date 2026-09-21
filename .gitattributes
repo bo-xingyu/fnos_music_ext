@@ -1,0 +1,10 @@
+# Shell / lifecycle scripts must stay LF — CRLF breaks bash on fnOS
+* text=auto
+*.sh text eol=lf
+fpk/cmd/* text eol=lf
+fpk/payload/bin/*.sh text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.fpk binary
+*.png binary

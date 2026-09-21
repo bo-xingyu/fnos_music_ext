@@ -3,6 +3,24 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.10.2] - 2026-09-21
+
+**修复 Windows 打包导致飞牛安装失败（CRLF）。**
+
+真机报错：
+```
+setup.sh: line 14: set: pipefail: invalid option name
+setup.sh: line 15: $'\r': command not found
+fnmusic-lib.sh: No such file or directory
+```
+
+原因：在 Windows 上构建时，shell 生命周期脚本带了 `\r\n`，bash 把 `\r` 拼进命令名与路径。
+
+修复：
+- `build_fpk.sh` 打包阶段强制 CRLF→LF，并自检 `cmd/`、`bin/` 无残留 CR
+- 新增 `.gitattributes`，shell 脚本固定 `eol=lf`
+- 版本 2.10.2，请用新包覆盖安装
+
 ## [2.10.1] - 2026-09-21
 
 **扩展音源支持登录 + 自定义音源。**

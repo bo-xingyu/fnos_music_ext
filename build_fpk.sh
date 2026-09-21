@@ -222,6 +222,88 @@ find "${APP_SRC}" \( -name '__pycache__' -o -name '.pytest_cache' -o -name '.ven
 find "${APP_SRC}" \( -name '*.pyc' -o -name '*.pyo' -o -name '.DS_Store' \
                     -o -name '*.part' -o -name '.env' -o -name '.env.*' \) \
      -type f -delete 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 强制 Unix 换行（LF）。在 Windows 上 git checkout / 编辑器会把脚本写成 CRLF，
+# 真机 bash 会把 \r 当成命令的一部分：set: pipefail: invalid option name、
+# $'\r': command not found、source 路径变成 fnmusic-lib.sh\r 找不到文件。
+# 2026-09-21 用户安装失败的直接原因。打包阶段必须洗一遍。
+# ---------------------------------------------------------------------------
+log_info "规范化换行为 LF（CRLF → LF）..."
+if ! python3 - "${STAGE}" <<'PYEOF'
+import os, sys
+root = sys.argv[1]
+text_ext = {
+    ".sh", ".py", ".txt", ".json", ".md", ".yml", ".yaml", ".env",
+    ".service", ".example",
+}
+special_names = {
+    "manifest", "privilege", "resource", "install", "config", "uninstall",
+    "install_init", "install_callback", "main", "upgrade_init", "upgrade_callback",
+    "uninstall_init", "uninstall_callback", "config_init", "config_callback",
+    "VERSION", "requirements.txt",
+}
+changed = 0
+for dirpath, dirnames, filenames in os.walk(root):
+    for name in filenames:
+        path = os.path.join(dirpath, name)
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in text_ext and name not in special_names:
+            if not (os.path.dirname(path).endswith("cmd") or os.path.dirname(path).endswith("bin")):
+                continue
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        if b"\r\n" not in data and b"\r" not in data:
+            continue
+        if b"\x00" in data[:2048]:
+            continue
+        new = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        if new != data:
+            with open(path, "wb") as f:
+                f.write(new)
+            changed += 1
+print(f"normalized {changed} files to LF")
+PYEOF
+then
+    log_err "CRLF → LF 转换失败，中止打包（否则真机安装会炸）"
+    exit 1
+fi
+
+# 打包前自检：cmd/ 与 bin/ 下不得再有 CRLF
+CRLF_LEFT="$(python3 - "${STAGE}" <<'PYEOF'
+import os, sys
+root = sys.argv[1]
+bad = []
+for sub in ("cmd", "bin", "app/bin"):
+    d = os.path.join(root, sub)
+    if not os.path.isdir(d):
+        # bin 在 app.tgz 里，先查 APP_SRC
+        d = os.path.join(root, "app", "bin") if sub == "bin" else os.path.join(root, sub)
+    if not os.path.isdir(d):
+        continue
+    for name in os.listdir(d):
+        p = os.path.join(d, name)
+        if not os.path.isfile(p):
+            continue
+        try:
+            data = open(p, "rb").read()
+        except OSError:
+            continue
+        if b"\r" in data:
+            bad.append(p)
+print("\n".join(bad))
+PYEOF
+)"
+if [ -n "${CRLF_LEFT}" ]; then
+    log_err "打包前脚本仍含 CR（会导致真机安装失败）："
+    printf '%s\n' "${CRLF_LEFT}"
+    exit 1
+fi
+log_info "换行自检通过（cmd/bin 无 CR）"
+
 # 运行时目录占位：install_callback 会 mkdir，这里预建空目录避免首次竞态
 mkdir -p "${APP_SRC}/cache" "${APP_SRC}/musicbox-data"
 # 绝不允许任何密钥进包：.env 已在上面删除，这里再做一次断言
