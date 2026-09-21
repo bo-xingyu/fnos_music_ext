@@ -1,9 +1,12 @@
 """扩展音源条目映射：musicsource-service 的 song → 代理内部统一条目。"""
 from __future__ import annotations
 
+import re
 from typing import Any
 
-EXTRA_SOURCE_NAMES = ("qq", "kugou", "kuwo", "qishui")
+BUILTIN_EXTRA_SOURCE_NAMES = ("qq", "kugou", "kuwo", "qishui")
+# 运行时可含自定义音源 key；保持向后兼容别名
+EXTRA_SOURCE_NAMES = BUILTIN_EXTRA_SOURCE_NAMES
 
 SOURCE_LABELS = {
     "qq": "QQ音乐",
@@ -12,11 +15,19 @@ SOURCE_LABELS = {
     "qishui": "汽水音乐",
 }
 
+CUSTOM_KEY_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_\-]{0,31}$")
+
 LOSSLESS_MARKERS = ("SQ", "HR", "LOSSLESS", "HIRES", "FLAC", "无损")
 
 
 def is_extra_source(src: str | None) -> bool:
-    return bool(src) and str(src).strip().lower() in EXTRA_SOURCE_NAMES
+    """是否属于扩展音源（内置或自定义）。网易云不算。"""
+    s = (src or "").strip().lower()
+    if not s or s == "netease":
+        return False
+    if s in BUILTIN_EXTRA_SOURCE_NAMES:
+        return True
+    return bool(CUSTOM_KEY_RE.match(s))
 
 
 def _to_float(value: Any) -> float:
@@ -31,7 +42,7 @@ def map_extra_song(raw: dict) -> dict | None:
     if not isinstance(raw, dict):
         return None
     source = str(raw.get("source") or "").strip().lower()
-    if source not in EXTRA_SOURCE_NAMES:
+    if not is_extra_source(source):
         return None
     sid = str(raw.get("id") or "").strip()
     if not sid:

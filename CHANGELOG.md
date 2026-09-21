@@ -3,6 +3,27 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.10.1] - 2026-09-21
+
+**扩展音源支持登录 + 自定义音源。**
+
+### 登录（Cookie / Token）
+- 内置 QQ / 酷狗 / 酷我 / 汽水支持粘贴浏览器 Cookie 解锁会员曲目
+- 凭据持久化在 `musicsource-data/auth/`（fpk 下位于应用数据目录，跨升级保留）
+- 管理页「扩展音源登录」：选择音源 → 粘贴 Cookie → 保存；可退出
+- 服务 API：`/api/v1/auth`、`/api/v1/auth/{source}/cookie|logout|qr|help`
+- 酷狗/酷我提供扫码 best-effort；失败回落 Cookie（页面有获取说明）
+
+### 自定义音源
+- 配置 `custom_sources.json` 或管理页「自定义音源」卡片
+- 模板字段：`search_url` / `list_path` / `map` / `url_url` / `url_path` / `lyric_url` / `headers` / `cookie`
+- 支持 `{keyword}` `{limit}` `{id}` 占位符；key 作为 `online:<key>:<id>` 参与搜索合并与播放
+- API：`/api/v1/custom`、`/api/v1/custom/item`、`/api/v1/custom/{key}/delete`
+
+### 代理 / 管理页
+- 自定义音源 key 被识别为扩展音源，搜索/播放/歌词/封面全链路可用
+- 配置页新增扩展音源开关与网关地址字段
+
 ## [2.10.0] - 2026-09-21
 
 **新增扩展在线音源：QQ音乐 / 酷狗音乐 / 酷我音乐 / 汽水音乐。**

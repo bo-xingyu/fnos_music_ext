@@ -92,6 +92,7 @@ start_musicsource() {
     lib_spawn "${MUSICSOURCE_PID}" "${MUSICSOURCE_LOG}" env \
         PATH="${PYTHON_BIN}:${PATH}" \
         PYTHONUNBUFFERED=1 \
+        FNMUSIC_MUSICSOURCE_DATA="${MUSICSOURCE_DATA_DIR}" \
         FNMUSIC_EXTRA_SOURCES="$(lib_read_env_value FNMUSIC_EXTRA_SOURCES qq,kugou,kuwo,qishui)" \
         FNMUSIC_QQ_ENABLED="$(lib_read_env_value FNMUSIC_QQ_ENABLED true)" \
         FNMUSIC_KUGOU_ENABLED="$(lib_read_env_value FNMUSIC_KUGOU_ENABLED true)" \

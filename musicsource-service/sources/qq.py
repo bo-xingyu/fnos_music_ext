@@ -22,6 +22,7 @@ from .base import (
     guess_ext_from_url,
     parse_duration_ms,
 )
+from . import auth_store
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -37,12 +38,21 @@ HEADERS = {
 }
 
 
+def _auth_headers() -> dict:
+    h = dict(HEADERS)
+    h.update(auth_store.cookie_header("qq"))
+    return h
+
+
 class QQSource:
     key = "qq"
     label = "QQ音乐"
 
     def __init__(self) -> None:
-        self._client = httpx.AsyncClient(headers=HEADERS, timeout=12.0, follow_redirects=True)
+        self._client = httpx.AsyncClient(headers=_auth_headers(), timeout=12.0, follow_redirects=True)
+
+    def _headers(self) -> dict:
+        return _auth_headers()
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -79,6 +89,7 @@ class QQSource:
             r = await self._client.get(
                 "https://u.y.qq.com/cgi-bin/musicu.fcg",
                 params={"data": json.dumps(payload, ensure_ascii=False)},
+                headers=self._headers(),
             )
             data = r.json()
         except Exception as exc:  # noqa: BLE001
@@ -168,6 +179,7 @@ class QQSource:
             r = await self._client.get(
                 "https://u.y.qq.com/cgi-bin/musicu.fcg",
                 params={"data": json.dumps(payload, ensure_ascii=False)},
+                headers=self._headers(),
             )
             data = r.json()
         except Exception as exc:  # noqa: BLE001
@@ -230,7 +242,7 @@ class QQSource:
                     "g_tk": 5381,
                     "platform": "yqq.json",
                 },
-                headers={**HEADERS, "Referer": "https://y.qq.com/"},
+                headers={**self._headers(), "Referer": "https://y.qq.com/"},
             )
             data = r.json()
             text = str(data.get("lyric") or "")

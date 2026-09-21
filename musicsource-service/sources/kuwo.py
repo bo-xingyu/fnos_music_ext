@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 
 from .base import SourceError, SourceSong, ensure_lrc_text, parse_duration_ms
+from . import auth_store
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -32,8 +33,22 @@ class KuwoSource:
     label = "酷我音乐"
 
     def __init__(self) -> None:
-        self._client = httpx.AsyncClient(headers=HEADERS, timeout=12.0, follow_redirects=True)
+        self._client = httpx.AsyncClient(headers=self._headers(), timeout=12.0, follow_redirects=True)
         self._kw_token = ""
+
+    def _headers(self) -> dict:
+        h = dict(HEADERS)
+        cookie = auth_store.cookie_of("kuwo")
+        token = ""
+        if cookie:
+            h["Cookie"] = cookie
+            m = re.search(r"kw_token=([^;]+)", cookie)
+            if m:
+                token = m.group(1)
+        if token:
+            self._kw_token = token
+            h["csrf"] = token
+        return h
 
     async def aclose(self) -> None:
         await self._client.aclose()

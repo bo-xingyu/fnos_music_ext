@@ -14,6 +14,7 @@ def test_extra_source_names():
 def test_is_extra_source():
     assert extra_items.is_extra_source("qq")
     assert extra_items.is_extra_source("KUGOU")
+    assert extra_items.is_extra_source("mymusic")   # 自定义 key
     assert not extra_items.is_extra_source("netease")
     assert not extra_items.is_extra_source("")
     assert not extra_items.is_extra_source(None)

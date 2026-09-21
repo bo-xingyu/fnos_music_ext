@@ -125,6 +125,8 @@ MUSICBOX_URL="http://127.0.0.1:${MUSICBOX_PORT}"
 # 扩展音源（QQ/酷狗/酷我/汽水）服务，v2.10
 MUSICSOURCE_PORT="${FNMUSIC_MUSICSOURCE_PORT:-8771}"
 MUSICSOURCE_URL="http://127.0.0.1:${MUSICSOURCE_PORT}"
+# 扩展音源登录凭据与自定义音源配置（跨升级持久，放在 RUN_DIR 之外）
+MUSICSOURCE_DATA_DIR="${PKGVAR}/musicsource-data"
 
 lib_log() {
     mkdir -p "${LOG_DIR}" 2>/dev/null

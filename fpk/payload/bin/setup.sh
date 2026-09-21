@@ -120,6 +120,13 @@ stage_code() {
     # 先把旧版本的凭证迁过来，再确保目录结构与属主正确。
     lib_migrate_musicbox_data
     lib_ensure_musicbox_data_dirs
+    # 扩展音源登录凭据 / 自定义音源配置：跨安装持久
+    mkdir -p "${MUSICSOURCE_DATA_DIR}/auth" 2>/dev/null || true
+    chmod 700 "${MUSICSOURCE_DATA_DIR}" 2>/dev/null || true
+    if [ -n "${TRIM_USERNAME:-}" ]; then
+        chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME:-${TRIM_USERNAME}}" \
+            "${MUSICSOURCE_DATA_DIR}" 2>/dev/null || true
+    fi
     return 0
 }
 
@@ -148,6 +155,7 @@ write_env_file() {
         echo "# --- 扩展音源 QQ/酷狗/酷我/汽水（v2.10） ---"
         echo "FNMUSIC_MUSICSOURCE_URL=$(dq "$(pick_env FNMUSIC_MUSICSOURCE_URL "" "http://127.0.0.1:${MUSICSOURCE_PORT:-8771}")")"
         echo "FNMUSIC_MUSICSOURCE_BIND=$(dq "$(pick_env FNMUSIC_MUSICSOURCE_BIND wizard_musicsource_bind 127.0.0.1)")"
+        echo "FNMUSIC_MUSICSOURCE_DATA=$(dq "${MUSICSOURCE_DATA_DIR:-/vol1/@appdata/fnmusicext/musicsource-data}")"
         echo "FNMUSIC_EXTRA_ENABLED=$(dq "$(norm_bool "$(pick_env FNMUSIC_EXTRA_ENABLED wizard_extra_enabled true)")")"
         echo "FNMUSIC_EXTRA_SOURCES=$(dq "$(pick_env FNMUSIC_EXTRA_SOURCES wizard_extra_sources qq,kugou,kuwo,qishui)")"
         echo "FNMUSIC_QQ_ENABLED=$(dq "$(norm_bool "$(pick_env FNMUSIC_QQ_ENABLED wizard_qq_enabled true)")")"

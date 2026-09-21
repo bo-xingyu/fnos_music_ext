@@ -1617,6 +1617,10 @@ async def fetch_all_online_search(
         tasks.append(fetch_netease_search(musicbox_client, keyword, CONF["netease_search_limit"]))
         labels.append(NETEASE_SOURCE)
     if musicsource_client is not None and CONF.get("extra_enabled") and extra_sources.any_enabled():
+        try:
+            await extra_sources.refresh_enabled_from_service(musicsource_client)
+        except Exception:  # noqa: BLE001
+            pass
         tasks.append(fetch_extra_online_search(musicsource_client, keyword))
         labels.append("extra")
     if not tasks:

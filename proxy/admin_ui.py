@@ -131,12 +131,17 @@ def _int_range(lo: int, hi: int):
 
 
 def _http_url(v: Any) -> str:
-    s = str(v).strip()
+    s = (v or "").strip()
+    if s and not re.match(r"^https?://", s):
+        raise ValueError("必须以 http:// 或 https:// 开头")
+    return s
+
+
+def _http_url_or_empty(v: Any) -> str:
+    s = (v or "").strip()
     if not s:
         return ""
-    if not re.match(r"^https?://[^\s]+$", s):
-        raise ValueError(f"必须以 http:// 或 https:// 开头，收到 {s!r}")
-    return s
+    return _http_url(s)
 
 
 def _free_text(maxlen: int = 200):
@@ -329,6 +334,17 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     # 前两个依赖我们从未可靠拿到的客户端网络线索，第三个则把窄管道照灌母带。
     "quality_wifi": ("FNMUSIC_QUALITY_WIFI", _in_choices(*QUALITY_LEVELS), False),
     "quality_cellular": ("FNMUSIC_QUALITY_CELLULAR", _in_choices(*QUALITY_LEVELS), False),
+    # --- 扩展音源 QQ/酷狗/酷我/汽水/自定义（v2.10）---
+    "extra_enabled": ("FNMUSIC_EXTRA_ENABLED", _as_bool, False),
+    "extra_sources": ("FNMUSIC_EXTRA_SOURCES", _free_text(200), False),
+    "qq_enabled": ("FNMUSIC_QQ_ENABLED", _as_bool, False),
+    "kugou_enabled": ("FNMUSIC_KUGOU_ENABLED", _as_bool, False),
+    "kuwo_enabled": ("FNMUSIC_KUWO_ENABLED", _as_bool, False),
+    "qishui_enabled": ("FNMUSIC_QISHUI_ENABLED", _as_bool, False),
+    "qishui_api_base": ("FNMUSIC_QISHUI_API_BASE", _http_url_or_empty, False),
+    "extra_api_base": ("FNMUSIC_EXTRA_API_BASE", _http_url_or_empty, False),
+    "musicsource_url": ("FNMUSIC_MUSICSOURCE_URL", _http_url, False),
+    "musicsource_bind": ("FNMUSIC_MUSICSOURCE_BIND", _in_choices("127.0.0.1", "0.0.0.0"), False),
 }
 
 # 页面上以「天/小时」为单位展示，落盘时换算成秒
@@ -378,6 +394,16 @@ DEFAULTS = {
     "cdn_redirect": "true",
     "quality_wifi": "lossless",
     "quality_cellular": "exhigh",
+    "extra_enabled": "true",
+    "extra_sources": "qq,kugou,kuwo,qishui",
+    "qq_enabled": "true",
+    "kugou_enabled": "true",
+    "kuwo_enabled": "true",
+    "qishui_enabled": "true",
+    "qishui_api_base": "",
+    "extra_api_base": "",
+    "musicsource_url": "http://127.0.0.1:8771",
+    "musicsource_bind": "127.0.0.1",
 }
 
 MASK = "••••••••"
@@ -723,6 +749,8 @@ class PrefixStripMiddleware(BaseHTTPMiddleware):
 app.add_middleware(PrefixStripMiddleware)
 
 _MB_CLIENT: httpx.AsyncClient | None = None
+_MS_CLIENT: httpx.AsyncClient | None = None
+MUSICSOURCE_URL = (os.environ.get("FNMUSIC_MUSICSOURCE_URL") or "http://127.0.0.1:8771").rstrip("/")
 
 
 def mb_client() -> httpx.AsyncClient:
@@ -730,6 +758,37 @@ def mb_client() -> httpx.AsyncClient:
     if _MB_CLIENT is None:
         _MB_CLIENT = httpx.AsyncClient(base_url=MUSICBOX_URL, timeout=MUSICBOX_TIMEOUT_S)
     return _MB_CLIENT
+
+
+def ms_client() -> httpx.AsyncClient:
+    """扩展音源服务（QQ/酷狗/酷我/汽水/自定义）客户端。"""
+    global _MS_CLIENT
+    if _MS_CLIENT is None:
+        _MS_CLIENT = httpx.AsyncClient(base_url=MUSICSOURCE_URL, timeout=15.0)
+    return _MS_CLIENT
+
+
+async def _ms_proxy(path: str, method: str = "GET", json_body: Any = None,
+                    params: dict | None = None, timeout: float = 15.0) -> JSONResponse:
+    """把请求转发给 musicsource-service；服务不可达时返回明确错误。"""
+    try:
+        c = ms_client()
+        if method.upper() == "POST":
+            r = await c.post(path, json=json_body or {}, params=params, timeout=timeout)
+        elif method.upper() == "DELETE":
+            r = await c.delete(path, params=params, timeout=timeout)
+        else:
+            r = await c.get(path, params=params, timeout=timeout)
+        try:
+            data = r.json()
+        except Exception:  # noqa: BLE001
+            data = {"ok": False, "error": r.text[:300], "_status": r.status_code}
+        if isinstance(data, dict):
+            data.setdefault("_status", r.status_code)
+        return JSONResponse(status_code=r.status_code if r.status_code >= 400 else 200,
+                            content=data if isinstance(data, dict) else {"ok": True, "data": data})
+    except Exception as exc:  # noqa: BLE001
+        return _err(502, f"扩展音源服务不可达（{MUSICSOURCE_URL}）：{type(exc).__name__}: {exc}")
 
 
 def _err(code: int, msg: str) -> JSONResponse:
@@ -1306,6 +1365,148 @@ async def api_login_check(request: Request, unikey: str = ""):
     return result
 
 
+# ---------------------------------------------------------- 扩展音源登录/自定义 ----
+
+@app.get("/api/extra/sources")
+async def api_extra_sources(request: Request):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    return await _ms_proxy("/api/v1/sources")
+
+
+@app.get("/api/extra/auth")
+async def api_extra_auth(request: Request):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    return await _ms_proxy("/api/v1/auth")
+
+
+@app.get("/api/extra/auth/{source}/help")
+async def api_extra_auth_help(request: Request, source: str):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    return await _ms_proxy(f"/api/v1/auth/{source}/help")
+
+
+@app.post("/api/extra/auth/{source}/cookie")
+async def api_extra_auth_cookie(request: Request, source: str):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    resp = await _ms_proxy(f"/api/v1/auth/{source}/cookie", method="POST", json_body=body)
+    # Cookie 变更后清代理搜索缓存，让会员曲目立刻可搜
+    try:
+        await _invalidate_proxy_cache()
+    except Exception:  # noqa: BLE001
+        pass
+    return resp
+
+
+@app.post("/api/extra/auth/{source}/logout")
+async def api_extra_auth_logout(request: Request, source: str):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    resp = await _ms_proxy(f"/api/v1/auth/{source}/logout", method="POST", json_body={})
+    try:
+        await _invalidate_proxy_cache()
+    except Exception:  # noqa: BLE001
+        pass
+    return resp
+
+
+@app.post("/api/extra/auth/{source}/qr")
+async def api_extra_auth_qr(request: Request, source: str):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    return await _ms_proxy(f"/api/v1/auth/{source}/qr", method="POST", json_body={})
+
+
+@app.get("/api/extra/auth/qr/check")
+async def api_extra_auth_qr_check(request: Request, unikey: str = "", source: str = ""):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    params = {"unikey": unikey}
+    if source:
+        return await _ms_proxy(f"/api/v1/auth/{source}/qr/check", params=params)
+    return await _ms_proxy("/api/v1/auth/qr/check", params=params)
+
+
+@app.get("/api/extra/custom")
+async def api_extra_custom_get(request: Request):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    return await _ms_proxy("/api/v1/custom")
+
+
+@app.post("/api/extra/custom")
+async def api_extra_custom_save(request: Request):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    try:
+        body = await request.json()
+    except Exception as exc:  # noqa: BLE001
+        return _err(422, f"无效 JSON: {exc}")
+    resp = await _ms_proxy("/api/v1/custom", method="POST", json_body=body)
+    try:
+        await _invalidate_proxy_cache()
+    except Exception:  # noqa: BLE001
+        pass
+    return resp
+
+
+@app.post("/api/extra/custom/item")
+async def api_extra_custom_item(request: Request):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    try:
+        body = await request.json()
+    except Exception as exc:  # noqa: BLE001
+        return _err(422, f"无效 JSON: {exc}")
+    resp = await _ms_proxy("/api/v1/custom/item", method="POST", json_body=body)
+    try:
+        await _invalidate_proxy_cache()
+    except Exception:  # noqa: BLE001
+        pass
+    return resp
+
+
+@app.post("/api/extra/custom/{key}/delete")
+async def api_extra_custom_delete(request: Request, key: str):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    resp = await _ms_proxy(f"/api/v1/custom/{key}/delete", method="POST", json_body={})
+    try:
+        await _invalidate_proxy_cache()
+    except Exception:  # noqa: BLE001
+        pass
+    return resp
+
+
 async def _invalidate_proxy_cache() -> bool:
     """通知代理进程清缓存（搜索 + 每日推荐 + 登录态）。失败只记日志。"""
     try:
@@ -1751,6 +1952,65 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
   </div>
 
   <div class="card">
+    <h2>扩展音源登录（QQ / 酷狗 / 酷我 / 汽水）</h2>
+    <div class="sub" style="margin:-6px 0 12px">
+      内置扩展音源走公开接口可搜免费曲；登录 Cookie 后可解锁你自己的会员曲目。
+      粘贴浏览器 Cookie 即可（F12 → Network → 复制 Cookie 请求头）。
+    </div>
+    <div id="extraAuthList" class="sub">加载中…</div>
+    <div class="acts" style="margin-top:10px">
+      <select id="extraSrcSel" class="btn">
+        <option value="qq">QQ音乐</option>
+        <option value="kugou">酷狗音乐</option>
+        <option value="kuwo">酷我音乐</option>
+        <option value="qishui">汽水音乐</option>
+      </select>
+      <input id="extraCookie" class="btn" type="password" placeholder="粘贴 Cookie（或 Token）" style="min-width:220px;flex:1">
+      <button class="btn pri" id="extraCookieSave">保存登录</button>
+      <button class="btn" id="extraLogout">退出</button>
+    </div>
+    <div class="sub" id="extraAuthMsg" style="margin:8px 0 0"></div>
+    <details style="margin-top:10px">
+      <summary style="cursor:pointer">Cookie 怎么拿？</summary>
+      <ol class="steps" style="margin:8px 0 0;padding-left:18px">
+        <li>浏览器打开并登录对应音乐网站（y.qq.com / kugou.com / kuwo.cn）</li>
+        <li>F12 → Network → 刷新 → 点任一请求 → Request Headers → 复制整段 <code>Cookie</code></li>
+        <li>粘贴到上方输入框，选对应音源后点「保存登录」</li>
+      </ol>
+    </details>
+  </div>
+
+  <div class="card">
+    <h2>自定义音源</h2>
+    <div class="sub" style="margin:-6px 0 12px">
+      用 HTTP 模板接入任意兼容接口（自建网关 / lx-music-api-server 等）。
+      保存后搜索结果会并入该音源。
+    </div>
+    <div class="acts" style="margin-top:0">
+      <button class="btn" id="customAdd">新增一条</button>
+      <button class="btn" id="customReload">刷新列表</button>
+      <span id="customMsg" class="sub" style="margin:0"></span>
+    </div>
+    <div id="customList" class="sub" style="margin-top:10px">加载中…</div>
+    <div id="customForm" class="hide" style="margin-top:12px;border-top:1px solid var(--line);padding-top:12px">
+      <div class="grid">
+        <label><span class="lb">key（字母开头）</span><input id="csKey" placeholder="mymusic"></label>
+        <label><span class="lb">显示名</span><input id="csLabel" placeholder="我的音源"></label>
+        <label><span class="lb">搜索 URL</span><input id="csSearch" placeholder="https://api.xx/search?keyword={keyword}&limit={limit}"></label>
+        <label><span class="lb">结果列表路径</span><input id="csListPath" placeholder="data.songs"></label>
+        <label><span class="lb">取直链 URL</span><input id="csUrl" placeholder="https://api.xx/url?id={id}"></label>
+        <label><span class="lb">直链字段路径</span><input id="csUrlPath" placeholder="data.url"></label>
+        <label><span class="lb">歌词 URL（可选）</span><input id="csLyric" placeholder="https://api.xx/lyric?id={id}"></label>
+        <label><span class="lb">Cookie（可选）</span><input id="csCookie" type="password" placeholder="留空不改"></label>
+      </div>
+      <div class="acts" style="margin-top:10px">
+        <button class="btn pri" id="csSave">保存自定义音源</button>
+        <button class="btn" id="csCancel">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
     <h2>配置</h2>
     <form id="cfgForm" autocomplete="off">
       <div class="grid">
@@ -1822,6 +2082,27 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
         <label><span class="lb">点收藏时自动下载</span>
           <input type="checkbox" name="download_on_favorite">
           <span class="ht">取账号能拿到的最高品质（jymaster→hires→lossless→exhigh 逐档降级），配歌词</span>
+        </label>
+
+        <label><span class="lb">启用扩展音源</span>
+          <input type="checkbox" name="extra_enabled">
+          <span class="ht">QQ / 酷狗 / 酷我 / 汽水 + 自定义音源；关闭后只保留网易云</span>
+        </label>
+        <label><span class="lb">扩展音源清单</span>
+          <input name="extra_sources" placeholder="qq,kugou,kuwo,qishui">
+          <span class="ht">逗号分隔。自定义音源保存后会自动加入，无需写在这里</span>
+        </label>
+        <label><span class="lb">QQ音乐</span><input type="checkbox" name="qq_enabled"><span class="ht">内置扩展音源</span></label>
+        <label><span class="lb">酷狗音乐</span><input type="checkbox" name="kugou_enabled"><span class="ht">内置扩展音源</span></label>
+        <label><span class="lb">酷我音乐</span><input type="checkbox" name="kuwo_enabled"><span class="ht">内置扩展音源</span></label>
+        <label><span class="lb">汽水音乐</span><input type="checkbox" name="qishui_enabled"><span class="ht">通常需聚合网关</span></label>
+        <label><span class="lb">汽水聚合网关</span>
+          <input name="qishui_api_base" placeholder="http://127.0.0.1:9000（可空）">
+          <span class="ht">lx-music-api-server / Musicn 等兼容端点</span>
+        </label>
+        <label><span class="lb">扩展音源服务地址</span>
+          <input name="musicsource_url" placeholder="http://127.0.0.1:8771">
+          <span class="ht">管理页登录/自定义音源走这个服务</span>
         </label>
 
         <label><span class="lb">音质：局域网（家里 WiFi / 内网）</span>
@@ -2024,7 +2305,7 @@ var $=function(s){return document.querySelector(s)};
 //     而给 checkbox 赋 value 不会改变勾选外观；
 //   - 提交时下面那句 `el.type==="checkbox"` 会把未登记的 checkbox 整个跳过，
 //     该字段不会出现在 values 里。
-var BOOLS=["free_only_on_logout","daily_enabled","local_daily_enabled","local_first","local_first_any_class","prefetch_next","pushplus_enabled","download_on_favorite","cdn_redirect","log_quiet"];
+var BOOLS=["free_only_on_logout","daily_enabled","local_daily_enabled","local_first","local_first_any_class","prefetch_next","pushplus_enabled","download_on_favorite","cdn_redirect","log_quiet","extra_enabled","qq_enabled","kugou_enabled","kuwo_enabled","qishui_enabled"];
 var pollTimer=null, qrUnikey="", expireTimer=null;
 
 // 服务端注入的绝对前缀（形如 /app/fnmusicext/）。
@@ -2036,6 +2317,13 @@ if(BASE.charAt(BASE.length-1)!=="/") BASE+="/";
 function url(p){ return BASE + String(p).replace(/^\/+/, "") }
 
 function api(path,opt){
+  opt = opt || {};
+  if(opt && opt.body && typeof opt.body === "object"){
+    opt = Object.assign({}, opt, {
+      headers: Object.assign({"Content-Type":"application/json"}, opt.headers||{}),
+      body: JSON.stringify(opt.body)
+    });
+  }
   return fetch(url(path),opt).then(function(r){
     return r.text().then(function(txt){
       var j=null; try{ j=JSON.parse(txt) }catch(e){}
@@ -2174,6 +2462,113 @@ function loadCfg(){
     });
     return j;
   });
+}
+
+// ---- 扩展音源登录 / 自定义音源 ----
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]})}
+function loadExtraAuth(){
+  api("api/extra/auth").then(function(j){
+    var box=$("#extraAuthList");
+    if(!j.ok){ box.textContent="扩展音源服务不可达："+(j.error||""); return }
+    var rows=j.data||[];
+    if(!rows.length){ box.textContent="暂无音源状态"; return }
+    var h="";
+    rows.forEach(function(r){
+      h+='<div style="margin:4px 0"><b>'+esc(r.source)+'</b> '
+        +(r.logged_in?'<span class="pill ok">已登录'+(r.nickname?esc(r.nickname):"")+'</span>':'<span class="pill warn">未登录</span>')
+        +(r.cookie_preview?' <span class="sub">'+esc(r.cookie_preview)+'</span>':"")
+        +'</div>';
+    });
+    box.innerHTML=h;
+  });
+}
+function loadCustom(){
+  api("api/extra/custom").then(function(j){
+    var box=$("#customList");
+    if(!j.ok){ box.textContent="无法加载自定义音源："+(j.error||""); return }
+    var rows=j.data||[];
+    if(!rows.length){ box.textContent="尚未配置自定义音源"; return }
+    var h="";
+    rows.forEach(function(r){
+      h+='<div style="margin:6px 0;padding:8px;border:1px solid var(--line);border-radius:8px">'
+        +'<b>'+esc(r.key)+'</b> '+esc(r.label||"")
+        +'<div class="sub">搜索：'+esc(r.search_url||"")+'</div>'
+        +'<div class="acts" style="margin-top:6px">'
+        +'<button class="btn" data-cedit="'+esc(r.key)+'">编辑</button>'
+        +'<button class="btn" data-cdel="'+esc(r.key)+'">删除</button>'
+        +'</div></div>';
+    });
+    box.innerHTML=h;
+    Array.prototype.forEach.call(box.querySelectorAll("[data-cdel]"),function(btn){
+      btn.onclick=function(){
+        if(!confirm("删除自定义音源 "+btn.getAttribute("data-cdel")+"？")) return;
+        api("api/extra/custom/"+btn.getAttribute("data-cdel")+"/delete",{method:"POST",body:{}}).then(function(){loadCustom()});
+      };
+    });
+    Array.prototype.forEach.call(box.querySelectorAll("[data-cedit]"),function(btn){
+      btn.onclick=function(){
+        var key=btn.getAttribute("data-cedit");
+        var row=null;
+        (j.data||[]).forEach(function(r){ if(r.key===key) row=r });
+        if(!row) return;
+        $("#csKey").value=row.key||"";
+        $("#csLabel").value=row.label||"";
+        $("#csSearch").value=row.search_url||"";
+        $("#csListPath").value=row.list_path||"";
+        $("#csUrl").value=row.url_url||"";
+        $("#csUrlPath").value=row.url_path||"url";
+        $("#csLyric").value=row.lyric_url||"";
+        $("#csCookie").value="";
+        $("#customForm").classList.remove("hide");
+      };
+    });
+  });
+}
+if($("#extraCookieSave")){
+  $("#extraCookieSave").onclick=function(){
+    var src=$("#extraSrcSel").value;
+    var cookie=$("#extraCookie").value.trim();
+    if(!cookie){ $("#extraAuthMsg").textContent="请先粘贴 Cookie"; return }
+    api("api/extra/auth/"+src+"/cookie",{method:"POST",body:{cookie:cookie}}).then(function(j){
+      $("#extraAuthMsg").textContent = j.ok ? ("已保存 "+src+" 登录态") : ("失败："+(j.error||""));
+      if(j.ok){ $("#extraCookie").value=""; loadExtraAuth(); }
+    });
+  };
+  $("#extraLogout").onclick=function(){
+    var src=$("#extraSrcSel").value;
+    api("api/extra/auth/"+src+"/logout",{method:"POST",body:{}}).then(function(j){
+      $("#extraAuthMsg").textContent = j.ok ? ("已退出 "+src) : ("失败："+(j.error||""));
+      loadExtraAuth();
+    });
+  };
+  loadExtraAuth();
+}
+if($("#customAdd")){
+  $("#customAdd").onclick=function(){
+    $("#customForm").classList.remove("hide");
+    ["csKey","csLabel","csSearch","csListPath","csUrl","csUrlPath","csLyric","csCookie"].forEach(function(id){ var e=$(id); if(e) e.value=""; });
+  };
+  $("#csCancel").onclick=function(){ $("#customForm").classList.add("hide") };
+  $("#customReload").onclick=loadCustom;
+  $("#csSave").onclick=function(){
+    var body={
+      key:$("#csKey").value.trim(),
+      label:$("#csLabel").value.trim()||$("#csKey").value.trim(),
+      enabled:true,
+      search_url:$("#csSearch").value.trim(),
+      list_path:$("#csListPath").value.trim(),
+      url_url:$("#csUrl").value.trim(),
+      url_path:$("#csUrlPath").value.trim()||"url",
+      lyric_url:$("#csLyric").value.trim(),
+      cookie:$("#csCookie").value.trim()
+    };
+    if(!body.key || !body.search_url){ $("#customMsg").textContent="key 与搜索 URL 必填"; return }
+    api("api/extra/custom/item",{method:"POST",body:body}).then(function(j){
+      $("#customMsg").textContent = j.ok ? "已保存" : ("失败："+(j.error||""));
+      if(j.ok){ $("#customForm").classList.add("hide"); loadCustom(); loadExtraAuth(); }
+    });
+  };
+  loadCustom();
 }
 
 // 歌单口径：多个勾选框 <-> 单个隐藏域 netease_channels

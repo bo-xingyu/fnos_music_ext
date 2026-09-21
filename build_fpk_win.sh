@@ -30,4 +30,5 @@ python3 -c "import sys; from PIL import Image; print(sys.executable, 'Pillow OK'
 command -v tar
 command -v gzip
 command -v md5sum
-bash ./build_fpk.sh --version 2.10.0
+VER="$(head -n 1 VERSION | tr -d '[:space:]')"
+bash ./build_fpk.sh --version "${VER}"

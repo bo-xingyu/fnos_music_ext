@@ -17,6 +17,7 @@ from .base import (
     guess_ext_from_url,
     parse_duration_ms,
 )
+from . import auth_store
 
 UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
@@ -35,7 +36,12 @@ class KugouSource:
     label = "酷狗音乐"
 
     def __init__(self) -> None:
-        self._client = httpx.AsyncClient(headers=HEADERS, timeout=12.0, follow_redirects=True)
+        self._client = httpx.AsyncClient(headers=self._headers(), timeout=12.0, follow_redirects=True)
+
+    def _headers(self) -> dict:
+        h = dict(HEADERS)
+        h.update(auth_store.cookie_header("kugou"))
+        return h
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -61,7 +67,7 @@ class KugouSource:
             "privilege_filter": 0,
         }
         try:
-            r = await self._client.get(url, params=params)
+            r = await self._client.get(url, params=params, headers=self._headers())
             data = r.json()
         except Exception as exc:  # noqa: BLE001
             raise SourceError(f"kugou search failed: {exc}") from exc
@@ -106,7 +112,7 @@ class KugouSource:
             raise SourceError("empty kugou song id")
 
         headers = {
-            **HEADERS,
+            **self._headers(),
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -197,7 +203,7 @@ class KugouSource:
             r = await self._client.get(
                 "https://m.kugou.com/app/i/krc.php",
                 params={"cmd": 100, "timelength": 999999, "hash": hash_},
-                headers={**HEADERS, "Accept": "*/*"},
+                headers={**self._headers(), "Accept": "*/*"},
             )
             # krc 接口有时返回纯文本 LRC，有时是加密 krc（不可读）；仅透传可识别文本
             text = r.text

@@ -30,19 +30,65 @@ def service_url() -> str:
 
 
 def enabled_sources() -> list[str]:
+    """启用中的扩展音源 key。
+
+    优先以 .env 配置为准（内置 4 源）；自定义音源需运行时向
+    musicsource-service 查询（见 refresh_enabled_from_service）。
+    """
     raw = (os.environ.get("FNMUSIC_EXTRA_SOURCES") or "qq,kugou,kuwo,qishui").strip()
     listed = [p.strip().lower() for p in raw.split(",") if p.strip()]
-    listed = [p for p in listed if p in extra_items.EXTRA_SOURCE_NAMES]
+    listed = [p for p in listed if extra_items.is_extra_source(p)]
     singles = {
         "qq": _flag("FNMUSIC_QQ_ENABLED", "true"),
         "kugou": _flag("FNMUSIC_KUGOU_ENABLED", "true"),
         "kuwo": _flag("FNMUSIC_KUWO_ENABLED", "true"),
         "qishui": _flag("FNMUSIC_QISHUI_ENABLED", "true"),
     }
-    # 若 EXTRA_SOURCES 明确列了清单，则取清单 ∩ 单源开关
+    builtin = extra_items.BUILTIN_EXTRA_SOURCE_NAMES
     if listed:
-        return [s for s in listed if singles.get(s, True)]
-    return [s for s, on in singles.items() if on]
+        out = [s for s in listed if s not in singles or singles.get(s, True)]
+    else:
+        out = [s for s, on in singles.items() if on]
+    # 追加进程内缓存的自定义音源
+    out.extend([s for s in _CUSTOM_SOURCES if s not in out])
+    return out
+
+
+_CUSTOM_SOURCES: list[str] = []
+
+
+def set_custom_sources(keys: list[str]) -> None:
+    global _CUSTOM_SOURCES
+    _CUSTOM_SOURCES = [k.strip().lower() for k in (keys or [])
+                       if extra_items.is_extra_source(k) and k.strip().lower() not in
+                       extra_items.BUILTIN_EXTRA_SOURCE_NAMES]
+
+
+async def refresh_enabled_from_service(client: httpx.AsyncClient) -> list[str]:
+    """从 musicsource-service 拉取完整音源清单（含自定义）。"""
+    try:
+        r = await client.get("/api/v1/sources", timeout=5.0)
+        if r.status_code != 200:
+            return enabled_sources()
+        data = r.json()
+        items = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return enabled_sources()
+        keys = []
+        for it in items:
+            if isinstance(it, dict) and it.get("enabled") and it.get("key"):
+                k = str(it["key"]).strip().lower()
+                if extra_items.is_extra_source(k):
+                    keys.append(k)
+        # 内置源仍受 .env 单源开关约束
+        env_set = set(enabled_sources())
+        custom = [k for k in keys if k not in extra_items.BUILTIN_EXTRA_SOURCE_NAMES]
+        set_custom_sources(custom)
+        builtin = [k for k in keys if k in extra_items.BUILTIN_EXTRA_SOURCE_NAMES and k in env_set]
+        merged = builtin + [c for c in custom if c not in builtin]
+        return merged or enabled_sources()
+    except Exception:  # noqa: BLE001
+        return enabled_sources()
 
 
 def any_enabled() -> bool:
@@ -111,7 +157,7 @@ async def resolve_url(
     quality: str = "",
 ) -> str | None:
     source = (source or "").strip().lower()
-    if source not in extra_items.EXTRA_SOURCE_NAMES:
+    if not extra_items.is_extra_source(source):
         return None
     song_id = (song_id or "").strip()
     if not song_id:
@@ -140,7 +186,7 @@ async def fetch_lyric(
     song_id: str,
 ) -> str:
     source = (source or "").strip().lower()
-    if source not in extra_items.EXTRA_SOURCE_NAMES:
+    if not extra_items.is_extra_source(source):
         return ""
     song_id = (song_id or "").strip()
     if not song_id:
@@ -170,7 +216,7 @@ async def fetch_detail(
     """取详情；失败时回落搜索缓存里已有的条目字段。"""
     fallback = dict(fallback or {})
     source = (source or "").strip().lower()
-    if source not in extra_items.EXTRA_SOURCE_NAMES:
+    if not extra_items.is_extra_source(source):
         return fallback
     song_id = (song_id or "").strip()
     if not song_id:

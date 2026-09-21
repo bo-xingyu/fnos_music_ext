@@ -18,6 +18,7 @@ from urllib.parse import urljoin
 import httpx
 
 from .base import SourceError, SourceSong, ensure_lrc_text, parse_duration_ms, guess_ext_from_url
+from . import auth_store
 
 UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
@@ -46,7 +47,15 @@ class QishuiSource:
     label = "汽水音乐"
 
     def __init__(self) -> None:
-        self._client = httpx.AsyncClient(headers=HEADERS, timeout=12.0, follow_redirects=True)
+        self._client = httpx.AsyncClient(headers=self._headers(), timeout=12.0, follow_redirects=True)
+
+    def _headers(self) -> dict:
+        h = dict(HEADERS)
+        h.update(auth_store.cookie_header("qishui"))
+        token = auth_store.token_of("qishui")
+        if token:
+            h["Authorization"] = f"Bearer {token}"
+        return h
 
     async def aclose(self) -> None:
         await self._client.aclose()

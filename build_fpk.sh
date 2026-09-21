@@ -350,6 +350,9 @@ for required in config/privilege config/resource \
                 musicsource-service/sources/kugou.py \
                 musicsource-service/sources/kuwo.py \
                 musicsource-service/sources/qishui.py \
+                musicsource-service/sources/custom.py \
+                musicsource-service/sources/auth_store.py \
+                musicsource-service/sources/login.py \
                 bin/fnmusic-lib.sh bin/setup.sh bin/start.sh bin/stop.sh bin/status.sh \
                 bin/restart_services.sh \
                 restore.sh netease_login.sh VERSION; do
