@@ -916,11 +916,12 @@ def test_stream_online_guid_unavailable_404(monkeypatch):
 
 
 def test_stream_rejects_unsupported_legacy_source(monkeypatch):
-    """旧版多音源遗留 guid 干净 404，且不打任何音源服务。"""
+    """未知在线音源 guid 干净 404，且不打任何音源服务。"""
     calls = _wire_netease(monkeypatch, song_id="228908", info=_netease_song_info("228908"))
 
     with TestClient(app) as client:
-        resp = client.get("/music/api/v1/track/stream?guid=online:kuwo:flac1")
+        # kuwo/qq 等在 v2.10 已是合法扩展音源；这里用真正未登记的来源
+        resp = client.get("/music/api/v1/track/stream?guid=online:migu:flac1")
         assert resp.status_code == 404
         assert resp.json()["msg"] == "unsupported online source"
 
@@ -1129,6 +1130,7 @@ def test_search_track_late_wait_catches_slow_source(monkeypatch):
     monkeypatch.setitem(CONF, "late_page_wait_s", 2.0)  # 阶段二足够长
     monkeypatch.setitem(CONF, "netease_enabled", True)
     monkeypatch.setitem(CONF, "free_only_on_logout", True)
+    monkeypatch.setitem(CONF, "extra_enabled", False)   # 隔离：只测网易云慢源路径
 
     def upstream_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"code": 0, "msg": "ok",
@@ -1168,6 +1170,7 @@ def test_search_track_within_budget_keeps_order(monkeypatch):
     monkeypatch.setitem(CONF, "netease_wait_s", 1.0)
     monkeypatch.setitem(CONF, "netease_enabled", True)
     monkeypatch.setitem(CONF, "free_only_on_logout", True)
+    monkeypatch.setitem(CONF, "extra_enabled", False)
 
     def upstream_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={

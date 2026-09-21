@@ -1,15 +1,16 @@
 # fnmusic-ext 飞牛音乐扩展代理
 
-`fnmusic-ext` 是专为 fnOS（飞牛私有云）自带音乐应用（`trim.music`）量身定制的无侵入式增强扩展。通过接管系统后端通信入口，在**完全不修改官方程序与数据库**的前提下，让原生飞牛音乐直接播放网易云曲库。
+`fnmusic-ext` 是专为 fnOS（飞牛私有云）自带音乐应用（`trim.music`）量身定制的无侵入式增强扩展。通过接管系统后端通信入口，在**完全不修改官方程序与数据库**的前提下，让原生飞牛音乐直接播放在线曲库。
 
-> **v2.0 起只有网易云一个在线音源**，且只使用你**扫码登录的那个私人账号**的权益。
-> musicdl（酷我/咪咕聚合）与 lxmusic（洛雪免登录解析）两个音源已整体移除，详见 [CHANGELOG.md](CHANGELOG.md)。
+> **v2.10 在线音源**：网易云（扫码登录私人账号）+ QQ音乐 / 酷狗音乐 / 酷我音乐 / 汽水音乐（扩展音源 `musicsource-service`）。
+> v2.0–v2.9 曾移除 musicdl/lxmusic；v2.10 以独立适配层重新引入多音源，开关可配。
 
 ### 🎵 核心带来什么功能？
 
-- **网易云在线搜播**：直接在官方搜索框输入歌名/歌手，网易云曲库结果实时并入官方列表，即点即播；
-- **使用你自己的会员权益**：扫码登录后，VIP / 无损 / 已购付费专辑曲目都能取到真实直链播放——音源完全来自你的私人账号，而不是任何第三方免登录解析；
-- **未登录也不至于不可用**：掉线或未扫码时自动降级为只播免费曲目（可关闭），飞牛音乐的基础功能照常工作；
+- **多音源在线搜播**：官方搜索框输入歌名/歌手，网易云 + QQ/酷狗/酷我/汽水曲库结果实时并入官方列表，即点即播；
+- **网易云会员权益**：扫码登录后，VIP / 无损 / 已购付费专辑曲目都能取到真实直链播放——音源完全来自你的私人账号；
+- **扩展音源免费曲目**：QQ/酷狗/酷我/汽水走公开 Web 接口，未登录也能搜播可匿名取链的免费曲目；
+- **未登录也不至于不可用**：掉线或未扫码时网易云自动降级为只播免费曲目（可关闭）；扩展音源独立开关，互不影响；
 - **精准歌词与高清封面**：自动补齐在线歌曲的动态滚动 LRC 歌词与高清专辑封面，播放界面完整美观；
 - **智能边播边存（无感离线）**：在线听歌时后台自动缓存音频文件，再次播放直接走本地，省外网流量且秒开；
 - **网易云官方「每日推荐」**：直接抓取 `/weapi/v3/discovery/recommend/songs`，在飞牛歌单列表注入一份与网易云 App 同源的「每日推荐」，推荐逻辑交给网易云自己；
@@ -18,7 +19,9 @@
 - **PushPlus 掉线提醒**：登录态失效、首次检测到未登录、登录成功、VIP 临期时推送提醒，不必盯着 NAS 才发现会员已过期；
 - **桌面网页管理**：装 `.fpk` 后飞牛桌面会出现「飞牛音乐扩展」图标，扫码登录、改配置、看日志全在一个页面里完成，**不用 SSH**。
 
-在线音源实现基于 [darknessomi/musicbox](https://github.com/darknessomi/musicbox)（PyPI 包名 `NetEase-MusicBox`），本仓库的 `musicbox-service/` 是它的 HTTP 包装层。
+在线音源实现：
+- 网易云基于 [darknessomi/musicbox](https://github.com/darknessomi/musicbox)（PyPI 包名 `NetEase-MusicBox`），本仓库的 `musicbox-service/` 是它的 HTTP 包装层；
+- 扩展音源（QQ/酷狗/酷我/汽水）见本仓库 `musicsource-service/`（v2.10+）。
 
 ---
 
@@ -334,24 +337,29 @@ curl -s http://127.0.0.1:8770/api/v1/auth/detail
 ├── restore.sh              # 一键还原官方直连（--full 彻底清理）
 ├── netease_login.sh        # 终端扫码登录（ASCII 二维码 + 过期刷新 + 状态轮询）
 ├── ensure_base_image.sh    # Docker 基础镜像源国内优先探测（docker 模式）
-├── docker-compose.yml      # 单 service：musicbox
+├── docker-compose.yml      # services: musicbox + musicsource
 ├── build_fpk.sh            # 打包飞牛应用包 → dist/<app>-<version>.fpk
 ├── fpk/                    # 应用包源：manifest / cmd / wizard / config / ui 入口 / 图标生成
 ├── proxy/                  # 拦截代理本体
 │   ├── app.py              # FastAPI 代理，所有拦截端点
 │   ├── admin_ui.py         # 桌面网页：扫码登录 + 配置 + 日志（统一网关鉴权）
-│   ├── netease_auth.py     # 登录态探测/缓存 + 降级门控 + 推送触发
+│   ├── netease_auth.py     # 网易云登录态探测/缓存 + 降级门控 + 推送触发
 │   ├── netease_items.py    # 网易云 song_info → 统一条目映射
+│   ├── extra_items.py      # 扩展音源（QQ/酷狗/酷我/汽水）条目映射
+│   ├── extra_sources.py    # musicsource-service HTTP 客户端
 │   ├── pushplus.py         # PushPlus 推送客户端（含节流与脱敏）
 │   ├── recommend.py        # 网易云官方每日推荐抓取与缓存
 │   ├── env_merge.py        # .env 增量安全合并（保留用户值 + 清理废弃键）
 │   ├── version.py          # 版本号读取
 │   ├── run_proxy.sh        # 幂等 socket 接管 + uvicorn --uds 启动
-│   └── tests/              # 288 个用例，pytest
-└── musicbox-service/       # NetEase-MusicBox 的 HTTP 包装
-    ├── app.py              # FastAPI：搜索/直链/详情/歌词/扫码登录/每日推荐
-    ├── netease_ext.py      # NEMbox 内部 API：可播过滤、批量详情、登录详情
-    └── runner.py           # musicbox CLI 执行器（剥离代理环境变量）
+│   └── tests/              # pytest
+├── musicbox-service/       # NetEase-MusicBox 的 HTTP 包装（网易云）
+│   ├── app.py              # FastAPI：搜索/直链/详情/歌词/扫码登录/每日推荐
+│   ├── netease_ext.py      # NEMbox 内部 API
+│   └── runner.py           # musicbox CLI 执行器
+└── musicsource-service/    # 扩展音源 HTTP 包装（v2.10）
+    ├── app.py              # FastAPI：多音源搜索/直链/歌词/详情
+    └── sources/            # qq.py / kugou.py / kuwo.py / qishui.py
 ```
 
 ---

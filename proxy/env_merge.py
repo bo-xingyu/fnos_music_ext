@@ -25,7 +25,7 @@ from pathlib import Path
 _LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 
 # v2.0 单源化后新增的配置项：合并时自动识别并安全补齐（不覆盖用户已有值）
-NEW_KEYS_COMMENT = "网易云单源 + PushPlus 提醒配置（v2.0 新增，缺失时自动补齐）"
+NEW_KEYS_COMMENT = "网易云 + 扩展音源（QQ/酷狗/酷我/汽水）+ PushPlus 配置（缺失时自动补齐）"
 # 与 proxy/pushplus.py 的 DEFAULT_URL 保持一致；此处不 import pushplus，
 # 因为 env_merge 由 install.sh 用系统 python3 直接调用，不能依赖 httpx。
 DEFAULT_PUSHPLUS_URL = "https://www.pushplus.plus/send"
@@ -33,6 +33,18 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_FREE_ONLY_ON_LOGOUT", "true"),
     ("FNMUSIC_DAILY_ENABLED", "true"),
     ("FNMUSIC_DAILY_LIMIT", "20"),
+    # --- 扩展音源 QQ/酷狗/酷我/汽水（v2.10）---
+    ("FNMUSIC_MUSICSOURCE_URL", "http://127.0.0.1:8771"),
+    ("FNMUSIC_EXTRA_ENABLED", "true"),
+    ("FNMUSIC_EXTRA_SOURCES", "qq,kugou,kuwo,qishui"),
+    ("FNMUSIC_QQ_ENABLED", "true"),
+    ("FNMUSIC_KUGOU_ENABLED", "true"),
+    ("FNMUSIC_KUWO_ENABLED", "true"),
+    ("FNMUSIC_QISHUI_ENABLED", "true"),
+    ("FNMUSIC_EXTRA_SEARCH_LIMIT", "20"),
+    ("FNMUSIC_MUSICSOURCE_BIND", "127.0.0.1"),
+    ("FNMUSIC_QISHUI_API_BASE", ""),
+    ("FNMUSIC_EXTRA_API_BASE", ""),
     # 本地每日推荐（v2.9）：每天从本地曲库随机抽 N 首，与网易云日推独立
     ("FNMUSIC_LOCAL_DAILY_ENABLED", "true"),
     ("FNMUSIC_LOCAL_DAILY_LIMIT", "50"),
@@ -150,7 +162,10 @@ NEW_PREFIXES = ("FNMUSIC_FREE_ONLY", "FNMUSIC_DAILY", "FNMUSIC_LOCAL_DAILY", "FN
                 "FNMUSIC_CHANNEL_LIST_", "FNMUSIC_REMOTE_AS_", "FNMUSIC_LOCAL_",
                 "FNMUSIC_PREFETCH_", "FNMUSIC_COVER_", "FNMUSIC_UNKNOWN_AS_", "FNMUSIC_HLS_",
                 # v2.9.28：非局域网直连 CDN 与取链硬超时
-                "FNMUSIC_CDN_", "FNMUSIC_PLAY_")
+                "FNMUSIC_CDN_", "FNMUSIC_PLAY_",
+                # v2.10：扩展音源 QQ/酷狗/酷我/汽水
+                "FNMUSIC_MUSICSOURCE_", "FNMUSIC_EXTRA_", "FNMUSIC_QQ_",
+                "FNMUSIC_KUGOU_", "FNMUSIC_KUWO_", "FNMUSIC_QISHUI_")
 
 # v2.0 已废弃的配置项：升级合并时从 .env 中清理，避免残留误导。
 # 只删「确定已无代码读取」的键；FNMUSIC_MODE / BASE_IMAGE / PIP_INDEX 等 docker 相关项保留。

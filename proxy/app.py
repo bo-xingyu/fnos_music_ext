@@ -1,16 +1,21 @@
 """fnmusic-ext 拦截代理 (FastAPI + httpx).
 
-唯一在线音源是网易云（musicbox 服务），且只使用扫码登录的那个私人账号的权益：
+在线音源：
+  - 网易云（musicbox 服务）：扫码登录的私人账号权益
+  - 扩展音源 QQ / 酷狗 / 酷我 / 汽水（musicsource-service :8771）
 
-    FNMUSIC_NETEASE_ENABLED=true          启用在线音源
-    FNMUSIC_FREE_ONLY_ON_LOGOUT=true      未登录时降级为只播免费曲目
+配置：
+    FNMUSIC_NETEASE_ENABLED=true          启用网易云
+    FNMUSIC_EXTRA_ENABLED=true            启用扩展音源
+    FNMUSIC_EXTRA_SOURCES=qq,kugou,kuwo,qishui
+    FNMUSIC_FREE_ONLY_ON_LOGOUT=true      未登录时网易云降级为只播免费曲目
     FNMUSIC_DAILY_ENABLED=true            抓取网易云官方「每日推荐」歌单
     FNMUSIC_PUSHPLUS_TOKEN=...            掉线/VIP 临期时通过 PushPlus 推送提醒
 
 功能：
 1. 通用透传：所有非拦截路径原样转发到 trim-music unix socket
-2. 搜索合并：GET /music/api/v1/search/track* （兼容 q/keyword，叠加网易云结果）
-3. 在线播放：stream + HLS 兜底 + transcode 空操作 + tee 缓存回放（音频与歌词 sidecar）
+2. 搜索合并：GET /music/api/v1/search/track* （兼容 q/keyword，叠加多音源结果）
+3. 在线播放：stream + HLS 兜底 + trans码空操作 + tee 缓存回放（音频与歌词 sidecar）
 4. 在线元数据/歌词/封面
 5. 网易云官方每日推荐歌单注入（需登录）
 6. GET /_ext/healthz
@@ -39,6 +44,8 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 try:
     from . import netease_auth
     from . import netease_items
+    from . import extra_items
+    from . import extra_sources
     from . import local_library
     from . import playlists
     from . import download as downloader
@@ -52,6 +59,8 @@ try:
 except ImportError:  # uvicorn --app-dir proxy
     import netease_auth  # type: ignore
     import netease_items  # type: ignore
+    import extra_items  # type: ignore
+    import extra_sources  # type: ignore
     import local_library  # type: ignore
     import playlists  # type: ignore
     import download as downloader  # type: ignore
@@ -170,6 +179,12 @@ CONF = {
     "netease_wait_s": _float("FNMUSIC_NETEASE_WAIT_S", 3.0),
     "netease_quality": os.environ.get("FNMUSIC_NETEASE_QUALITY", "lossless"),
     "netease_search_limit": _int("FNMUSIC_NETEASE_SEARCH_LIMIT", 50),
+    # 扩展音源（QQ / 酷狗 / 酷我 / 汽水）
+    "musicsource_url": os.environ.get("FNMUSIC_MUSICSOURCE_URL", "http://127.0.0.1:8771"),
+    "extra_enabled": _flag("FNMUSIC_EXTRA_ENABLED", "true"),
+    "extra_sources": extra_sources.enabled_sources(),
+    "extra_search_limit": _int("FNMUSIC_EXTRA_SEARCH_LIMIT", 20),
+    "extra_wait_s": _float("FNMUSIC_EXTRA_WAIT_S", 3.0),
     # 未登录时降级为只播免费曲目；关掉则未登录完全不提供在线播放
     "free_only_on_logout": _flag("FNMUSIC_FREE_ONLY_ON_LOGOUT", "true"),
     "upstream_sock": os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket"),
@@ -200,8 +215,20 @@ CONF = {
 
 _REDACT_KEY_PARTS = ("api_key", "apikey", "token", "secret", "password")
 
-# 唯一在线音源标识，贯穿 guid（online:netease:<song_id>）与各拦截分支
+# 在线音源标识，贯穿 guid（online:netease:<song_id> / online:qq:<mid> …）
 NETEASE_SOURCE = netease_items.SOURCE_NAME
+EXTRA_SOURCE_NAMES = extra_items.EXTRA_SOURCE_NAMES
+
+
+def is_extra_online_source(src: str | None) -> bool:
+    return extra_items.is_extra_source(src)
+
+
+def is_known_online_source(src: str | None) -> bool:
+    if not src:
+        return True  # 空来源在调用方再判
+    s = str(src).strip().lower()
+    return s == NETEASE_SOURCE or s in EXTRA_SOURCE_NAMES
 
 HOP_BY_HOP = {
     "connection",
@@ -1101,35 +1128,49 @@ def write_lyric_cache(guid: str, text: str, title: str = "", artist: str = "") -
 
 
 async def resolve_online_lyric(request: Request, guid: str) -> str:
-    """本地 .lrc 优先；没有再向网易云要，拿到就落盘。"""
+    """本地 .lrc 优先；没有再按音源向 musicbox / musicsource 要，拿到就落盘。"""
     cached = read_lyric_cache(guid)
     if cached:
         return cached
 
-    musicbox_client = get_musicbox_client(request.app)
     song_id = song_id_from_online_guid(guid).split(":")[-1]
     if not song_id:
         return ""
-    try:
-        r = await musicbox_client.get(f"/api/v1/song/{song_id}/lyric", timeout=10.0)
-        if r.status_code == 200:
-            res_data = r.json()
-            if isinstance(res_data, dict) and res_data.get("ok") is not False:
-                l_data = res_data.get("data")
-                if isinstance(l_data, dict):
-                    lyric_text = str(l_data.get("lyric") or "").strip()
-                    if lyric_text:
-                        info = await _online_info(request, guid)
-                        write_lyric_cache(
-                            guid,
-                            lyric_text,
-                            title=str((info or {}).get("title") or ""),
-                            artist=str((info or {}).get("artist") or ""),
-                        )
-                        return lyric_text
-    except Exception as e:
-        logger.warning("musicbox lyric fetch failed for %s: %s", guid, e)
-    return ""
+    src = source_from_online_guid(guid)
+    lyric_text = ""
+
+    if is_extra_online_source(src):
+        try:
+            lyric_text = await extra_sources.fetch_lyric(
+                get_musicsource_client(request.app), src, song_id
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("extra source lyric fetch failed for %s: %s: %s",
+                           guid, type(e).__name__, e)
+            lyric_text = ""
+    else:
+        musicbox_client = get_musicbox_client(request.app)
+        try:
+            r = await musicbox_client.get(f"/api/v1/song/{song_id}/lyric", timeout=10.0)
+            if r.status_code == 200:
+                res_data = r.json()
+                if isinstance(res_data, dict) and res_data.get("ok") is not False:
+                    l_data = res_data.get("data")
+                    if isinstance(l_data, dict):
+                        lyric_text = str(l_data.get("lyric") or "").strip()
+        except Exception as e:
+            logger.warning("musicbox lyric fetch failed for %s: %s", guid, e)
+            lyric_text = ""
+
+    if lyric_text:
+        info = await _online_info(request, guid)
+        write_lyric_cache(
+            guid,
+            lyric_text,
+            title=str((info or {}).get("title") or ""),
+            artist=str((info or {}).get("artist") or ""),
+        )
+    return lyric_text
 
 
 def media_type_for_ext(ext: str) -> str:
@@ -1288,6 +1329,14 @@ def get_musicbox_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     if client is None:
         client = httpx.AsyncClient(base_url=CONF["musicbox_url"], timeout=20.0)
         fastapi_app.state.musicbox_client = client
+    return client
+
+
+def get_musicsource_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
+    client = getattr(fastapi_app.state, "musicsource_client", None)
+    if client is None:
+        client = httpx.AsyncClient(base_url=CONF["musicsource_url"], timeout=15.0)
+        fastapi_app.state.musicsource_client = client
     return client
 
 
@@ -1538,6 +1587,49 @@ async def fetch_netease_search(
     except Exception as e:
         logger.warning("Failed to fetch netease search: %s", e)
         return None
+
+
+async def fetch_extra_online_search(
+    client: httpx.AsyncClient,
+    keyword: str,
+    limit: int | None = None,
+) -> list[dict] | None:
+    """扩展音源聚合搜索（QQ/酷狗/酷我/汽水）。"""
+    if not keyword or not CONF.get("extra_enabled"):
+        return []
+    sources = extra_sources.enabled_sources()
+    if not sources:
+        return []
+    return await extra_sources.fetch_extra_search(client, keyword, limit=limit, sources=sources)
+
+
+async def fetch_all_online_search(
+    musicbox_client: httpx.AsyncClient,
+    musicsource_client: httpx.AsyncClient | None,
+    keyword: str,
+) -> list[dict]:
+    """并发拉取网易云 + 扩展音源，合并为统一条目列表。"""
+    if not keyword:
+        return []
+    tasks: list[Any] = []
+    labels: list[str] = []
+    if CONF["netease_enabled"] and await _online_search_allowed(musicbox_client):
+        tasks.append(fetch_netease_search(musicbox_client, keyword, CONF["netease_search_limit"]))
+        labels.append(NETEASE_SOURCE)
+    if musicsource_client is not None and CONF.get("extra_enabled") and extra_sources.any_enabled():
+        tasks.append(fetch_extra_online_search(musicsource_client, keyword))
+        labels.append("extra")
+    if not tasks:
+        return []
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    items: list[dict] = []
+    for label, res in zip(labels, results):
+        if isinstance(res, Exception):
+            logger.warning("online search %s failed: %s: %s", label, type(res).__name__, res)
+            continue
+        if isinstance(res, list):
+            items.extend(res)
+    return items
 
 
 async def _enrich_netease_items(client: httpx.AsyncClient, items: list[dict]) -> None:
@@ -2060,6 +2152,7 @@ async def lifespan(fastapi_app: FastAPI):
 
     created_upstream = False
     created_musicbox = False
+    created_musicsource = False
     created_push = False
     created_cdn = False
 
@@ -2077,6 +2170,13 @@ async def lifespan(fastapi_app: FastAPI):
             timeout=20.0,
         )
         created_musicbox = True
+
+    if CONF.get("extra_enabled") and getattr(fastapi_app.state, "musicsource_client", None) is None:
+        fastapi_app.state.musicsource_client = httpx.AsyncClient(
+            base_url=CONF["musicsource_url"],
+            timeout=15.0,
+        )
+        created_musicsource = True
 
     if getattr(fastapi_app.state, "push_client", None) is None:
         fastapi_app.state.push_client = httpx.AsyncClient(timeout=pushplus.REQUEST_TIMEOUT_S)
@@ -2111,6 +2211,9 @@ async def lifespan(fastapi_app: FastAPI):
         if created_musicbox and getattr(fastapi_app.state, "musicbox_client", None):
             await fastapi_app.state.musicbox_client.aclose()
             fastapi_app.state.musicbox_client = None
+        if created_musicsource and getattr(fastapi_app.state, "musicsource_client", None):
+            await fastapi_app.state.musicsource_client.aclose()
+            fastapi_app.state.musicsource_client = None
         if created_push and getattr(fastapi_app.state, "push_client", None):
             await fastapi_app.state.push_client.aclose()
             fastapi_app.state.push_client = None
@@ -2151,18 +2254,38 @@ async def ext_healthz(request: Request):
     if CONF["netease_enabled"] and CONF["daily_enabled"] and musicbox_status == "ok":
         daily_status = "ok" if login.logged_in else "need_login"
 
-    # 在线音源可用 = 服务活着，且（已登录 或 允许未登录降级播免费曲）
+    # 扩展音源（QQ/酷狗/酷我/汽水）
+    extra_status = "disabled"
+    extra_list: list[str] = []
+    if CONF.get("extra_enabled") and extra_sources.any_enabled():
+        extra_list = extra_sources.enabled_sources()
+        extra_status = "fail"
+        try:
+            ms_client = get_musicsource_client(request.app)
+            extra_status = await extra_sources.healthz(ms_client)
+        except Exception as e:
+            logger.debug("musicsource health check failed: %s", e)
+            extra_status = "fail"
+
+    # 在线音源可用 = 网易云服务活着且（已登录 或 允许免费曲降级）或扩展音源可用
     netease_usable = musicbox_status == "ok" and (
         login.logged_in or CONF["free_only_on_logout"]
     )
+    extra_usable = extra_status == "ok" and bool(extra_list)
+    online_usable = netease_usable or extra_usable
 
     return {
-        "ok": upstream_status == "ok" and netease_usable,
+        "ok": upstream_status == "ok" and online_usable,
         "version": get_version(),
         "upstream": upstream_status,
         "musicbox": musicbox_status,
         "netease": login.to_public_dict(),
         "daily": daily_status,
+        "extra_sources": {
+            "status": extra_status,
+            "enabled": extra_list,
+            "service": CONF.get("musicsource_url"),
+        },
         "pushplus": "enabled" if pushplus.enabled() else "disabled",
     }
 
@@ -2562,7 +2685,9 @@ async def search_track(request: Request):
     # 在线搜索与上游请求【并发】发起：网易云这一路本身要几秒（服务端要批量校验
     # 真实直链），串行排在 upstream 之后等于把这段时间白等掉，
     # 常常因此撞上首屏预算而只返回本地结果。
-    online_allowed = await _online_search_allowed(musicbox_client) if keyword else False
+    # v2.10：同时并入 QQ/酷狗/酷我/汽水扩展音源（各自独立开关，不要求网易云登录）。
+    musicsource_client = get_musicsource_client(request.app)
+    online_allowed = await _any_online_search_allowed(musicbox_client) if keyword else False
 
     now = time.time()
     cached_entry = _SEARCH_CACHE.get(keyword) if keyword else None
@@ -2580,7 +2705,7 @@ async def search_track(request: Request):
     if keyword and online_allowed and not is_valid_cache:
         entry = {"items": [], "ts": time.time(), "task": None}
         search_task = asyncio.create_task(
-            fetch_netease_search(musicbox_client, keyword, CONF["netease_search_limit"])
+            fetch_all_online_search(musicbox_client, musicsource_client, keyword)
         )
         agg_task = asyncio.create_task(_collect_search(entry, search_task))
         entry["task"] = agg_task
@@ -2658,7 +2783,7 @@ async def search_track(request: Request):
 
 
 async def _online_search_allowed(musicbox_client: httpx.AsyncClient) -> bool:
-    """在线音源是否放行。
+    """网易云音源是否放行（扩展音源另有独立开关，见 extra_sources）。
 
     单源 = 网易云。未登录时是否降级为「只播免费曲」由 FNMUSIC_FREE_ONLY_ON_LOGOUT 决定：
     开（默认）→ 继续搜索，musicbox 服务端已把结果过滤成免费可播曲目；
@@ -2673,6 +2798,13 @@ async def _online_search_allowed(musicbox_client: httpx.AsyncClient) -> bool:
         logger.info("online search skipped: 网易云未登录且未开启免费曲降级")
         return False
     return True
+
+
+async def _any_online_search_allowed(musicbox_client: httpx.AsyncClient) -> bool:
+    """是否允许并入任何在线搜索结果（网易云或扩展音源）。"""
+    if CONF.get("extra_enabled") and extra_sources.any_enabled():
+        return True
+    return await _online_search_allowed(musicbox_client)
 
 
 async def _wait_task(task: asyncio.Task, timeout: float) -> bool:
@@ -2693,7 +2825,7 @@ async def _collect_search(entry: dict, task: "asyncio.Task | None") -> None:
         try:
             res = await task
         except Exception as exc:
-            logger.warning("netease search bg failed: %s", exc)
+            logger.warning("online search bg failed: %s", exc)
     entry["items"] = deduplicate_online_items(res if isinstance(res, list) else [])
     # 以"聚合完成"为缓存起点：空结果的短 TTL 窗口从此刻开始计时，
     # 而不是从发起请求那一刻（否则慢搜索会吃掉大部分自愈窗口）
@@ -2713,6 +2845,7 @@ async def search_suggest(request: Request):
 
     upstream_client = get_upstream_client(request.app)
     musicbox_client = get_musicbox_client(request.app)
+    musicsource_client = get_musicsource_client(request.app)
     keyword = extract_keyword(request)
 
     url_path = request.url.path
@@ -2721,15 +2854,22 @@ async def search_suggest(request: Request):
     headers = copy_incoming_headers(request)
 
     netease_task: asyncio.Task | None = None
-    if keyword and await _online_search_allowed(musicbox_client):
-        # 联想词只要标题，跳过详情补齐以省下一次往返
-        netease_task = asyncio.create_task(
-            fetch_netease_search(musicbox_client, keyword, 5, enrich=False)
-        )
+    extra_task: asyncio.Task | None = None
+    if keyword:
+        if await _online_search_allowed(musicbox_client):
+            # 联想词只要标题，跳过详情补齐以省下一次往返
+            netease_task = asyncio.create_task(
+                fetch_netease_search(musicbox_client, keyword, 5, enrich=False)
+            )
+        if CONF.get("extra_enabled") and extra_sources.any_enabled():
+            extra_task = asyncio.create_task(
+                fetch_extra_online_search(musicsource_client, keyword, 5)
+            )
 
     def _drop_task() -> None:
-        if netease_task is not None and not netease_task.done():
-            netease_task.cancel()
+        for t in (netease_task, extra_task):
+            if t is not None and not t.done():
+                t.cancel()
 
     req = upstream_client.build_request("GET", url_path, headers=headers)
     upstream_resp = await upstream_client.send(req)
@@ -2760,19 +2900,33 @@ async def search_suggest(request: Request):
         return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
     netease_rows = None
+    extra_rows = None
+    pending = []
     if netease_task is not None:
+        pending.append(("netease", netease_task))
+    if extra_task is not None:
+        pending.append(("extra", extra_task))
+    for label, task in pending:
         try:
-            netease_rows = await asyncio.wait_for(asyncio.shield(netease_task), timeout=10.0)
+            rows = await asyncio.wait_for(asyncio.shield(task), timeout=10.0)
         except Exception as e:
-            logger.warning("Suggest netease error: %s", e)
-            netease_task.cancel()
+            logger.warning("Suggest %s error: %s", label, e)
+            task.cancel()
+            rows = None
+        if label == "netease":
+            netease_rows = rows
+        else:
+            extra_rows = rows
 
     data_field = upstream_json.get("data")
-    if isinstance(data_field, list) and isinstance(netease_rows, list):
-        for item in netease_rows[:5]:
-            title = str(item.get("title") or "")
-            if title and title not in data_field:
-                data_field.append(title)
+    if isinstance(data_field, list):
+        for rows in (netease_rows, extra_rows):
+            if not isinstance(rows, list):
+                continue
+            for item in rows[:5]:
+                title = str(item.get("title") or "")
+                if title and title not in data_field:
+                    data_field.append(title)
 
     return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
@@ -3007,6 +3161,26 @@ async def _prefetch_inner(request: Request, guid: str) -> None:
         prefetch.note_result(guid, False, 0.0, "no song id")
         return
     started = time.monotonic()
+    src = source_from_online_guid(guid)
+
+    if is_extra_online_source(src):
+        ms_client = get_musicsource_client(request.app)
+        url, _info = await asyncio.gather(
+            extra_sources.resolve_url(ms_client, src, song_id),
+            _online_info(request, guid),
+            return_exceptions=True,
+        )
+        ok = bool(url) and not isinstance(url, Exception)
+        if ok and isinstance(url, str):
+            _url_cache_put(f"{src}:{song_id}", "extra", url)
+        prefetch.note_result(guid, ok, (time.monotonic() - started) * 1000.0,
+                             "" if ok else f"url={url!r}")
+        return
+
+    if src and src != NETEASE_SOURCE:
+        prefetch.note_result(guid, False, 0.0, f"unsupported source {src}")
+        return
+
     client = get_musicbox_client(request.app)
     url, _info = await asyncio.gather(
         resolve_netease_url(client, song_id, request),
@@ -3242,10 +3416,13 @@ async def stream_track(request: Request):
         return serve_file_with_range(cached, range_header, media_type_for_ext(ext))
 
     src = source_from_online_guid(guid)
+    if src and is_extra_online_source(src):
+        return await _stream_extra_online(request, guid, src, started, _log_play)
+
     if src and src != NETEASE_SOURCE:
-        # 历史遗留的非网易云 guid（旧版多音源缓存/收藏），单源版无法解析
-        logger.info("stream rejected: unsupported legacy online source %r (guid=%s)", src, guid)
-        _note_stream_fail(guid, f"unsupported legacy online source {src!r}",
+        # 未知在线音源（既非网易云也非当前扩展音源）
+        logger.info("stream rejected: unsupported online source %r (guid=%s)", src, guid)
+        _note_stream_fail(guid, f"unsupported online source {src!r}",
                           (time.monotonic() - started) * 1000.0, "resolve")
         return _online_unavailable("unsupported online source")
 
@@ -3488,6 +3665,139 @@ async def stream_track(request: Request):
         resolved_ext=resolved_ext,
         pre_info=info if isinstance(info, dict) else None,
     )
+
+
+async def _stream_extra_online(
+    request: Request,
+    guid: str,
+    src: str,
+    started: float,
+    log_play,
+) -> Response:
+    """扩展音源（QQ/酷狗/酷我/汽水）在线播放：取直链 → CDN 中转 + 边播边存。"""
+    if not CONF.get("extra_enabled") or src not in extra_sources.enabled_sources():
+        _note_stream_fail(guid, f"extra source disabled: {src}",
+                          (time.monotonic() - started) * 1000.0, "resolve")
+        return _online_unavailable(f"source {src} disabled")
+
+    song_id = song_id_from_online_guid(guid).split(":")[-1]
+    if not song_id:
+        _note_stream_fail(guid, "empty song id", (time.monotonic() - started) * 1000.0,
+                          "resolve")
+        return _online_unavailable()
+
+    musicsource_client = get_musicsource_client(request.app)
+    range_header = request.headers.get("range")
+
+    # 元数据：先看缓存/搜索结果，再回源补齐
+    info = await _online_info(request, guid)
+
+    # 本地曲库优先（与网易云同策略）
+    local_db = resolve_music_db()
+    local_dir = detect_library_dir()
+    if info and local_library.local_first_enabled() and str(info.get("title") or "").strip():
+        decision = quality.resolve(request, db_path=local_db)
+        hit = local_library.find_local_match(
+            str(info.get("title") or ""), str(info.get("artist") or ""), local_db, local_dir
+        )
+        if hit and local_library.serves_request(hit, decision.get("level") or "",
+                                               decision.get("network") or ""):
+            try:
+                if log_play(f"local-first(ext={hit.get('ext')},src={src})", " local"):
+                    logger.info("local-first hit: %s -> %s", guid, hit.get("path"))
+                return serve_file_with_range(hit["path"], range_header,
+                                             media_type_for_ext(hit.get("ext") or "mp3"))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("local-first serve failed for %s: %s", guid, exc)
+
+    _schedule_prefetch(request, guid)
+
+    # 直链短缓存（扩展音源同样适用）
+    play_url = _url_cache_get(f"{src}:{song_id}", "extra")
+    resolve_started = time.monotonic()
+    if not play_url:
+        play_url = await extra_sources.resolve_url(musicsource_client, src, song_id)
+        if play_url:
+            _url_cache_put(f"{src}:{song_id}", "extra", play_url)
+    resolve_ms = (time.monotonic() - resolve_started) * 1000.0
+    if not play_url:
+        _note_stream_fail(guid, f"extra resolve empty ({src})",
+                          resolve_ms, "resolve")
+        logger.info("stream 404 for %s: 扩展音源 %s 未返回直链", guid, src)
+        return _online_unavailable()
+
+    if info is None:
+        info = await extra_sources.fetch_detail(musicsource_client, src, song_id,
+                                                fallback=_search_item_by_guid(guid))
+        if info:
+            _ONLINE_INFO_CACHE[guid] = (time.time(), info)
+            _cache_put_prune(_ONLINE_INFO_CACHE, _ONLINE_INFO_MAX)
+            if info.get("cover_url"):
+                _ONLINE_COVER_CACHE[guid] = (time.time(), str(info["cover_url"]))
+                _cache_put_prune(_ONLINE_COVER_CACHE, _ONLINE_INFO_MAX)
+
+    resolved_ext = str((info or {}).get("ext")) if (info or {}).get("ext") else None
+
+    # 非局域网 302 直连（与网易云策略一致）
+    if cdn_redirect_enabled() and quality.network_of(request) == "cellular":
+        if not redirect_storm(guid):
+            _STREAM_MODE["redirect"] = int(_STREAM_MODE.get("redirect", 0)) + 1
+            log_play(f"redirect({_url_scheme_host(play_url)})", " warm" if False else None)
+            logger.info("stream redirect %s -> cdn（扩展音源 %s）%s",
+                        guid, src, _url_scheme_host(play_url))
+            return RedirectResponse(
+                play_url, status_code=302,
+                headers={"Cache-Control": "private, max-age=60",
+                         "Accept-Ranges": "bytes"})
+        # storm 时继续中转
+
+    req_headers = {}
+    if range_header:
+        req_headers["Range"] = range_header
+    stream_client = get_cdn_client(request.app)
+    try:
+        stream_req = stream_client.build_request("GET", play_url, headers=req_headers)
+        resp = await stream_client.send(stream_req, stream=True)
+        content_type = (resp.headers.get("content-type") or "").lower()
+        if resp.status_code >= 400 or "text/html" in content_type:
+            await resp.aclose()
+            logger.warning("%s cdn refused %s: status=%s content-type=%s",
+                           src, guid, resp.status_code, content_type or "-")
+            _note_stream_fail(guid, f"cdn status={resp.status_code} ct={content_type or '-'}",
+                              (time.monotonic() - started) * 1000.0, "open-cdn")
+            return _online_unavailable()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to stream %s url for %s: %s", src, guid, exc)
+        _note_stream_fail(guid, f"cdn open failed: {exc}",
+                          (time.monotonic() - started) * 1000.0, "open-cdn")
+        return _online_unavailable()
+
+    log_play(src)
+    _STREAM_MODE["tee"] = int(_STREAM_MODE.get("tee", 0)) + 1
+    return stream_tee_response(
+        resp,
+        guid=guid,
+        range_header=range_header,
+        coro_factory=None if info is not None else (lambda: _online_info(request, guid)),
+        client_to_close=None,
+        resolved_ext=resolved_ext,
+        pre_info=info if isinstance(info, dict) else None,
+    )
+
+
+def _search_item_by_guid(guid: str) -> dict | None:
+    """从搜索缓存里按 guid 反查条目（扩展音源元数据兜底）。"""
+    try:
+        for entry in list(_SEARCH_CACHE.values()):
+            items = entry.get("items") if isinstance(entry, dict) else None
+            if not isinstance(items, list):
+                continue
+            for it in items:
+                if isinstance(it, dict) and online_guid_from_item(it) == guid:
+                    return dict(it)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -4056,10 +4366,24 @@ async def _online_cover_url(request: Request, guid: str) -> str:
     if not song_id:
         return ""
     src = source_from_online_guid(guid)
+    cover = ""
+
+    if is_extra_online_source(src):
+        try:
+            info = await _online_info(request, guid)
+            cover = str((info or {}).get("cover_url") or "").strip()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("extra cover fetch failed for %s: %s", guid, e)
+            return ""
+        if not cover:
+            return ""
+        _ONLINE_COVER_CACHE[guid] = (now, cover)
+        _cache_put_prune(_ONLINE_COVER_CACHE, _ONLINE_INFO_MAX)
+        return cover
+
     if src and src != NETEASE_SOURCE:
         return ""
 
-    cover = ""
     try:
         r = await get_musicbox_client(request.app).get(
             f"/api/v1/song/{song_id}/info", timeout=10.0
@@ -4087,18 +4411,49 @@ async def _online_cover_url(request: Request, guid: str) -> str:
 
 
 async def _online_info(request: Request, guid: str) -> dict | None:
-    """在线曲目元数据：只走网易云（唯一音源）。结果按 TTL 缓存。"""
+    """在线曲目元数据：网易云走 musicbox；扩展音源走 musicsource-service。结果按 TTL 缓存。"""
     now = time.time()
     hit = _ONLINE_INFO_CACHE.get(guid)
     if hit and now - hit[0] < _ONLINE_INFO_TTL:
         return hit[1]
 
     src = source_from_online_guid(guid)
-    if src and src != NETEASE_SOURCE:
-        return None
-
     song_id = song_id_from_online_guid(guid).split(":")[-1]
     if not song_id:
+        return None
+
+    if is_extra_online_source(src):
+        try:
+            record = await extra_sources.fetch_detail(
+                get_musicsource_client(request.app), src, song_id,
+                fallback=_search_item_by_guid(guid),
+            )
+            # 补歌词（有则填）
+            try:
+                lyric = await extra_sources.fetch_lyric(
+                    get_musicsource_client(request.app), src, song_id
+                )
+                if lyric:
+                    record["lyric"] = lyric
+            except Exception:  # noqa: BLE001
+                pass
+            if not record or not str(record.get("title") or "").strip():
+                # 没有标题也不缓存，避免把空结果钉住
+                if record and (record.get("id") or record.get("source")):
+                    # 至少保留结构，便于后续重试
+                    return record
+                return None
+            _ONLINE_INFO_CACHE[guid] = (time.time(), record)
+            _cache_put_prune(_ONLINE_INFO_CACHE, _ONLINE_INFO_MAX)
+            if record.get("cover_url"):
+                _ONLINE_COVER_CACHE[guid] = (time.time(), str(record["cover_url"]))
+                _cache_put_prune(_ONLINE_COVER_CACHE, _ONLINE_INFO_MAX)
+            return record
+        except Exception as e:  # noqa: BLE001
+            logger.warning("extra /info failed for %s: %s: %s", guid, type(e).__name__, e)
+            return None
+
+    if src and src != NETEASE_SOURCE:
         return None
 
     musicbox_client = get_musicbox_client(request.app)
@@ -4842,6 +5197,7 @@ def _netease_song_id(guid: str) -> str:
     if not is_online_guid(g):
         return ""
     src = source_from_online_guid(g)
+    # 扩展音源只做本地收藏/展示，不写回网易云红心
     if src and src != NETEASE_SOURCE:
         return ""
     sid = song_id_from_online_guid(g).split(":")[-1].strip()

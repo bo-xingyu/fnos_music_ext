@@ -1,4 +1,5 @@
 """版本号读取与 .env 安全合并（防覆盖/平滑升级/废弃键清理）单元测试。"""
+import os
 import re
 import stat
 from pathlib import Path
@@ -292,19 +293,30 @@ def test_ensure_prefix_defaults_does_not_invent_unrelated_keys():
 def test_render_env_includes_new_keys_comment():
     text = env_merge.render_env(
         env_merge.NEW_DEFAULTS,
-        comments={env_merge.NEW_DEFAULTS[0][0]: env_merge.NEW_KEYS_COMMENT},
+        comments={env_merge.NEW_KEYS_COMMENT and env_merge.NEW_DEFAULTS[0][0]: env_merge.NEW_KEYS_COMMENT},
     )
     assert env_merge.NEW_KEYS_COMMENT in text
     # render -> parse 往返，验证注释不干扰解析
     import tempfile
 
-    with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
+    # Windows 下 NamedTemporaryFile 默认 locale 编码（如 GBK），中文注释会写坏；
+    # 必须显式 UTF-8，与 parse_env_file / write_env_atomic 的约定一致。
+    fd, path = tempfile.mkstemp(suffix=".env")
+    os.close(fd)
+    with open(path, "w", encoding="utf-8") as f:
         f.write(text)
-        path = f.name
-    kv2, _ = env_merge.parse_env_file(Path(path))
-    m = dict(kv2)
-    assert m["FNMUSIC_PUSHPLUS_URL"] == env_merge.DEFAULT_PUSHPLUS_URL
-    assert m["FNMUSIC_FREE_ONLY_ON_LOGOUT"] == "true"
+    try:
+        kv2, _ = env_merge.parse_env_file(Path(path))
+        m = dict(kv2)
+        assert m["FNMUSIC_PUSHPLUS_URL"] == env_merge.DEFAULT_PUSHPLUS_URL
+        assert m["FNMUSIC_FREE_ONLY_ON_LOGOUT"] == "true"
+        assert m.get("FNMUSIC_EXTRA_ENABLED") == "true"
+        assert "qq" in m.get("FNMUSIC_EXTRA_SOURCES", "")
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def test_cli_merge_adds_new_and_drops_obsolete(tmp_path):

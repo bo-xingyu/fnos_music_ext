@@ -3,6 +3,66 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.10.0] - 2026-09-21
+
+**新增扩展在线音源：QQ音乐 / 酷狗音乐 / 酷我音乐 / 汽水音乐。**
+
+### 新增服务 `musicsource-service/`
+
+独立 FastAPI 包装层（默认端口 `8771`），与 musicbox 并列：
+
+| 音源 | 搜索 | 取直链 | 歌词 |
+|------|------|--------|------|
+| QQ音乐 | musicu.fcg SearchCgi | vkey.GetVkeyServer | fcg_query_lyric_new |
+| 酷狗音乐 | mobilecdn search/song | wwwapi play/getdata + trackercdn + m.kugou | krc / lyrics.kugou |
+| 酷我音乐 | search.kuwo.cn r.s + www API | antiserver convert_url + www playUrl | songinfoandlrc / newlyric |
+| 汽水音乐 | 可配置聚合网关 | 可配置聚合网关 | 可配置聚合网关 |
+
+HTTP 契约与 musicbox 类似：
+
+- `GET /healthz`
+- `GET /api/v1/sources`
+- `GET /api/v1/search?keyword=&limit=&source=all|qq|kugou|kuwo|qishui`
+- `GET /api/v1/song/{source}/{id}/url`
+- `GET /api/v1/song/{source}/{id}/lyric`
+- `GET /api/v1/song/{source}/{id}/detail`
+
+### 代理层集成（v2.10）
+
+- **搜索合并**：`/music/api/v1/search/track` 并发拉取网易云 + 扩展音源，按 `(title, artist)` 去重后并入飞牛列表。扩展音源 **不依赖网易云登录**，各自独立开关。
+- **在线播放**：guid 形如 `online:qq:<mid>` / `online:kugou:<hash>`，走与网易云相同的 CDN 中转 + 边播边存 + 直链短缓存。
+- **元数据 / 歌词 / 封面**：按音源路由到对应服务。
+- **健康检查** `/_ext/healthz` 新增 `extra_sources` 字段。
+- **收藏**：扩展音源仅做本地收藏展示，**不会**写回网易云红心。
+
+### 配置（`.env`）
+
+```
+FNMUSIC_MUSICSOURCE_URL=http://127.0.0.1:8771
+FNMUSIC_EXTRA_ENABLED=true
+FNMUSIC_EXTRA_SOURCES=qq,kugou,kuwo,qishui
+FNMUSIC_QQ_ENABLED=true
+FNMUSIC_KUGOU_ENABLED=true
+FNMUSIC_KUWO_ENABLED=true
+FNMUSIC_QISHUI_ENABLED=true
+FNMUSIC_EXTRA_SEARCH_LIMIT=20
+FNMUSIC_QISHUI_API_BASE=          # 汽水可选聚合网关
+FNMUSIC_EXTRA_API_BASE=           # 扩展音源可选统一网关
+```
+
+### 说明与限制
+
+- 扩展音源走各平台**公开/半公开 Web 接口**，覆盖免费/可匿名取链曲目；不破解、不绕过付费墙。
+- 汽水音乐 Web 接口变动频繁且常带签名，**推荐**配置 `FNMUSIC_QISHUI_API_BASE` 指向自建兼容网关（lx-music-api-server / Musicn 等）。
+- `docker-compose.yml` 已加入 `musicsource` 服务；host 模式可直接：
+  `cd musicsource-service && pip install -r requirements.txt && uvicorn app:app --host 127.0.0.1 --port 8771`
+- 网易云单源链路行为不变；关掉 `FNMUSIC_EXTRA_ENABLED` 即回到 v2.9 行为。
+
+### 测试
+
+- 新增 `proxy/tests/test_extra_items.py`、`proxy/tests/test_extra_sources.py`
+- 扩展音源映射 / 客户端 / healthz 字段覆盖
+
 ## [2.9.30] - 2026-09-16
 
 **修「歌没放完就被切歌」——302 直连失败时自动退回 NAS 中转。**

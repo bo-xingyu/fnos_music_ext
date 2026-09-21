@@ -1,18 +1,11 @@
-# 唯一在线音源：网易云 musicbox（https://github.com/darknessomi/musicbox）
+# 在线音源：
+#   - musicbox：网易云（https://github.com/darknessomi/musicbox）
+#   - musicsource：QQ / 酷狗 / 酷我 / 汽水（本仓库 musicsource-service，v2.10+）
 #
-# v2.0 起已移除 musicdl（酷我/咪咕聚合）与 lxmusic（洛雪解析）两个第三方免登录音源，
-# 所有在线曲目都来自扫码登录的那个私人网易云账号的权益。
+# 扩展音源服务默认启用；不需要时在 .env 里设 FNMUSIC_EXTRA_ENABLED=false，
+# 或把 EXTRA_SOURCES 置空。
 #
-# 基础镜像与 pip 源可由根目录 .env 覆盖（FNMUSIC_BASE_IMAGE / FNMUSIC_PIP_INDEX），
-# 其中基础镜像由 ensure_base_image.sh 自动探测维护：国内镜像优先直连（绕开 daemon
-# 加速器），官方源兜底（不修改系统 Docker 配置，仅本应用构建生效）。
-#
-# 默认只监听 127.0.0.1：音源服务的接口全部无鉴权（含发起扫码登录），对外暴露意味着
-# 同网段任何人都能扫自己的号顶掉你的登录。扫码统一走 ./netease_login.sh。
-# 如果你确实需要在别的设备上用浏览器打开二维码图片：
-#   1. 在 .env 里设 FNMUSIC_MUSICBOX_BIND=0.0.0.0
-#   2. 访问 http://<NAS_IP>:8770/api/v1/auth/login/qr.png
-# 并自行做好防火墙/内网隔离。
+# 默认只监听 127.0.0.1：音源接口无鉴权，对外暴露请自行防火墙隔离。
 services:
   musicbox:
     build:
@@ -30,6 +23,32 @@ services:
     environment:
       # 未登录时是否降级为只播免费曲目（与代理层保持同一份语义）
       - FNMUSIC_FREE_ONLY_ON_LOGOUT=${FNMUSIC_FREE_ONLY_ON_LOGOUT:-true}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/healthz\")' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  musicsource:
+    build:
+      context: ./musicsource-service
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${FNMUSIC_BASE_IMAGE:-python:3.13-slim}
+        PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    container_name: fnmusic-musicsource
+    ports:
+      - "${FNMUSIC_MUSICSOURCE_BIND:-127.0.0.1}:8771:8000"
+    environment:
+      - FNMUSIC_EXTRA_SOURCES=${FNMUSIC_EXTRA_SOURCES:-qq,kugou,kuwo,qishui}
+      - FNMUSIC_QQ_ENABLED=${FNMUSIC_QQ_ENABLED:-true}
+      - FNMUSIC_KUGOU_ENABLED=${FNMUSIC_KUGOU_ENABLED:-true}
+      - FNMUSIC_KUWO_ENABLED=${FNMUSIC_KUWO_ENABLED:-true}
+      - FNMUSIC_QISHUI_ENABLED=${FNMUSIC_QISHUI_ENABLED:-true}
+      - FNMUSIC_QISHUI_API_BASE=${FNMUSIC_QISHUI_API_BASE:-}
+      - FNMUSIC_EXTRA_API_BASE=${FNMUSIC_EXTRA_API_BASE:-}
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/healthz\")' || exit 1"]
