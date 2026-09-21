@@ -3,6 +3,17 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.10.4] - 2026-09-21
+
+**扩展音源扫码登录界面对齐网易云。**
+
+- 管理页「扩展音源扫码登录」：选择 QQ / 酷狗 / 酷我 / 汽水 → **生成二维码** → 手机 App 扫码确认，与网易云卡片交互一致
+- QQ：ptqrshow / ptqrlogin 完整链路，成功后自动落 Cookie
+- 酷狗 / 酷我：扫码轮询 + 多套状态码兼容；失败提示改用 Cookie
+- 汽水：无稳定扫码接口，界面引导 Cookie / 聚合网关
+- 步骤文案、过期提示、登录态列表按音源展示
+- `musicsource-service` 增加 `qrcode` + `pillow`，任意内容可生成本地二维码 PNG
+
 ## [2.10.3] - 2026-09-21
 
 **修复启动失败：`env: '.venv-musicbox/bin/uvicorn': Permission denied`。**

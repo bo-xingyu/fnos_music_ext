@@ -231,13 +231,22 @@ def auth_status(source: str = Path(...)):
 @app.get("/api/v1/auth/{source}/help")
 def auth_help(source: str = Path(...)):
     s = source.strip().lower()
+    try:
+        from sources import login as login_mod
+        steps = login_mod.qr_steps(s)
+        help_txt = login_mod.help_text(s)
+        label = login_mod.SOURCE_LABELS.get(s, s)
+    except Exception:  # noqa: BLE001
+        steps, help_txt, label = [], "", s
     return {
         "ok": True,
         "data": {
             "source": s,
-            "cookie_help": login_mod.help_text(s),
-            "supports_qr": s in ("kugou", "kuwo", "qq"),
-            "qr_note": "扫码接口各平台变动频繁，失败时请改用 Cookie。",
+            "label": label,
+            "cookie_help": help_txt,
+            "supports_qr": s in ("qq", "kugou", "kuwo"),
+            "steps": steps,
+            "qr_note": "扫码接口各平台会变；失败时请改用 Cookie。",
         },
     }
 

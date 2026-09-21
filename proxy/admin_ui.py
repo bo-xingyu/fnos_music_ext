@@ -1952,31 +1952,50 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
   </div>
 
   <div class="card">
-    <h2>扩展音源登录（QQ / 酷狗 / 酷我 / 汽水）</h2>
+    <h2>扩展音源扫码登录（QQ / 酷狗 / 酷我 / 汽水）</h2>
     <div class="sub" style="margin:-6px 0 12px">
-      内置扩展音源走公开接口可搜免费曲；登录 Cookie 后可解锁你自己的会员曲目。
-      粘贴浏览器 Cookie 即可（F12 → Network → 复制 Cookie 请求头）。
+      与网易云同款扫码登录：选音源 → 生成二维码 → 手机 App 扫码确认。
+      扫码失败时可在下方粘贴 Cookie。登录后可解锁你自己的会员曲目。
     </div>
-    <div id="extraAuthList" class="sub">加载中…</div>
-    <div class="acts" style="margin-top:10px">
-      <select id="extraSrcSel" class="btn">
-        <option value="qq">QQ音乐</option>
-        <option value="kugou">酷狗音乐</option>
-        <option value="kuwo">酷我音乐</option>
-        <option value="qishui">汽水音乐</option>
-      </select>
-      <input id="extraCookie" class="btn" type="password" placeholder="粘贴 Cookie（或 Token）" style="min-width:220px;flex:1">
-      <button class="btn pri" id="extraCookieSave">保存登录</button>
-      <button class="btn" id="extraLogout">退出</button>
+    <div class="acts" style="margin-top:0;gap:8px">
+      <button class="btn pri extra-src-btn" data-esrc="qq" type="button">QQ音乐</button>
+      <button class="btn extra-src-btn" data-esrc="kugou" type="button">酷狗音乐</button>
+      <button class="btn extra-src-btn" data-esrc="kuwo" type="button">酷我音乐</button>
+      <button class="btn extra-src-btn" data-esrc="qishui" type="button">汽水音乐</button>
     </div>
-    <div class="sub" id="extraAuthMsg" style="margin:8px 0 0"></div>
-    <details style="margin-top:10px">
-      <summary style="cursor:pointer">Cookie 怎么拿？</summary>
-      <ol class="steps" style="margin:8px 0 0;padding-left:18px">
-        <li>浏览器打开并登录对应音乐网站（y.qq.com / kugou.com / kuwo.cn）</li>
-        <li>F12 → Network → 刷新 → 点任一请求 → Request Headers → 复制整段 <code>Cookie</code></li>
-        <li>粘贴到上方输入框，选对应音源后点「保存登录」</li>
-      </ol>
+    <div class="acts" style="margin-top:12px">
+      <button class="btn pri" id="extraQrBtn" type="button">生成二维码</button>
+      <button class="btn hide" id="extraQrRefresh" type="button">换一张</button>
+      <span id="extraQrState" class="sub" style="margin:0"></span>
+    </div>
+    <div class="qr hide" id="extraQrBox">
+      <img id="extraQrImg" alt="扩展音源登录二维码">
+      <div class="st">
+        <ol class="steps" id="extraQrSteps">
+          <li>打开对应音乐 App</li>
+          <li>使用扫一扫</li>
+          <li>扫描左侧二维码并在手机上确认</li>
+        </ol>
+        <p class="sub" style="margin:12px 0 0" id="extraQrTip">二维码过期会自动提示，可点「换一张」。</p>
+      </div>
+    </div>
+
+    <div id="extraAuthList" class="sub" style="margin-top:12px">登录状态加载中…</div>
+    <details style="margin-top:10px" open>
+      <summary style="cursor:pointer">Cookie 登录（扫码失败时用）</summary>
+      <div class="acts" style="margin-top:10px">
+        <select id="extraSrcSel" class="btn">
+          <option value="qq">QQ音乐</option>
+          <option value="kugou">酷狗音乐</option>
+          <option value="kuwo">酷我音乐</option>
+          <option value="qishui">汽水音乐</option>
+        </select>
+        <input id="extraCookie" class="btn" type="password" placeholder="粘贴 Cookie（或 Token）" style="min-width:200px;flex:1">
+        <button class="btn pri" id="extraCookieSave" type="button">保存登录</button>
+        <button class="btn" id="extraLogout" type="button">退出</button>
+      </div>
+      <div class="sub" id="extraAuthMsg" style="margin:8px 0 0"></div>
+      <div class="sub" id="extraCookieHelp" style="margin:8px 0 0"></div>
     </details>
   </div>
 
@@ -2464,8 +2483,110 @@ function loadCfg(){
   });
 }
 
-// ---- 扩展音源登录 / 自定义音源 ----
-function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]})}
+// ---- 扩展音源登录（扫码对齐网易云）/ 自定义音源 ----
+var EXTRA_QR_UNIKEY="";
+var EXTRA_QR_TIMER=null;
+var EXTRA_QR_EXPIRE=null;
+var EXTRA_CUR_SRC="qq";
+var EXTRA_STEPS={
+  qq:["打开手机上的 <b>QQ</b> 或 <b>QQ 音乐 App</b>","使用<b>扫一扫</b>扫描左侧二维码","在手机上<b>确认登录</b>"],
+  kugou:["打开手机上的 <b>酷狗音乐 App</b>","首页或我的 → <b>扫一扫</b>","扫描左侧二维码并在手机上<b>确认登录</b>"],
+  kuwo:["打开手机上的 <b>酷我音乐 App</b>","使用<b>扫一扫</b>扫描左侧二维码","在手机上确认登录；若无扫码请改用 Cookie"],
+  qishui:["汽水暂无稳定扫码接口","请展开下方 <b>Cookie 登录</b>","或在配置中填写聚合网关"]
+};
+var EXTRA_COOKIE_HINT={
+  qq:"浏览器登录 y.qq.com → F12 → Network → 复制 Cookie（含 qqmusic_key / qm_keyst / uin）",
+  kugou:"浏览器登录 www.kugou.com → F12 复制 Cookie（含 kg_mid / kg_dfid 等）",
+  kuwo:"浏览器登录 www.kuwo.cn → F12 复制 Cookie（含 kw_token / Hm_token）",
+  qishui:"从汽水抓包 Cookie/token，或配置 FNMUSIC_QISHUI_API_BASE 聚合网关"
+};
+function extraQrState(txt,cls){
+  var e=$("#extraQrState"); if(!e) return;
+  e.textContent=txt||"";
+  e.className="sub"+(cls?" "+cls:"");
+  e.style.margin="0";
+}
+function extraStopPoll(){
+  if(EXTRA_QR_TIMER){clearInterval(EXTRA_QR_TIMER);EXTRA_QR_TIMER=null}
+  if(EXTRA_QR_EXPIRE){clearTimeout(EXTRA_QR_EXPIRE);EXTRA_QR_EXPIRE=null}
+}
+function extraRenderSteps(src, tip){
+  var ol=$("#extraQrSteps");
+  if(ol){
+    var steps=EXTRA_STEPS[src]||EXTRA_STEPS.qq;
+    ol.innerHTML=steps.map(function(s){return "<li>"+s+"</li>"}).join("");
+  }
+  var t=$("#extraQrTip");
+  if(t) t.textContent=tip||"二维码过期会自动提示，可点「换一张」。";
+}
+function extraSetSrc(src){
+  EXTRA_CUR_SRC=src||"qq";
+  Array.prototype.forEach.call(document.querySelectorAll(".extra-src-btn"),function(b){
+    var on=b.getAttribute("data-esrc")===EXTRA_CUR_SRC;
+    b.className=(on?"btn pri":"btn")+" extra-src-btn";
+  });
+  var sel=$("#extraSrcSel"); if(sel) sel.value=EXTRA_CUR_SRC;
+  var help=$("#extraCookieHelp");
+  if(help) help.textContent="Cookie 获取："+(EXTRA_COOKIE_HINT[EXTRA_CUR_SRC]||"");
+  extraRenderSteps(EXTRA_CUR_SRC);
+  extraStopPoll();
+  EXTRA_QR_UNIKEY="";
+  var box=$("#extraQrBox"); if(box) box.classList.add("hide");
+  var ref=$("#extraQrRefresh"); if(ref) ref.classList.add("hide");
+  extraQrState("已选择 "+(EXTRA_QR_LABELS[EXTRA_CUR_SRC]||EXTRA_CUR_SRC)+"，点「生成二维码」");
+}
+var EXTRA_QR_LABELS={qq:"QQ音乐",kugou:"酷狗音乐",kuwo:"酷我音乐",qishui:"汽水音乐"};
+function extraNewQr(){
+  extraStopPoll();
+  $("#extraQrRefresh").classList.add("hide");
+  extraQrState("正在申请 "+(EXTRA_QR_LABELS[EXTRA_CUR_SRC]||EXTRA_CUR_SRC)+" 二维码…");
+  api("api/extra/auth/"+EXTRA_CUR_SRC+"/qr",{method:"POST",body:{}}).then(function(j){
+    if(!j.ok){
+      extraQrState("失败："+(j.error||("HTTP "+(j._status||"?"))),"err");
+      extraRenderSteps(EXTRA_CUR_SRC, j.help||EXTRA_COOKIE_HINT[EXTRA_CUR_SRC]||"请改用 Cookie 登录");
+      $("#extraQrBox").classList.remove("hide");
+      var img=$("#extraQrImg"); if(img) img.removeAttribute("src");
+      return;
+    }
+    EXTRA_QR_UNIKEY=j.unikey||"";
+    $("#extraQrBox").classList.remove("hide");
+    $("#extraQrRefresh").classList.remove("hide");
+    var src=j.qr_png||j.qr_content||"";
+    if(src){ $("#extraQrImg").src=src.indexOf("data:")===0||src.indexOf("http")===0?src:url(src); }
+    extraRenderSteps(EXTRA_CUR_SRC, j.tip||j.cookie_help||"请用对应 App 扫码登录");
+    extraQrState("等待扫码…");
+    if(j.mode==="cookie_fallback"){
+      extraQrState("该音源请用 Cookie 登录","warn");
+    }
+    EXTRA_QR_TIMER=setInterval(function(){extraPollQr()},2500);
+    EXTRA_QR_EXPIRE=setTimeout(function(){extraQrState("二维码可能已过期，可点「换一张」","warn")},180000);
+  });
+}
+function extraPollQr(){
+  if(!EXTRA_QR_UNIKEY) return;
+  var path="api/extra/auth/qr/check?unikey="+encodeURIComponent(EXTRA_QR_UNIKEY)+"&source="+encodeURIComponent(EXTRA_CUR_SRC);
+  api(path).then(function(j){
+    if(!j.ok) return;
+    var code=j.code;
+    if(code===802){ extraQrState("已扫码，请在手机上确认登录"); }
+    else if(code===803){
+      extraStopPoll(); EXTRA_QR_UNIKEY="";
+      extraQrState("登录成功："+(j.nickname||j.label||EXTRA_CUR_SRC),"");
+      $("#extraQrBox").classList.add("hide");
+      $("#extraQrRefresh").classList.add("hide");
+      loadExtraAuth();
+      var msg=$("#extraAuthMsg"); if(msg) msg.textContent="扫码登录成功";
+    }
+    else if(code===800){
+      extraStopPoll();
+      extraQrState("二维码已过期，请点「换一张」","warn");
+      extraRenderSteps(EXTRA_CUR_SRC, j.help||EXTRA_COOKIE_HINT[EXTRA_CUR_SRC]||"");
+    }
+    else if(code===801){
+      extraQrState(j.msg||"等待扫码…");
+    }
+  });
+}
 function loadExtraAuth(){
   api("api/extra/auth").then(function(j){
     var box=$("#extraAuthList");
@@ -2524,23 +2645,38 @@ function loadCustom(){
     });
   });
 }
+Array.prototype.forEach.call(document.querySelectorAll(".extra-src-btn"),function(b){
+  b.onclick=function(){ extraSetSrc(b.getAttribute("data-esrc")) };
+});
+if($("#extraQrBtn")){
+  extraSetSrc("qq");
+  $("#extraQrBtn").onclick=function(){ extraNewQr() };
+  $("#extraQrRefresh").onclick=function(){ extraNewQr() };
+}
+if($("#extraSrcSel")){
+  $("#extraSrcSel").onchange=function(){
+    extraSetSrc(this.value);
+  };
+}
 if($("#extraCookieSave")){
   $("#extraCookieSave").onclick=function(){
     var src=$("#extraSrcSel").value;
     var cookie=$("#extraCookie").value.trim();
     if(!cookie){ $("#extraAuthMsg").textContent="请先粘贴 Cookie"; return }
     api("api/extra/auth/"+src+"/cookie",{method:"POST",body:{cookie:cookie}}).then(function(j){
-      $("#extraAuthMsg").textContent = j.ok ? ("已保存 "+src+" 登录态") : ("失败："+(j.error||""));
+      $("#extraAuthMsg").textContent = j.ok ? ("已保存 "+(EXTRA_QR_LABELS[src]||src)+" 登录态") : ("失败："+(j.error||""));
       if(j.ok){ $("#extraCookie").value=""; loadExtraAuth(); }
     });
   };
   $("#extraLogout").onclick=function(){
     var src=$("#extraSrcSel").value;
     api("api/extra/auth/"+src+"/logout",{method:"POST",body:{}}).then(function(j){
-      $("#extraAuthMsg").textContent = j.ok ? ("已退出 "+src) : ("失败："+(j.error||""));
+      $("#extraAuthMsg").textContent = j.ok ? ("已退出 "+(EXTRA_QR_LABELS[src]||src)) : ("失败："+(j.error||""));
       loadExtraAuth();
     });
   };
+  var help=$("#extraCookieHelp");
+  if(help) help.textContent="Cookie 获取："+EXTRA_COOKIE_HINT.qq;
   loadExtraAuth();
 }
 if($("#customAdd")){
