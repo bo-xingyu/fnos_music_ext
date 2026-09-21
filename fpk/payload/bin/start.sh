@@ -18,32 +18,62 @@ start_musicbox() {
         return 0
     fi
     local venv="${RUN_DIR}/.venv-musicbox"
-    if [ ! -x "${venv}/bin/uvicorn" ]; then
+    # 启动前修权限：root 安装后包用户常对 venv 无执行位（Permission denied）
+    lib_fix_runtime_perms
+    local spawn_as_root=0
+    if [ ! -f "${venv}/bin/uvicorn" ]; then
         lib_fail "未找到 ${venv}/bin/uvicorn，音源服务无法启动。请在应用中心重新安装本应用以重建虚拟环境。"
         return 1
     fi
+    if ! lib_venv_exec_ok "${venv}"; then
+        lib_warn "包用户无法执行 ${venv}/bin/uvicorn（已尝试 chmod/chown），改以 root 启动 musicbox"
+        spawn_as_root=1
+    fi
     local bind
     bind="$(lib_read_env_value FNMUSIC_MUSICBOX_BIND "0.0.0.0")"
-    lib_log "启动 musicbox 音源服务 ${bind}:${MUSICBOX_PORT}（降权到 ${TRIM_USERNAME:-当前用户}）"
+    lib_log "启动 musicbox 音源服务 ${bind}:${MUSICBOX_PORT}（$([ "${spawn_as_root}" -eq 1 ] && echo root || echo "降权到 ${TRIM_USERNAME:-当前用户}")）"
 
     # 音源服务不需要 root：只监听 TCP 端口、读写自己数据目录，
     # 按官方「长期运行并对外提供访问的进程应尽可能以非 root 运行」要求降权。
     # PID 由子进程自己写入 pidfile（见 lib_spawn 说明），确保 stop 能杀到真身。
-    lib_spawn "${MUSICBOX_PID}" "${MUSICBOX_LOG}" env \
-        PATH="${PYTHON_BIN}:${PATH}" \
-        PYTHONUNBUFFERED=1 \
-        XDG_DATA_HOME="${MUSICBOX_DATA_DIR}" \
-        XDG_CACHE_HOME="${MUSICBOX_DATA_DIR}/cache" \
-        XDG_CONFIG_HOME="${MUSICBOX_DATA_DIR}/config" \
-        FNMUSIC_FREE_ONLY_ON_LOGOUT="$(lib_read_env_value FNMUSIC_FREE_ONLY_ON_LOGOUT true)" \
-        FNMUSIC_LOG_QUIET="$(lib_read_env_value FNMUSIC_LOG_QUIET true)" \
-        "${venv}/bin/uvicorn" app:app \
-            --app-dir "${RUN_DIR}/musicbox-service" \
-            --host "${bind}" \
-            --port "${MUSICBOX_PORT}"
+    if [ "${spawn_as_root}" -eq 1 ]; then
+        lib_spawn "${MUSICBOX_PID}" "${MUSICBOX_LOG}" --as-root env \
+            PATH="${PYTHON_BIN}:${PATH}" \
+            PYTHONUNBUFFERED=1 \
+            XDG_DATA_HOME="${MUSICBOX_DATA_DIR}" \
+            XDG_CACHE_HOME="${MUSICBOX_DATA_DIR}/cache" \
+            XDG_CONFIG_HOME="${MUSICBOX_DATA_DIR}/config" \
+            FNMUSIC_FREE_ONLY_ON_LOGOUT="$(lib_read_env_value FNMUSIC_FREE_ONLY_ON_LOGOUT true)" \
+            FNMUSIC_LOG_QUIET="$(lib_read_env_value FNMUSIC_LOG_QUIET true)" \
+            "${venv}/bin/uvicorn" app:app \
+                --app-dir "${RUN_DIR}/musicbox-service" \
+                --host "${bind}" \
+                --port "${MUSICBOX_PORT}"
+    else
+        lib_spawn "${MUSICBOX_PID}" "${MUSICBOX_LOG}" env \
+            PATH="${PYTHON_BIN}:${PATH}" \
+            PYTHONUNBUFFERED=1 \
+            XDG_DATA_HOME="${MUSICBOX_DATA_DIR}" \
+            XDG_CACHE_HOME="${MUSICBOX_DATA_DIR}/cache" \
+            XDG_CONFIG_HOME="${MUSICBOX_DATA_DIR}/config" \
+            FNMUSIC_FREE_ONLY_ON_LOGOUT="$(lib_read_env_value FNMUSIC_FREE_ONLY_ON_LOGOUT true)" \
+            FNMUSIC_LOG_QUIET="$(lib_read_env_value FNMUSIC_LOG_QUIET true)" \
+            "${venv}/bin/uvicorn" app:app \
+                --app-dir "${RUN_DIR}/musicbox-service" \
+                --host "${bind}" \
+                --port "${MUSICBOX_PORT}"
+    fi
 
     if ! lib_wait_pidfile "${MUSICBOX_PID}"; then
         lib_fail "musicbox 启动后未能写入 PID 或立刻退出。日志: ${MUSICBOX_LOG}"
+        # 把权限线索写进用户可见日志
+        if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+            {
+                echo "排障：ls -l ${venv}/bin/uvicorn"
+                ls -l "${venv}/bin/uvicorn" 2>&1 || true
+                echo "id=$(id -un) TRIM_USERNAME=${TRIM_USERNAME:-}"
+            } >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+        fi
         tail -n 20 "${MUSICBOX_LOG}" >> "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null
         return 1
     fi
@@ -82,14 +112,28 @@ start_musicsource() {
         return 0
     fi
     local venv="${RUN_DIR}/.venv-musicsource"
-    if [ ! -x "${venv}/bin/uvicorn" ]; then
+    if [ ! -f "${venv}/bin/uvicorn" ]; then
         lib_warn "未找到 ${venv}/bin/uvicorn，扩展音源暂不可用（网易云音源不受影响）"
         return 0
     fi
+    local ms_root=0
+    if ! lib_venv_exec_ok "${venv}"; then
+        lib_fix_venv_perms "${venv}"
+        if ! lib_venv_exec_ok "${venv}"; then
+            lib_warn "包用户无法执行 musicsource uvicorn，改以 root 启动扩展音源"
+            ms_root=1
+        fi
+    fi
     local bind
     bind="$(lib_read_env_value FNMUSIC_MUSICSOURCE_BIND 127.0.0.1)"
-    lib_log "启动 musicsource 扩展音源 ${bind}:${MUSICSOURCE_PORT}（降权）"
-    lib_spawn "${MUSICSOURCE_PID}" "${MUSICSOURCE_LOG}" env \
+    lib_log "启动 musicsource 扩展音源 ${bind}:${MUSICSOURCE_PORT}"
+    local _ms_spawn_args=(
+        "${MUSICSOURCE_PID}" "${MUSICSOURCE_LOG}"
+    )
+    if [ "${ms_root}" -eq 1 ]; then
+        _ms_spawn_args+=(--as-root)
+    fi
+    lib_spawn "${_ms_spawn_args[@]}" env \
         PATH="${PYTHON_BIN}:${PATH}" \
         PYTHONUNBUFFERED=1 \
         FNMUSIC_MUSICSOURCE_DATA="${MUSICSOURCE_DATA_DIR}" \
@@ -311,6 +355,8 @@ main() {
 
     # 启动前轮转一次日志：此时还没有进程持有日志 fd，rename 是安全的
     lib_rotate_logs
+    # 统一修运行时权限（venv 可执行 / 代码可读 / 数据目录属主）
+    lib_fix_runtime_perms
 
     start_musicbox || return 1
     # 扩展音源失败不阻断：网易云与本地曲库仍可工作

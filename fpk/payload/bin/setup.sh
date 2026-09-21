@@ -360,6 +360,9 @@ build_venvs() {
             }
         }
     done
+    # root 建完 venv 后必须把可执行位与属主修好，否则包用户启动时
+    # 报 Permission denied（真机 /vol3/@appdata/.../.venv-musicbox/bin/uvicorn）
+    lib_fix_runtime_perms
     lib_log "虚拟环境就绪"
     return 0
 }
@@ -369,6 +372,7 @@ main() {
     stage_code || return 1
     write_env_file || return 1
     build_venvs || return 1
+    lib_fix_runtime_perms
     lib_log "=== setup 完成 ==="
     return 0
 }

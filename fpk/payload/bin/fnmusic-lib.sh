@@ -128,6 +128,90 @@ MUSICSOURCE_URL="http://127.0.0.1:${MUSICSOURCE_PORT}"
 # 扩展音源登录凭据与自定义音源配置（跨升级持久，放在 RUN_DIR 之外）
 MUSICSOURCE_DATA_DIR="${PKGVAR}/musicsource-data"
 
+
+# ------------------------------------------------------------------------------
+# 运行时权限：root 安装建 venv 后，包用户必须能读代码、能执行 uvicorn
+# 真机故障：env: '/vol3/@appdata/fnmusicext/app/.venv-musicbox/bin/uvicorn': Permission denied
+# ------------------------------------------------------------------------------
+
+lib_pkg_user() {
+    echo "${TRIM_USERNAME:-}"
+}
+
+lib_chown_to_pkg() {
+    # 尽力 chown；用户不存在或非 root 时静默跳过
+    local target
+    target="$(lib_pkg_user)"
+    [ -n "${target}" ] || return 0
+    id "${target}" >/dev/null 2>&1 || return 0
+    local grp="${TRIM_GROUPNAME:-${target}}"
+    chown -R "${target}:${grp}" "$@" 2>/dev/null || true
+}
+
+lib_fix_venv_perms() {
+    local venv="$1"
+    [ -d "${venv}" ] || return 0
+    chmod -R a+rX "${venv}" 2>/dev/null || true
+    if [ -d "${venv}/bin" ]; then
+        find "${venv}/bin" -type f \( \
+            -name 'python*' -o -name 'uvicorn' -o -name 'pip*' \
+            -o -name 'activate*' \) -exec chmod a+x {} + 2>/dev/null || true
+        chmod a+x "${venv}/bin"/* 2>/dev/null || true
+    fi
+    lib_chown_to_pkg "${venv}"
+}
+
+lib_venv_exec_ok() {
+    # 包用户（或当前用户）能否执行 venv/bin/uvicorn
+    local venv="$1" bin target
+    bin="${venv}/bin/uvicorn"
+    [ -f "${bin}" ] || return 1
+    lib_fix_venv_perms "${venv}"
+    target="$(lib_pkg_user)"
+    if [ -z "${target}" ] || [ "$(id -un)" = "${target}" ]; then
+        [ -x "${bin}" ]
+        return $?
+    fi
+    if [ "$(id -un)" != "root" ]; then
+        [ -x "${bin}" ]
+        return $?
+    fi
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -u "${target}" -- test -x "${bin}" 2>/dev/null && return 0
+    fi
+    if command -v su >/dev/null 2>&1; then
+        su -s /bin/bash "${target}" -c "test -x $(printf '%q' "${bin}")" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+lib_fix_runtime_perms() {
+    # 安装/启动前统一整理：目录可穿越、venv 可执行、数据目录归包用户
+    chmod 755 "${PKGVAR}" "${RUN_DIR}" "${LOG_DIR}" 2>/dev/null || true
+    chmod 755 "${RUN_DIR}/proxy" "${RUN_DIR}/musicbox-service" \
+              "${RUN_DIR}/musicsource-service" "${RUN_DIR}/bin" 2>/dev/null || true
+    chmod -R a+rX "${RUN_DIR}/proxy" "${RUN_DIR}/musicbox-service" \
+                  "${RUN_DIR}/musicsource-service" "${RUN_DIR}/bin" 2>/dev/null || true
+    chmod a+x "${RUN_DIR}/restore.sh" "${RUN_DIR}/netease_login.sh" \
+              "${RUN_DIR}/proxy/run_proxy.sh" "${RUN_DIR}"/bin/*.sh 2>/dev/null || true
+    for v in "${RUN_DIR}"/.venv-proxy "${RUN_DIR}"/.venv-musicbox "${RUN_DIR}"/.venv-musicsource; do
+        lib_fix_venv_perms "${v}"
+    done
+    # 登录凭证与自定义音源数据
+    mkdir -p "${MUSICBOX_DATA_DIR}" "${MUSICSOURCE_DATA_DIR}/auth" 2>/dev/null || true
+    chmod 700 "${MUSICBOX_DATA_DIR}" "${MUSICSOURCE_DATA_DIR}" 2>/dev/null || true
+    lib_chown_to_pkg "${MUSICBOX_DATA_DIR}" "${MUSICSOURCE_DATA_DIR}"
+    # .env 只给属主
+    if [ -f "${ENV_FILE}" ]; then
+        chmod 600 "${ENV_FILE}" 2>/dev/null || true
+        lib_chown_to_pkg "${ENV_FILE}"
+    fi
+    # pid/log 目录包用户可写（降权进程要写 pid/log）
+    mkdir -p "${PKGVAR}" "${LOG_DIR}" 2>/dev/null || true
+    chmod 777 "${PKGVAR}" "${LOG_DIR}" 2>/dev/null || chmod 755 "${PKGVAR}" "${LOG_DIR}" 2>/dev/null || true
+    return 0
+}
+
 lib_log() {
     mkdir -p "${LOG_DIR}" 2>/dev/null
     echo "$(date '+%Y-%m-%d %H:%M:%S') [$$] $*" >> "${INFO_LOG}" 2>/dev/null

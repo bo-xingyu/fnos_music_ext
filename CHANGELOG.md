@@ -3,6 +3,22 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.10.3] - 2026-09-21
+
+**修复启动失败：`env: '.venv-musicbox/bin/uvicorn': Permission denied`。**
+
+真机现象：musicbox 曾正常响应 `/api/v1/song/*/info`，重启后报  
+`musicbox 启动后未能写入 PID 或立刻退出`，日志尾部为 uvicorn Permission denied。
+
+原因：生命周期脚本以 root 创建 venv，再 `runuser` 降到包用户启动；  
+包用户对 `.venv-*/bin/uvicorn` 或上级目录无执行/穿越权限。
+
+修复：
+- `lib_fix_runtime_perms`：统一 chmod/chown RUN_DIR、三个 venv、musicbox-data、musicsource-data
+- setup.sh 建完 venv / start.sh 启动前都调用
+- 若包用户仍无法执行 uvicorn，musicbox/musicsource 自动改以 root 启动并写日志
+- 启动失败时把 `ls -l uvicorn` 线索写进用户可见日志
+
 ## [2.10.2] - 2026-09-21
 
 **修复 Windows 打包导致飞牛安装失败（CRLF）。**
