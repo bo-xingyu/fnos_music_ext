@@ -125,6 +125,7 @@ main() {
     verify_official
     # 3. 停音源服务
     lib_stop_pid "musicbox" "${MUSICBOX_PID}" 10
+    lib_stop_pid "musicsource" "${MUSICSOURCE_PID}" 10
     lib_log "=== stop 完成 ==="
     return 0
 }

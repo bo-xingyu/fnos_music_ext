@@ -62,6 +62,65 @@ start_musicbox() {
     return 1
 }
 
+start_musicsource() {
+    # 扩展音源（QQ/酷狗/酷我/汽水）。开关关闭或未打包装载荷时静默跳过。
+    local extra_on
+    extra_on="$(lib_read_env_value FNMUSIC_EXTRA_ENABLED true)"
+    case "$(echo "${extra_on}" | tr '[:upper:]' '[:lower:]')" in
+        true|1|yes|on) ;;
+        *)
+            lib_log "扩展音源已关闭（FNMUSIC_EXTRA_ENABLED=${extra_on}），跳过 musicsource"
+            return 0
+            ;;
+    esac
+    if [ ! -d "${RUN_DIR}/musicsource-service" ]; then
+        lib_log "未找到 musicsource-service 载荷，跳过扩展音源"
+        return 0
+    fi
+    if lib_pid_alive "${MUSICSOURCE_PID}"; then
+        lib_log "musicsource 已在运行 (pid=$(head -n 1 "${MUSICSOURCE_PID}"))"
+        return 0
+    fi
+    local venv="${RUN_DIR}/.venv-musicsource"
+    if [ ! -x "${venv}/bin/uvicorn" ]; then
+        lib_warn "未找到 ${venv}/bin/uvicorn，扩展音源暂不可用（网易云音源不受影响）"
+        return 0
+    fi
+    local bind
+    bind="$(lib_read_env_value FNMUSIC_MUSICSOURCE_BIND 127.0.0.1)"
+    lib_log "启动 musicsource 扩展音源 ${bind}:${MUSICSOURCE_PORT}（降权）"
+    lib_spawn "${MUSICSOURCE_PID}" "${MUSICSOURCE_LOG}" env \
+        PATH="${PYTHON_BIN}:${PATH}" \
+        PYTHONUNBUFFERED=1 \
+        FNMUSIC_EXTRA_SOURCES="$(lib_read_env_value FNMUSIC_EXTRA_SOURCES qq,kugou,kuwo,qishui)" \
+        FNMUSIC_QQ_ENABLED="$(lib_read_env_value FNMUSIC_QQ_ENABLED true)" \
+        FNMUSIC_KUGOU_ENABLED="$(lib_read_env_value FNMUSIC_KUGOU_ENABLED true)" \
+        FNMUSIC_KUWO_ENABLED="$(lib_read_env_value FNMUSIC_KUWO_ENABLED true)" \
+        FNMUSIC_QISHUI_ENABLED="$(lib_read_env_value FNMUSIC_QISHUI_ENABLED true)" \
+        FNMUSIC_QISHUI_API_BASE="$(lib_read_env_value FNMUSIC_QISHUI_API_BASE "")" \
+        FNMUSIC_EXTRA_API_BASE="$(lib_read_env_value FNMUSIC_EXTRA_API_BASE "")" \
+        FNMUSIC_LOG_QUIET="$(lib_read_env_value FNMUSIC_LOG_QUIET true)" \
+        "${venv}/bin/uvicorn" app:app \
+            --app-dir "${RUN_DIR}/musicsource-service" \
+            --host "${bind}" \
+            --port "${MUSICSOURCE_PORT}"
+
+    if ! lib_wait_pidfile "${MUSICSOURCE_PID}"; then
+        lib_warn "musicsource 启动失败，扩展音源暂不可用。日志: ${MUSICSOURCE_LOG}"
+        return 0
+    fi
+    if lib_wait_http "${MUSICSOURCE_URL}/healthz" 20 1; then
+        lib_log "musicsource 就绪 ${MUSICSOURCE_URL}/healthz (pid=$(head -n 1 "${MUSICSOURCE_PID}"))"
+        return 0
+    fi
+    if lib_pid_alive "${MUSICSOURCE_PID}"; then
+        lib_warn "musicsource 20s 内未通过 healthz，仍在运行中。日志: ${MUSICSOURCE_LOG}"
+        return 0
+    fi
+    lib_warn "musicsource 启动后立刻退出。日志: ${MUSICSOURCE_LOG}"
+    return 0
+}
+
 start_proxy() {
     if lib_pid_alive "${PROXY_PID}" && lib_probe_proxy; then
         lib_log "代理已在运行且接管正常 (pid=$(head -n 1 "${PROXY_PID}"))"
@@ -253,9 +312,12 @@ main() {
     lib_rotate_logs
 
     start_musicbox || return 1
+    # 扩展音源失败不阻断：网易云与本地曲库仍可工作
+    start_musicsource
     start_proxy || {
         # 代理起不来就别留着音源服务空转
         lib_stop_pid "musicbox" "${MUSICBOX_PID}" 10
+        lib_stop_pid "musicsource" "${MUSICSOURCE_PID}" 10
         return 1
     }
     # 管理页面失败不致命：主功能（在线播放）不依赖它

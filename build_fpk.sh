@@ -197,6 +197,9 @@ sync_into_app "musicbox-service/runner.py"
 sync_into_app "musicbox-service/netease_ext.py"
 sync_into_app "musicbox-service/requirements.txt"
 sync_into_app "musicbox-service/.dockerignore"
+sync_into_app "musicsource-service/app.py"
+sync_into_app "musicsource-service/requirements.txt"
+sync_into_app "musicsource-service/sources"
 sync_into_app "restore.sh"
 sync_into_app "netease_login.sh"
 sync_into_app "VERSION"
@@ -340,6 +343,13 @@ for required in config/privilege config/resource \
                 proxy/admin_ui.py proxy/loghouse.py \
                 proxy/recommend.py proxy/env_merge.py proxy/trimgw.py proxy/local_files.py proxy/prefetch.py proxy/run_proxy.sh proxy/requirements.txt \
                 musicbox-service/app.py musicbox-service/requirements.txt \
+                musicsource-service/app.py musicsource-service/requirements.txt \
+                musicsource-service/sources/__init__.py \
+                musicsource-service/sources/base.py \
+                musicsource-service/sources/qq.py \
+                musicsource-service/sources/kugou.py \
+                musicsource-service/sources/kuwo.py \
+                musicsource-service/sources/qishui.py \
                 bin/fnmusic-lib.sh bin/setup.sh bin/start.sh bin/stop.sh bin/status.sh \
                 bin/restart_services.sh \
                 restore.sh netease_login.sh VERSION; do

@@ -1,11 +1,11 @@
 [
   {
-    "stepTitle": "网易云音源",
+    "stepTitle": "在线音源",
     "items": [
       {
         "type": "select",
         "field": "wizard_netease_quality",
-        "label": "音质",
+        "label": "网易云音质",
         "initValue": "lossless",
         "options": [
           { "label": "无损 lossless", "value": "lossless" },
@@ -17,7 +17,7 @@
       {
         "type": "switch",
         "field": "wizard_free_only_on_logout",
-        "label": "未登录时降级为只播免费曲目",
+        "label": "网易云未登录时降级为只播免费曲目",
         "initValue": "true"
       },
       {
@@ -38,14 +38,61 @@
         ]
       },
       {
+        "type": "switch",
+        "field": "wizard_extra_enabled",
+        "label": "启用扩展音源（QQ/酷狗/酷我/汽水）",
+        "initValue": "true"
+      },
+      {
+        "type": "switch",
+        "field": "wizard_qq_enabled",
+        "label": "QQ音乐",
+        "initValue": "true"
+      },
+      {
+        "type": "switch",
+        "field": "wizard_kugou_enabled",
+        "label": "酷狗音乐",
+        "initValue": "true"
+      },
+      {
+        "type": "switch",
+        "field": "wizard_kuwo_enabled",
+        "label": "酷我音乐",
+        "initValue": "true"
+      },
+      {
+        "type": "switch",
+        "field": "wizard_qishui_enabled",
+        "label": "汽水音乐",
+        "initValue": "true"
+      },
+      {
+        "type": "text",
+        "field": "wizard_qishui_api_base",
+        "label": "汽水/扩展音源聚合网关（可选）",
+        "initValue": "",
+        "helpText": "留空 = 保持当前值。汽水通常需要兼容网关才能解析直链。"
+      },
+      {
         "type": "select",
         "field": "wizard_musicbox_bind",
-        "label": "音源服务监听地址",
+        "label": "网易云音源服务监听地址",
         "initValue": "127.0.0.1",
         "helpText": "建议保持 127.0.0.1。改成 0.0.0.0 会让同网段任何人都能无鉴权访问音源服务接口（含发起扫码登录），等于别人可以用自己的网易云扫你的二维码顶掉你的账号。",
         "options": [
           { "label": "0.0.0.0（可局域网浏览器扫码）", "value": "0.0.0.0" },
           { "label": "127.0.0.1（仅本机，最安全）", "value": "127.0.0.1" }
+        ]
+      },
+      {
+        "type": "select",
+        "field": "wizard_musicsource_bind",
+        "label": "扩展音源服务监听地址",
+        "initValue": "127.0.0.1",
+        "options": [
+          { "label": "0.0.0.0", "value": "0.0.0.0" },
+          { "label": "127.0.0.1（推荐）", "value": "127.0.0.1" }
         ]
       }
     ]

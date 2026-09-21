@@ -70,6 +70,16 @@ main() {
         elif ! lib_pid_alive "${MUSICBOX_PID}"; then
             need=1
             reason="musicbox 音源进程不存在"
+        elif [ -d "${RUN_DIR}/musicsource-service" ] \
+             && [ "$(lib_read_env_value FNMUSIC_EXTRA_ENABLED true | tr '[:upper:]' '[:lower:]')" != "false" ] \
+             && [ ! -x "${RUN_DIR}/.venv-musicsource/bin/uvicorn" ]; then
+            : # 未装 venv 时看门狗也无法恢复，不触发 start 循环
+        elif [ -d "${RUN_DIR}/musicsource-service" ] \
+             && [ "$(lib_read_env_value FNMUSIC_EXTRA_ENABLED true | tr '[:upper:]' '[:lower:]')" != "false" ] \
+             && [ -x "${RUN_DIR}/.venv-musicsource/bin/uvicorn" ] \
+             && ! lib_pid_alive "${MUSICSOURCE_PID}"; then
+            need=1
+            reason="musicsource 扩展音源进程不存在"
         fi
         if [ "${need}" -eq 0 ]; then
             fails=0

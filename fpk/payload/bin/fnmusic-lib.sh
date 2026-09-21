@@ -106,9 +106,11 @@ lib_ensure_musicbox_data_dirs() {
 
 PROXY_PID="${PKGVAR}/proxy.pid"
 MUSICBOX_PID="${PKGVAR}/musicbox.pid"
+MUSICSOURCE_PID="${PKGVAR}/musicsource.pid"
 UI_PID="${PKGVAR}/ui.pid"
 PROXY_LOG="${LOG_DIR}/proxy.log"
 MUSICBOX_LOG="${LOG_DIR}/musicbox.log"
+MUSICSOURCE_LOG="${LOG_DIR}/musicsource.log"
 UI_LOG="${LOG_DIR}/ui.log"
 INFO_LOG="${LOG_DIR}/info.log"
 
@@ -120,6 +122,9 @@ TARGET_SOCK="/var/run/trim_music.socket"
 UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
 MUSICBOX_PORT="${FNMUSIC_MUSICBOX_PORT:-8770}"
 MUSICBOX_URL="http://127.0.0.1:${MUSICBOX_PORT}"
+# 扩展音源（QQ/酷狗/酷我/汽水）服务，v2.10
+MUSICSOURCE_PORT="${FNMUSIC_MUSICSOURCE_PORT:-8771}"
+MUSICSOURCE_URL="http://127.0.0.1:${MUSICSOURCE_PORT}"
 
 lib_log() {
     mkdir -p "${LOG_DIR}" 2>/dev/null

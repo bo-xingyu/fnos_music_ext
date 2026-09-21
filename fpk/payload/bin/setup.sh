@@ -103,7 +103,7 @@ stage_code() {
     # 代码与脚本载荷：逐项覆盖。绝不删除 RUN_DIR 下的 .env / cache /
     # online_favorites / play_history / recommend_cache / musicbox-data / .venv-*
     local item
-    for item in proxy musicbox-service bin restore.sh netease_login.sh VERSION; do
+    for item in proxy musicbox-service musicsource-service bin restore.sh netease_login.sh VERSION; do
         if [ -e "${APPDEST}/${item}" ]; then
             cp -a "${APPDEST}/${item}" "${RUN_DIR}/" || {
                 lib_fail "复制 ${item} 到 ${RUN_DIR} 失败"
@@ -145,7 +145,19 @@ write_env_file() {
         echo "FNMUSIC_SEARCH_EMPTY_TTL=$(dq "$(pick_env FNMUSIC_SEARCH_EMPTY_TTL "" 60)")"
         echo "FNMUSIC_LOGIN_CACHE_TTL=$(dq "$(pick_env FNMUSIC_LOGIN_CACHE_TTL "" 300)")"
         echo "FNMUSIC_MUSICBOX_BIND=$(dq "$(pick_env FNMUSIC_MUSICBOX_BIND wizard_musicbox_bind 127.0.0.1)")"
-        echo "# --- 登录态与降级 ---"
+        echo "# --- 扩展音源 QQ/酷狗/酷我/汽水（v2.10） ---"
+        echo "FNMUSIC_MUSICSOURCE_URL=$(dq "$(pick_env FNMUSIC_MUSICSOURCE_URL "" "http://127.0.0.1:${MUSICSOURCE_PORT:-8771}")")"
+        echo "FNMUSIC_MUSICSOURCE_BIND=$(dq "$(pick_env FNMUSIC_MUSICSOURCE_BIND wizard_musicsource_bind 127.0.0.1)")"
+        echo "FNMUSIC_EXTRA_ENABLED=$(dq "$(norm_bool "$(pick_env FNMUSIC_EXTRA_ENABLED wizard_extra_enabled true)")")"
+        echo "FNMUSIC_EXTRA_SOURCES=$(dq "$(pick_env FNMUSIC_EXTRA_SOURCES wizard_extra_sources qq,kugou,kuwo,qishui)")"
+        echo "FNMUSIC_QQ_ENABLED=$(dq "$(norm_bool "$(pick_env FNMUSIC_QQ_ENABLED wizard_qq_enabled true)")")"
+        echo "FNMUSIC_KUGOU_ENABLED=$(dq "$(norm_bool "$(pick_env FNMUSIC_KUGOU_ENABLED wizard_kugou_enabled true)")")"
+        echo "FNMUSIC_KUWO_ENABLED=$(dq "$(norm_bool "$(pick_env FNMUSIC_KUWO_ENABLED wizard_kuwo_enabled true)")")"
+        echo "FNMUSIC_QISHUI_ENABLED=$(dq "$(norm_bool "$(pick_env FNMUSIC_QISHUI_ENABLED wizard_qishui_enabled true)")")"
+        echo "FNMUSIC_EXTRA_SEARCH_LIMIT=$(dq "$(pick_env FNMUSIC_EXTRA_SEARCH_LIMIT "" 20)")"
+        echo "FNMUSIC_QISHUI_API_BASE=$(dq "$(pick_env FNMUSIC_QISHUI_API_BASE wizard_qishui_api_base "")")"
+        echo "FNMUSIC_EXTRA_API_BASE=$(dq "$(pick_env FNMUSIC_EXTRA_API_BASE "" "")")"
+        echo "# --- 登录态与降级（仅影响网易云） ---"
         echo "FNMUSIC_FREE_ONLY_ON_LOGOUT=$(dq "$(norm_bool "$(pick_env FNMUSIC_FREE_ONLY_ON_LOGOUT wizard_free_only_on_logout true)")")"
         echo "FNMUSIC_LOGIN_STATE_TTL=$(dq "$(pick_env FNMUSIC_LOGIN_STATE_TTL "" 300)")"
         echo "FNMUSIC_LOGIN_CHECK_INTERVAL=$(dq "$(pick_env FNMUSIC_LOGIN_CHECK_INTERVAL "" 3600)")"
@@ -307,12 +319,18 @@ build_venvs() {
     local idx
     idx="$(lib_read_env_value FNMUSIC_PIP_INDEX "https://pypi.tuna.tsinghua.edu.cn/simple")"
     local name req
-    for name in proxy musicbox; do
+    for name in proxy musicbox musicsource; do
         local venv="${RUN_DIR}/.venv-${name}"
         if [ "${name}" = "proxy" ]; then
             req="${RUN_DIR}/proxy/requirements.txt"
+        elif [ "${name}" = "musicsource" ]; then
+            req="${RUN_DIR}/musicsource-service/requirements.txt"
         else
             req="${RUN_DIR}/musicbox-service/requirements.txt"
+        fi
+        if [ ! -f "${req}" ]; then
+            lib_warn "跳过 ${name}：缺少 ${req}"
+            continue
         fi
         if [ ! -x "${venv}/bin/python" ]; then
             lib_log "创建虚拟环境 ${venv}"

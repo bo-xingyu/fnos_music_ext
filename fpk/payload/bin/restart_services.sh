@@ -29,8 +29,9 @@ main() {
         bash "${RUN_DIR}/restore.sh" >> "${LOG_DIR}/restore.log" 2>&1 \
             || lib_warn "restore.sh 返回非零，交由随后的 start.sh 重新接管（它会做幂等探测）"
     fi
-    # 3. 停音源服务（配置里的监听地址/降级开关可能变了）
+    # 3. 停音源服务（配置里的监听地址/开关可能变了）
     lib_stop_pid "musicbox" "${MUSICBOX_PID}" 10
+    lib_stop_pid "musicsource" "${MUSICSOURCE_PID}" 10
 
     # 4. 重新拉起。start.sh 自身幂等：ui 若已在运行会被跳过
     if bash "${SCRIPT_DIR}/start.sh" >> "${LOG_DIR}/info.log" 2>&1; then
